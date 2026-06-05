@@ -1,0 +1,12 @@
+services:
+  hermes-router:
+    build: .
+    ports:
+      - "${PORT:-8319}:${PORT:-8319}"
+    env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8319}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
