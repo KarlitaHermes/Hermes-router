@@ -22,6 +22,8 @@ When you hit a limit, your app returns errors. If you have multiple keys or prov
 ```
 Your app  →  hermes-router  →  Gemini (key 1, 2, 3 ...)
                             →  OpenRouter (key 1, 2 ...)
+                            →  SambaNova
+                            →  GitHub Models
                             →  Cerebras
                             →  Groq
 ```
@@ -57,6 +59,8 @@ All configuration is via `.env` (or real environment variables):
 | `GROQ_API_KEY` | Groq API key | — |
 | `GEMINI_MODEL` | Gemini model to use | `gemini-2.5-flash-lite` |
 | `OPENROUTER_MODEL` | OpenRouter model to use | `nvidia/nemotron-3-super-120b-a12b:free` |
+| `SAMBANOVA_MODEL` | SambaNova model to use | `Meta-Llama-3.3-70B-Instruct` |
+| `GITHUB_MODELS_MODEL` | GitHub Models model to use | `gpt-4o-mini` |
 | `CEREBRAS_MODEL` | Cerebras model to use | `gpt-oss-120b` |
 | `GROQ_MODEL` | Groq model to use | `llama-3.1-8b-instant` |
 | `ROUTER_MODEL_ID` | Model name advertised at `/v1/models` | `hermes-router` |
@@ -69,6 +73,8 @@ Any provider with no keys set is automatically skipped.
 |---|---|---|
 | Gemini | Generous per-minute limits | [aistudio.google.com](https://aistudio.google.com) |
 | OpenRouter | 50 req/day per key | [openrouter.ai](https://openrouter.ai) |
+| SambaNova | Free, fast Llama models | [cloud.sambanova.ai](https://cloud.sambanova.ai) |
+| GitHub Models | Free with any GitHub account | [github.com/settings/tokens](https://github.com/settings/tokens) |
 | Cerebras | Fast inference, free tier | [cloud.cerebras.ai](https://cloud.cerebras.ai) |
 | Groq | Fast inference, free tier | [console.groq.com](https://console.groq.com) |
 

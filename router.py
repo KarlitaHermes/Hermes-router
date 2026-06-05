@@ -81,6 +81,24 @@ def _build_providers() -> list[dict]:
             },
         })
 
+    sambanova_keys = _keys("SAMBANOVA_API_KEYS") or _keys("SAMBANOVA_API_KEY")
+    if sambanova_keys:
+        providers.append({
+            "name":     "sambanova",
+            "base_url": "https://api.sambanova.ai/v1",
+            "model":    os.environ.get("SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct"),
+            "keys":     sambanova_keys,
+        })
+
+    github_keys = _keys("GITHUB_MODELS_TOKENS") or _keys("GITHUB_MODELS_TOKEN")
+    if github_keys:
+        providers.append({
+            "name":     "github_models",
+            "base_url": "https://models.inference.ai.azure.com",
+            "model":    os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o-mini"),
+            "keys":     github_keys,
+        })
+
     cerebras_keys = _keys("CEREBRAS_API_KEYS") or _keys("CEREBRAS_API_KEY")
     if cerebras_keys:
         providers.append({
