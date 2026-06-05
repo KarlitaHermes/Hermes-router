@@ -7,9 +7,12 @@ A lightweight OpenAI-compatible proxy that:
   - Cascades to the next provider when one is exhausted or rate-limited
   - Strips thinking/reasoning fields that break non-Claude providers
   - Handles 413 (payload too large) by cascading instead of crashing
+  - Caches identical responses to preserve free-tier quota
+  - Routes short requests to low-latency providers first (optional)
+  - Tracks per-provider latency and error rates
 
 Supported providers (configure via .env):
-  Gemini → OpenRouter → Cerebras → Groq
+  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq
 
 Quick start:
   pip install -r requirements.txt
@@ -17,9 +20,9 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging
+import json, os, time, threading, logging, hashlib
 from pathlib import Path
-from collections import deque
+from collections import deque, OrderedDict
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 
@@ -44,9 +47,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("hermes-router")
 
-PORT           = int(os.environ.get("PORT", 8319))
-PROXY_API_KEYS = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-router-1").split(",") if k.strip()]
-ROUTER_MODEL   = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
+PORT              = int(os.environ.get("PORT", 8319))
+PROXY_API_KEYS    = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-router-1").split(",") if k.strip()]
+ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
+CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
+CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
+FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+
+# Providers known for low-latency inference — promoted for short requests
+_FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
 
 
 def _keys(env_var: str) -> list[str]:
@@ -139,7 +148,7 @@ class CredentialPool:
             log.info(f"  {p['name']}: {len(p['keys'])} key(s) loaded")
 
     def get_key(self, provider_name: str) -> str | None:
-        """Return the next ready key for a provider, or None if all are cooling."""
+        """Return the next ready key (round-robin), or None if all are cooling."""
         with self.lock:
             pool = self.pools.get(provider_name, deque())
             now  = time.time()
@@ -161,6 +170,113 @@ class CredentialPool:
 
 
 pool = CredentialPool(PROVIDERS)
+
+# ── Per-provider stats ─────────────────────────────────────────────────────────
+
+class ProviderStats:
+    """Tracks latency and error rates per provider for observability."""
+
+    def __init__(self):
+        self.lock   = threading.Lock()
+        self._data: dict[str, dict] = {}
+
+    def _ensure(self, name: str):
+        if name not in self._data:
+            self._data[name] = {"latency_sum": 0.0, "latency_count": 0,
+                                "error_count": 0, "request_count": 0}
+
+    def record_success(self, name: str, latency_s: float):
+        with self.lock:
+            self._ensure(name)
+            s = self._data[name]
+            s["latency_sum"]   += latency_s
+            s["latency_count"] += 1
+            s["request_count"] += 1
+
+    def record_error(self, name: str):
+        with self.lock:
+            self._ensure(name)
+            s = self._data[name]
+            s["error_count"]   += 1
+            s["request_count"] += 1
+
+    def summary(self, name: str) -> dict:
+        with self.lock:
+            s  = self._data.get(name, {})
+            lc = s.get("latency_count", 0)
+            rc = s.get("request_count", 0)
+            ec = s.get("error_count", 0)
+            return {
+                "avg_latency_ms": round(s.get("latency_sum", 0) / lc * 1000) if lc else None,
+                "error_rate":     round(ec / rc, 3) if rc else 0.0,
+                "total_requests": rc,
+            }
+
+    def all_summaries(self) -> dict:
+        with self.lock:
+            return {name: self.summary(name) for name in self._data}
+
+
+stats = ProviderStats()
+
+# ── Response cache ─────────────────────────────────────────────────────────────
+
+class ResponseCache:
+    """
+    In-memory LRU cache for non-streaming responses.
+    Identical requests (same model + messages) return a cached copy,
+    saving free-tier quota for novel queries.
+    Set CACHE_TTL_SECONDS=0 to disable.
+    """
+
+    def __init__(self, ttl: int = 300, max_size: int = 100):
+        self.ttl      = ttl
+        self.max_size = max_size
+        self.lock     = threading.Lock()
+        self._store: OrderedDict = OrderedDict()  # hash -> (data, timestamp)
+        self.hits     = 0
+        self.misses   = 0
+
+    def _hash(self, model: str, messages: list) -> str:
+        content = json.dumps({"model": model, "messages": messages}, sort_keys=True)
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def get(self, model: str, messages: list) -> dict | None:
+        if self.ttl <= 0:
+            return None
+        key = self._hash(model, messages)
+        with self.lock:
+            if key in self._store:
+                data, ts = self._store[key]
+                if time.time() - ts < self.ttl:
+                    self._store.move_to_end(key)
+                    self.hits += 1
+                    return data
+                del self._store[key]
+            self.misses += 1
+        return None
+
+    def set(self, model: str, messages: list, data: dict):
+        if self.ttl <= 0:
+            return
+        key = self._hash(model, messages)
+        with self.lock:
+            if len(self._store) >= self.max_size:
+                self._store.popitem(last=False)  # evict oldest
+            self._store[key] = (data, time.time())
+
+    @property
+    def size(self) -> int:
+        with self.lock:
+            return len(self._store)
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return round(self.hits / total, 3) if total else 0.0
+
+
+cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE)
 
 # ── Thinking field stripping ───────────────────────────────────────────────────
 # Some providers (e.g. Gemini 2.5) emit reasoning/thinking fields in responses.
@@ -210,6 +326,29 @@ def _streaming_generator(resp: requests.Response):
             yield (line + "\n").encode("utf-8")
     if buf:
         yield buf
+
+# ── Complexity-aware provider ordering ────────────────────────────────────────
+
+def _estimated_tokens(messages: list) -> int:
+    """Rough token estimate: total content characters / 4."""
+    return sum(len(str(m.get("content", ""))) for m in messages) // 4
+
+
+def _ordered_providers(payload: dict) -> list[dict]:
+    """
+    Return providers in cascade order.
+    If FAST_ROUTE_THRESHOLD > 0 and the request is short, promote
+    low-latency providers (Groq, Cerebras, SambaNova) to the front.
+    """
+    if FAST_ROUTE_TOKENS <= 0:
+        return PROVIDERS
+    tokens = _estimated_tokens(payload.get("messages", []))
+    if tokens <= FAST_ROUTE_TOKENS:
+        fast = [p for p in PROVIDERS if p["name"] in _FAST_PROVIDERS]
+        slow = [p for p in PROVIDERS if p["name"] not in _FAST_PROVIDERS]
+        log.debug(f"Short request (~{tokens} tokens) — fast-routing to {[p['name'] for p in fast]}")
+        return fast + slow
+    return PROVIDERS
 
 # ── Request forwarding ─────────────────────────────────────────────────────────
 
@@ -281,8 +420,17 @@ def chat():
 
     payload   = request.get_json(force=True)
     streaming = payload.get("stream", False)
+    messages  = payload.get("messages", [])
+    model     = payload.get("model", ROUTER_MODEL)
 
-    for provider in PROVIDERS:
+    # Cache check (non-streaming only)
+    if not streaming:
+        cached = cache.get(model, messages)
+        if cached is not None:
+            log.info("↩ cache hit")
+            return jsonify(cached)
+
+    for provider in _ordered_providers(payload):
         name     = provider["name"]
         attempts = len(pool.pools.get(name, [])) or 1
 
@@ -293,36 +441,45 @@ def chat():
                 break
 
             log.info(f"→ Trying {name} ...{key[-6:]}")
+            t0   = time.time()
             resp = forward(provider, key, payload, streaming)
+            elapsed = time.time() - t0
 
             if resp is None:
+                stats.record_error(name)
                 pool.mark_rate_limited(name, key, retry_after=30)
                 continue
 
             if resp.status_code == 429:
+                stats.record_error(name)
                 retry_after = int(resp.headers.get("Retry-After", 60))
                 pool.mark_rate_limited(name, key, retry_after=retry_after)
                 log.warning(f"  {name} 429 — cooldown {retry_after}s, trying next key")
                 continue
 
             if resp.status_code in (400, 401, 403):
+                stats.record_error(name)
                 log.error(f"  {name} {resp.status_code} — skipping provider: {resp.text[:200]}")
                 break
 
             if resp.status_code == 413:
+                stats.record_error(name)
                 log.warning(f"  {name} 413 — payload too large, cascading")
                 break
 
             if resp.status_code >= 500:
+                stats.record_error(name)
                 pool.mark_rate_limited(name, key, retry_after=15)
                 continue
 
             if not (200 <= resp.status_code < 300):
+                stats.record_error(name)
                 log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
                 break
 
             # Success
-            log.info(f"  ✓ {name} {resp.status_code}")
+            stats.record_success(name, elapsed)
+            log.info(f"  ✓ {name} {resp.status_code} ({elapsed*1000:.0f}ms)")
             if streaming:
                 return Response(
                     stream_with_context(_streaming_generator(resp)),
@@ -332,6 +489,7 @@ def chat():
             else:
                 data = resp.json()
                 _strip_response(data)
+                cache.set(model, messages, data)
                 return jsonify(data), resp.status_code
 
         log.warning(f"✗ {name} exhausted — cascading")
@@ -341,27 +499,53 @@ def chat():
 
 @app.route("/v1/status")
 def status():
-    """Show key cooldown state for all providers."""
+    """Show key cooldown state, latency/error stats, and cache metrics."""
     err = _auth_check()
     if err:
         return err
-    now = time.time()
-    out = {}
+
+    now  = time.time()
+    keys = {}
     with pool.lock:
         for name, entries in pool.pools.items():
-            out[name] = [
+            keys[name] = [
                 {
-                    "key_tail":  e["key"][-6:],
-                    "status":    "cooling" if e["cool_until"] > now else "ready",
-                    "ready_in":  max(0, round(e["cool_until"] - now)),
+                    "key_tail": e["key"][-6:],
+                    "status":   "cooling" if e["cool_until"] > now else "ready",
+                    "ready_in": max(0, round(e["cool_until"] - now)),
                 }
                 for e in entries
             ]
-    return jsonify(out)
+
+    provider_stats = {}
+    for p in PROVIDERS:
+        provider_stats[p["name"]] = {
+            "keys":  keys.get(p["name"], []),
+            "stats": stats.summary(p["name"]),
+        }
+
+    return jsonify({
+        "providers": provider_stats,
+        "cache": {
+            "enabled":  CACHE_TTL > 0,
+            "ttl_s":    CACHE_TTL,
+            "size":     cache.size,
+            "max_size": CACHE_MAX_SIZE,
+            "hits":     cache.hits,
+            "misses":   cache.misses,
+            "hit_rate": cache.hit_rate,
+        },
+        "fast_routing": {
+            "enabled":         FAST_ROUTE_TOKENS > 0,
+            "threshold_tokens": FAST_ROUTE_TOKENS,
+            "fast_providers":  sorted(_FAST_PROVIDERS),
+        },
+    })
 
 
 if __name__ == "__main__":
     log.info(f"hermes-router starting on :{PORT}")
     log.info(f"Providers: {[p['name'] for p in PROVIDERS]}")
-    log.info(f"Proxy auth keys: {len(PROXY_API_KEYS)} configured")
+    log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE})")
+    log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
     app.run(host="0.0.0.0", port=PORT, threaded=True)

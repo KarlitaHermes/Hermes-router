@@ -17,6 +17,9 @@ When you hit a limit, your app returns errors. If you have multiple keys or prov
 - **Provider cascade** — if one provider is fully exhausted, automatically fall through to the next
 - **Thinking field stripping** — removes `reasoning_content` / `think` fields that Gemini adds but other providers reject, preventing 400 errors during fallback
 - **Smart cooldowns** — rate-limited keys sit out temporarily instead of hammering the API
+- **Response cache** — identical requests return a cached copy, saving free-tier quota for novel queries
+- **Complexity routing** — short requests can be fast-routed to low-latency providers first (opt-in)
+- **Observability** — per-provider latency and error rates visible at `/v1/status`
 - **Drop-in compatible** — any OpenAI SDK client works with zero code changes
 
 ```
@@ -64,6 +67,9 @@ All configuration is via `.env` (or real environment variables):
 | `CEREBRAS_MODEL` | Cerebras model to use | `gpt-oss-120b` |
 | `GROQ_MODEL` | Groq model to use | `llama-3.1-8b-instant` |
 | `ROUTER_MODEL_ID` | Model name advertised at `/v1/models` | `hermes-router` |
+| `CACHE_TTL_SECONDS` | Cache identical responses for N seconds (0 = off) | `300` |
+| `CACHE_MAX_SIZE` | Max cached responses before evicting oldest | `100` |
+| `FAST_ROUTE_THRESHOLD` | Token count below which fast providers are tried first (0 = off) | `0` |
 
 Any provider with no keys set is automatically skipped.
 
