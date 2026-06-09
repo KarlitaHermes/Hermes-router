@@ -1,94 +1,128 @@
 # hermes-router
 
-A lightweight OpenAI-compatible proxy that load-balances across multiple free AI providers and API keys — so your app stays online even when one provider hits a rate limit.
+**Keep your AI app online for free.** hermes-router sits between your app and a bunch of
+free AI providers (Gemini, OpenRouter, Groq, and more). When one provider hits its rate
+limit, it automatically tries the next one — so your app keeps working instead of erroring out.
 
-## The problem
+It speaks the **OpenAI API**, so any tool or library that talks to OpenAI works with it
+unchanged. You just point your app at hermes-router instead of at OpenAI.
 
-Free AI tiers are great, but they rate-limit aggressively:
-- Gemini: per-minute token limits
-- OpenRouter: 50 requests/day per key
-- Groq / Cerebras: requests-per-minute caps
+---
 
-When you hit a limit, your app returns errors. If you have multiple keys or providers, switching between them manually is painful.
+## Who is this for?
 
-## What hermes-router does
+- You're building something with AI and don't want to pay for an API yet.
+- You keep hitting "rate limit exceeded" errors on free tiers.
+- You have a few free API keys and want them used automatically, without writing
+  switch-over logic yourself.
 
-- **Key rotation** — cycle through all your keys for each provider before giving up
-- **Provider cascade** — if one provider is fully exhausted, automatically fall through to the next
-- **Thinking field stripping** — removes `reasoning_content` / `think` fields that Gemini adds but other providers reject, preventing 400 errors during fallback
-- **Smart cooldowns** — rate-limited keys sit out temporarily instead of hammering the API
-- **Response cache** — identical requests return a cached copy, saving free-tier quota for novel queries
-- **Complexity routing** — short requests can be fast-routed to low-latency providers first (opt-in)
-- **Observability** — per-provider latency and error rates visible at `/v1/status`
-- **Drop-in compatible** — any OpenAI SDK client works with zero code changes
+If that's you, this is a single Python file you run once and forget about.
+
+---
+
+## How it works (the 30-second version)
 
 ```
-Your app  →  hermes-router  →  Gemini (key 1, 2, 3 ...)
-                            →  OpenRouter (key 1, 2 ...)
-                            →  SambaNova
-                            →  GitHub Models
-                            →  Cerebras
-                            →  Groq
+                    ┌─────────────────────────────────────────┐
+   Your app  ─────► │             hermes-router               │
+ (OpenAI SDK,       │                                         │
+  curl, etc.)       │   Try Gemini      (key 1 → key 2 → …)    │
+                    │   then OpenRouter (key 1 → key 2 → …)    │
+                    │   then SambaNova                         │
+                    │   then GitHub Models                     │
+                    │   then Cerebras                          │
+                    │   then Groq                              │
+                    └─────────────────────────────────────────┘
 ```
+
+When a provider is rate-limited or exhausted, hermes-router moves down the list
+automatically. The first one that answers wins. Your app never sees the failures.
+
+**Extra niceties:**
+
+- **Key rotation** — uses every key you give it for a provider before moving on.
+- **Smart cooldowns** — a rate-limited key sits out for a while instead of being hammered.
+- **Response cache** — repeated identical questions return instantly without spending quota.
+- **Large-payload skip** — providers that reject big requests (like Groq's free tier) are
+  skipped automatically when your prompt is too long, instead of wasting a failed attempt.
+- **Thinking-field cleanup** — strips `reasoning_content` / `think` fields that some models
+  add but others reject, which would otherwise cause errors when falling back.
+- **Built-in monitoring** — see latency, error rates, and cache hits at `/v1/status`.
+
+---
+
+## What you'll need
+
+1. **Python 3.10 or newer** — check with `python3 --version`.
+2. **At least one free API key** from any provider in the table below. More is better —
+   the whole point is to spread load across them.
+
+---
 
 ## Quick start
 
 ```bash
+# 1. Get the code
 git clone https://github.com/Shaf2665/hermes-router
 cd hermes-router
 
+# 2. Install the two dependencies (Flask + requests)
 pip install -r requirements.txt
 
+# 3. Create your config file and add your API keys
 cp .env.example .env
-# edit .env and add your API keys
+nano .env          # paste in at least one provider's key
 
+# 4. Start it
 python router.py
 ```
 
-The server starts on port `8319` by default.
+You'll see something like:
 
-## Configuration
+```
+hermes-router starting on :8319
+Providers: ['gemini', 'groq']
+Cache: enabled (TTL=300s, max=100)
+```
 
-All configuration is via `.env` (or real environment variables):
+That's it — hermes-router is now listening on **http://localhost:8319**.
 
-| Variable | Description | Default |
-|---|---|---|
-| `PROXY_API_KEYS` | Comma-separated keys clients use to authenticate with the router | `sk-router-1` |
-| `PORT` | Port to listen on | `8319` |
-| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING` | `INFO` |
-| `GEMINI_API_KEYS` | Comma-separated Gemini API keys | — |
-| `OPENROUTER_API_KEYS` | Comma-separated OpenRouter API keys | — |
-| `CEREBRAS_API_KEY` | Cerebras API key | — |
-| `GROQ_API_KEY` | Groq API key | — |
-| `GEMINI_MODEL` | Gemini model to use | `gemini-2.5-flash-lite` |
-| `OPENROUTER_MODEL` | OpenRouter model to use | `nvidia/nemotron-3-super-120b-a12b:free` |
-| `SAMBANOVA_MODEL` | SambaNova model to use | `Meta-Llama-3.3-70B-Instruct` |
-| `GITHUB_MODELS_MODEL` | GitHub Models model to use | `gpt-4o-mini` |
-| `CEREBRAS_MODEL` | Cerebras model to use | `gpt-oss-120b` |
-| `GROQ_MODEL` | Groq model to use | `llama-3.1-8b-instant` |
-| `ROUTER_MODEL_ID` | Model name advertised at `/v1/models` | `hermes-router` |
-| `CACHE_TTL_SECONDS` | Cache identical responses for N seconds (0 = off) | `300` |
-| `CACHE_MAX_SIZE` | Max cached responses before evicting oldest | `100` |
-| `FAST_ROUTE_THRESHOLD` | Token count below which fast providers are tried first (0 = off) | `0` |
+### Check that it's working
 
-Any provider with no keys set is automatically skipped.
+In another terminal:
 
-### Getting free API keys
+```bash
+curl http://localhost:8319/health
+```
+
+You should get back `{"status": "ok", "providers": [...]}`. If you see your providers
+listed, you're ready to go.
+
+---
+
+## Getting free API keys
+
+You only need one to start, but add as many as you can — that's what keeps you online.
 
 | Provider | Free tier | Sign up |
 |---|---|---|
 | Gemini | Generous per-minute limits | [aistudio.google.com](https://aistudio.google.com) |
-| OpenRouter | 50 req/day per key | [openrouter.ai](https://openrouter.ai) |
+| OpenRouter | 50 requests/day per key | [openrouter.ai](https://openrouter.ai) |
 | SambaNova | Free, fast Llama models | [cloud.sambanova.ai](https://cloud.sambanova.ai) |
 | GitHub Models | Free with any GitHub account | [github.com/settings/tokens](https://github.com/settings/tokens) |
 | Cerebras | Fast inference, free tier | [cloud.cerebras.ai](https://cloud.cerebras.ai) |
 | Groq | Fast inference, free tier | [console.groq.com](https://console.groq.com) |
 
-**Tip:** Create multiple Google / OpenRouter accounts to stack more free keys.
+**Tip:** Most providers let you create more than one key, and you can sign up with
+multiple Google / GitHub accounts to stack even more free quota. Add them all as
+comma-separated values (see below).
 
-## Usage with any OpenAI SDK
+---
 
-Point your client at `http://localhost:8319/v1` with your `PROXY_API_KEYS` value:
+## Using it from your app
+
+Point any OpenAI client at `http://localhost:8319/v1` and use the model name
+`hermes-router`. Use one of your `PROXY_API_KEYS` values as the API key.
 
 **Python:**
 ```python
@@ -96,7 +130,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8319/v1",
-    api_key="sk-my-router-key-1",
+    api_key="sk-router-1",          # one of your PROXY_API_KEYS
 )
 
 response = client.chat.completions.create(
@@ -109,7 +143,7 @@ print(response.choices[0].message.content)
 **curl:**
 ```bash
 curl http://localhost:8319/v1/chat/completions \
-  -H "Authorization: Bearer sk-my-router-key-1" \
+  -H "Authorization: Bearer sk-router-1" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "hermes-router",
@@ -117,45 +151,56 @@ curl http://localhost:8319/v1/chat/completions \
   }'
 ```
 
-## Docker
+Streaming (`"stream": true`) works too.
 
-```bash
-cp .env.example .env
-# fill in your keys
+---
 
-docker compose up -d
-```
+## Configuration
 
-## API endpoints
+Everything is set in the `.env` file (or as real environment variables). You only need
+the keys for the providers you actually use — anything left blank is skipped automatically.
 
-| Endpoint | Auth | Description |
+### API keys (add the ones you have)
+
+| Variable | Description |
+|---|---|
+| `GEMINI_API_KEYS` | Comma-separated Gemini keys |
+| `OPENROUTER_API_KEYS` | Comma-separated OpenRouter keys |
+| `SAMBANOVA_API_KEY` | SambaNova key |
+| `GITHUB_MODELS_TOKEN` | GitHub Models token |
+| `CEREBRAS_API_KEY` | Cerebras key |
+| `GROQ_API_KEY` | Groq key |
+
+> Multiple keys for one provider? Separate them with commas:
+> `GEMINI_API_KEYS=key_one,key_two,key_three`
+
+### Optional settings (sensible defaults — change only if you want to)
+
+| Variable | What it does | Default |
 |---|---|---|
-| `GET /health` | No | Health check — returns provider list |
-| `GET /v1/models` | Yes | Lists available models |
-| `POST /v1/chat/completions` | Yes | Main chat endpoint (streaming supported) |
-| `GET /v1/status` | Yes | Shows key cooldown state per provider |
+| `PROXY_API_KEYS` | The key(s) your app uses to talk to hermes-router | `sk-router-1` |
+| `PORT` | Port to listen on | `8319` |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, or `WARNING` | `INFO` |
+| `GEMINI_MODEL` | Which Gemini model to use | `gemini-2.5-flash-lite` |
+| `OPENROUTER_MODEL` | Which OpenRouter model to use | `nvidia/nemotron-3-super-120b-a12b:free` |
+| `SAMBANOVA_MODEL` | Which SambaNova model to use | `Meta-Llama-3.3-70B-Instruct` |
+| `GITHUB_MODELS_MODEL` | Which GitHub model to use | `gpt-4o-mini` |
+| `CEREBRAS_MODEL` | Which Cerebras model to use | `gpt-oss-120b` |
+| `GROQ_MODEL` | Which Groq model to use | `llama-3.1-8b-instant` |
+| `ROUTER_MODEL_ID` | The model name your app sends | `hermes-router` |
+| `CACHE_TTL_SECONDS` | Cache identical answers for N seconds (`0` = off) | `300` |
+| `CACHE_MAX_SIZE` | How many answers to keep cached | `100` |
+| `FAST_ROUTE_THRESHOLD` | Send short requests to fast providers first (`0` = off) | `0` |
+| `GROQ_SKIP_TOKENS_OVER` | Skip Groq when a request is bigger than this (it would be rejected anyway). Set `0` to disable, or raise it if you're on a paid Groq tier. | `5500` |
 
-### Check provider status
+> Any provider can have its own skip ceiling with `{PROVIDER}_SKIP_TOKENS_OVER`,
+> e.g. `CEREBRAS_SKIP_TOKENS_OVER=30000`.
 
-```bash
-curl http://localhost:8319/v1/status \
-  -H "Authorization: Bearer sk-my-router-key-1"
-```
+---
 
-Example response:
-```json
-{
-  "gemini": [
-    {"key_tail": "abc123", "status": "ready", "ready_in": 0},
-    {"key_tail": "xyz789", "status": "cooling", "ready_in": 42}
-  ],
-  "groq": [
-    {"key_tail": "def456", "status": "ready", "ready_in": 0}
-  ]
-}
-```
+## Running it 24/7 (Linux systemd service)
 
-## Run as a systemd service (Linux)
+So it starts on boot and restarts if it ever crashes:
 
 ```bash
 sudo nano /etc/systemd/system/hermes-router.service
@@ -182,7 +227,67 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now hermes-router
 ```
 
-## How cascading works
+(Replace `/path/to/hermes-router` with the real folder path.)
+
+---
+
+## Running with Docker
+
+```bash
+cp .env.example .env
+# fill in your keys
+docker compose up -d
+```
+
+---
+
+## API endpoints
+
+| Endpoint | Needs auth? | What it's for |
+|---|---|---|
+| `GET /health` | No | Quick "is it up?" check — returns the provider list |
+| `GET /v1/models` | Yes | Lists the model name your app should use |
+| `POST /v1/chat/completions` | Yes | The main chat endpoint (streaming supported) |
+| `GET /v1/status` | Yes | Live view of every key, provider stats, and cache metrics |
+
+### Checking status
+
+```bash
+curl http://localhost:8319/v1/status \
+  -H "Authorization: Bearer sk-router-1"
+```
+
+Example response:
+
+```json
+{
+  "providers": {
+    "gemini": {
+      "keys": [
+        {"key_tail": "abc123", "status": "ready",   "ready_in": 0},
+        {"key_tail": "xyz789", "status": "cooling", "ready_in": 42}
+      ],
+      "stats": {"avg_latency_ms": 850, "error_rate": 0.0, "total_requests": 42}
+    },
+    "groq": {
+      "keys": [{"key_tail": "def456", "status": "ready", "ready_in": 0}],
+      "stats": {"avg_latency_ms": 210, "error_rate": 0.05, "total_requests": 18},
+      "skip_if_tokens_over": 5500
+    }
+  },
+  "cache": {"enabled": true, "ttl_s": 300, "size": 12, "max_size": 100,
+            "hits": 8, "misses": 30, "hit_rate": 0.211},
+  "fast_routing": {"enabled": false, "threshold_tokens": 0,
+                   "fast_providers": ["cerebras", "groq", "sambanova"]}
+}
+```
+
+- `status: ready` — key is good to use right now.
+- `status: cooling` — key was rate-limited; `ready_in` is seconds until it's usable again.
+
+---
+
+## What happens on each request (the cascade)
 
 ```
 Request received
@@ -191,23 +296,48 @@ Request received
 Try Gemini key 1 ──429──► Try Gemini key 2 ──429──► All Gemini keys cooling
                                                               │
                                                               ▼
-                                                    Try OpenRouter key 1 ──429──► ...
+                                                    Try OpenRouter key 1 ──429──► …
                                                               │ (all exhausted)
                                                               ▼
                                                          Try Cerebras
-                                                              │ (400/exhausted)
+                                                              │ (exhausted)
                                                               ▼
                                                            Try Groq
                                                               │ (exhausted)
                                                               ▼
-                                                         503 — all providers exhausted
+                                                 503 — all providers exhausted
 ```
 
-- **429** → key goes into cooldown, try next key for same provider
-- **400/401/403** → skip entire provider (bad credentials or unsupported payload)
-- **413** → payload too large for this provider, cascade to next
-- **5xx** → provider error, short cooldown then retry
+How different errors are handled:
+
+- **429 (rate limited)** → that key cools down, try the next key for the same provider.
+- **400 / 401 / 403** → skip the whole provider (bad key or unsupported request).
+- **413 (too big)** → request too large for this provider, move to the next one.
+- **5xx (provider error)** → brief cooldown, then retry.
+
+---
+
+## Troubleshooting
+
+**`503 — all providers exhausted`**
+All your keys are rate-limited or invalid. Check `/v1/status` — if everything shows
+`cooling`, just wait, or add more keys. If a provider shows repeated errors, double-check
+that key is valid.
+
+**`401 unauthorized` from hermes-router itself**
+The `Authorization` header your app sends must match one of your `PROXY_API_KEYS`. They're
+two different things: provider keys go in `.env`; the key your *app* uses is `PROXY_API_KEYS`.
+
+**A provider is always being skipped**
+Check `/v1/status` for a `skip_if_tokens_over` value — your prompts may be larger than that
+provider's limit. Raise the limit (e.g. `GROQ_SKIP_TOKENS_OVER=0` to disable) if you're on
+a paid tier.
+
+**Nothing happens / connection refused**
+Make sure `python router.py` is still running and you're using the right port (default 8319).
+
+---
 
 ## License
 
-MIT
+[MIT](LICENSE) — free to use, modify, and distribute.

@@ -63,6 +63,14 @@ def _keys(env_var: str) -> list[str]:
     return [k.strip() for k in os.environ.get(env_var, "").split(",") if k.strip()]
 
 
+def _int_env(env_var: str, default: int = 0) -> int:
+    """Parse an integer env var, falling back to default on missing/invalid."""
+    try:
+        return int(os.environ.get(env_var, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Provider definitions ───────────────────────────────────────────────────────
 
 def _build_providers() -> list[dict]:
@@ -128,6 +136,19 @@ def _build_providers() -> list[dict]:
 
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
+
+    # Per-provider "skip when the request is too big" ceiling. Some free tiers
+    # reject large payloads outright (e.g. Groq's free tier caps tokens-per-minute
+    # at ~6000 and returns 413), so trying them with a big prompt just wastes a
+    # round-trip before cascading. When the estimated request size exceeds a
+    # provider's ceiling, that provider is skipped entirely.
+    #   Configure via  {PROVIDER}_SKIP_TOKENS_OVER  (0 = never skip).
+    # Groq defaults to 5500 to match its free TPM; override if you're on a paid tier.
+    _skip_defaults = {"groq": 5500}
+    for p in providers:
+        env_var = f"{p['name'].upper()}_SKIP_TOKENS_OVER"
+        p["skip_if_tokens_over"] = _int_env(env_var, _skip_defaults.get(p["name"], 0))
+
     return providers
 
 
@@ -430,8 +451,18 @@ def chat():
             log.info("↩ cache hit")
             return jsonify(cached)
 
+    est_tokens = _estimated_tokens(messages)
+
     for provider in _ordered_providers(payload):
         name     = provider["name"]
+
+        # Skip providers whose payload ceiling this request would exceed
+        # (e.g. Groq's free TPM) — avoids a guaranteed 413 round-trip.
+        cap = provider.get("skip_if_tokens_over", 0)
+        if cap and est_tokens > cap:
+            log.info(f"⤳ skipping {name} (~{est_tokens} tok > {cap} cap)")
+            continue
+
         attempts = len(pool.pools.get(name, [])) or 1
 
         for _ in range(attempts):
@@ -519,10 +550,13 @@ def status():
 
     provider_stats = {}
     for p in PROVIDERS:
-        provider_stats[p["name"]] = {
+        entry = {
             "keys":  keys.get(p["name"], []),
             "stats": stats.summary(p["name"]),
         }
+        if p.get("skip_if_tokens_over"):
+            entry["skip_if_tokens_over"] = p["skip_if_tokens_over"]
+        provider_stats[p["name"]] = entry
 
     return jsonify({
         "providers": provider_stats,
@@ -548,4 +582,7 @@ if __name__ == "__main__":
     log.info(f"Providers: {[p['name'] for p in PROVIDERS]}")
     log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE})")
     log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
+    _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}
+    if _skips:
+        log.info(f"Large-payload skip ceilings: {_skips}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
