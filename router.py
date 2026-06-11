@@ -53,9 +53,43 @@ ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
 
 # Providers known for low-latency inference — promoted for short requests
 _FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
+
+# ── Smart routing: capability ratings ─────────────────────────────────────────
+# 1=outstanding  2=best  3=good  4=fair  5=basic  (lower = more capable)
+# Recommended base model: set ROUTER_BASE_MODEL_PROVIDER + ROUTER_BASE_MODEL
+# e.g. ROUTER_BASE_MODEL_PROVIDER=openai  ROUTER_BASE_MODEL=gpt-4o-mini
+KNOWN_MODEL_RATINGS: dict = {
+    # 1 — Outstanding
+    "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
+    "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
+    # 2 — Best
+    "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
+    "llama-3.3-70b": 2, "llama-3.1-70b": 2,
+    "mistral-large": 2, "mistral-medium": 2,
+    "command-r-plus": 2, "nvidia/nemotron-3-super": 2, "nemotron": 2,
+    "claude-sonnet": 2, "claude-3-5": 2, "grok-2": 2,
+    # 3 — Good
+    "gemini-2.5-flash-lite": 3, "gemini-1.5-flash": 3,
+    "gpt-4o-mini": 3, "gpt-oss-120b": 3,
+    "mistral-small": 3, "glm-4.5-flash": 3, "glm-4.7-flash": 3,
+    "llama-3.1-8b-instant": 3,
+    # 4 — Fair
+    "command-r7b": 4, "command-r7b-12-2024": 4,
+    "llama-3.2-3b": 4, "mistral-7b": 4,
+}
+_RATING_PATTERNS: list = [
+    (1, ["pro-exp", "ultra", "opus", "o3", "o1-pro"]),
+    (2, ["70b", "large", "plus", "pro", "turbo", "super", "sonnet"]),
+    (3, ["flash", "small", "mini", "medium", "120b", "8b-instant", "glm-4"]),
+    (4, ["7b", "8b", "lite", "fast", "r7b", "nano", "3b"]),
+    (5, ["micro", "tiny", "1b"]),
+]
+_COMPLEXITY_LABELS = {1: "critical", 2: "complex", 3: "standard", 4: "simple", 5: "trivial"}
+_provider_state: dict = {}   # populated at startup by _initialize_ratings()
 
 
 def _keys(env_var: str) -> list[str]:
@@ -205,6 +239,131 @@ PROVIDERS = _build_providers()
 
 # ── Credential pool ────────────────────────────────────────────────────────────
 
+# ── Smart routing helpers ─────────────────────────────────────────────────────
+
+def _rate_model(model_name: str) -> int:
+    mn = model_name.lower()
+    for key in sorted(KNOWN_MODEL_RATINGS, key=len, reverse=True):
+        if key in mn:
+            return KNOWN_MODEL_RATINGS[key]
+    for rating, patterns in _RATING_PATTERNS:
+        if any(p in mn for p in patterns):
+            return rating
+    return 3
+
+
+def _discover_best_model(base_url: str, key: str, extra_headers: dict = None) -> str | None:
+    try:
+        hdrs = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
+        r = requests.get(f"{base_url.rstrip('/')}/models", headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            return None
+        models = [m["id"] for m in r.json().get("data", []) if isinstance(m.get("id"), str)]
+        return min(models, key=_rate_model) if models else None
+    except Exception:
+        return None
+
+
+def _probe_provider(provider: dict, key: str) -> tuple:
+    """Returns (success, latency_ms, model_used). Auto-discovers alt model on 400/404."""
+    url  = provider["base_url"].rstrip("/") + "/chat/completions"
+    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+            **provider.get("headers", {})}
+    body = {"model": provider["model"],
+            "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+    t0 = time.time()
+    try:
+        r = requests.post(url, headers=hdrs, json=body, timeout=12)
+        latency = (time.time() - t0) * 1000
+        if r.status_code == 200:
+            return True, latency, provider["model"]
+        if r.status_code in (400, 404):
+            alt = _discover_best_model(provider["base_url"], key, provider.get("headers", {}))
+            if alt:
+                body["model"] = alt
+                t0 = time.time()
+                r2 = requests.post(url, headers=hdrs, json=body, timeout=12)
+                if r2.status_code == 200:
+                    return True, (time.time() - t0) * 1000, alt
+        return False, (time.time() - t0) * 1000, provider["model"]
+    except Exception:
+        return False, (time.time() - t0) * 1000, provider["model"]
+
+
+def classify_complexity(messages: list) -> int:
+    """Heuristic: 1 (critical) → 5 (trivial). No LLM call."""
+    content = " ".join(
+        m["content"] if isinstance(m.get("content"), str)
+        else " ".join(p.get("text", "") for p in m["content"] if isinstance(p, dict))
+        for m in messages if m.get("content")
+    )
+    tokens = len(content) // 4
+    cl = content.lower()
+    has_code    = "```" in content or any(k in cl for k in ["def ", "function ", "class ", "import "])
+    has_complex = any(k in cl for k in ["implement", "design", "architect", "debug", "refactor",
+                                         "algorithm", "optimize", "analyze", "build", "develop"])
+    has_simple  = any(k in cl for k in ["what is", "who is", "define", "translate", "yes or no"])
+    if tokens > 2000 or (has_code and has_complex): return 1
+    if tokens > 800  or has_complex:                return 2
+    if tokens > 300  or has_code:                   return 3
+    if tokens > 100  or (not has_simple):           return 4
+    return 5
+
+
+def _get_smart_ordered(providers: list, complexity: int) -> list:
+    """
+    Sort providers for this complexity: cheapest capable model first, then
+    overkill models, then too-weak as last resort. Never blocks.
+    """
+    def _key(p):
+        state  = _provider_state.get(p["name"], {})
+        rating = state.get("rating", _rate_model(p["model"]))
+        avail  = state.get("available", True)
+        if rating <= complexity:
+            return (0, complexity - rating, 0 if avail else 1)   # perfect match = 0 delta
+        return (1, rating - complexity, 0 if avail else 1)        # too weak — closest first
+    return sorted(providers, key=_key)
+
+
+def _initialize_ratings(providers: list, pool_ref):
+    """Background: probe all providers, fix bad models, assign ratings, persist state."""
+    global _provider_state
+    if STATE_FILE.exists():
+        try:
+            _provider_state = json.loads(STATE_FILE.read_text()).get("providers", {})
+            log.info(f"[ratings] Loaded cached state ({len(_provider_state)} providers)")
+        except Exception:
+            pass
+
+    log.info("[ratings] Background provider validation starting…")
+    new_state = {}
+    for p in providers:
+        name  = p["name"]
+        probe = pool_ref.pools.get(name, [])
+        if not probe:
+            new_state[name] = {"rating": _rate_model(p["model"]), "model": p["model"],
+                                "available": False, "latency_ms": 0, "overridden": False}
+            continue
+        key = probe[0]["key"]
+        ok, latency, actual = _probe_provider(p, key)
+        overridden = actual != p["model"]
+        if overridden:
+            log.info(f"[ratings]   {name}: model fixed {p['model']} → {actual}")
+            p["model"] = actual
+        rating = _rate_model(actual)
+        log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} rating={rating} model={actual} {latency:.0f}ms")
+        new_state[name] = {"rating": rating, "model": actual, "available": ok,
+                            "latency_ms": round(latency, 1), "overridden": overridden,
+                            "original_model": p["model"] if overridden else actual}
+    _provider_state = new_state
+    try:
+        STATE_FILE.write_text(json.dumps({"last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                           "providers": new_state}, indent=2))
+        log.info("[ratings] State persisted to disk")
+    except Exception as e:
+        log.warning(f"[ratings] Could not persist state: {e}")
+
+
 class CredentialPool:
     """Thread-safe round-robin key pool with per-key cooldown tracking."""
 
@@ -240,6 +399,9 @@ class CredentialPool:
 
 
 pool = CredentialPool(PROVIDERS)
+
+# Background: validate providers, fix models, assign ratings
+threading.Thread(target=_initialize_ratings, args=(PROVIDERS, pool), daemon=True).start()
 
 # ── Per-provider stats ─────────────────────────────────────────────────────────
 
@@ -406,19 +568,16 @@ def _estimated_tokens(messages: list) -> int:
 
 def _ordered_providers(payload: dict) -> list[dict]:
     """
-    Return providers in cascade order.
-    If FAST_ROUTE_THRESHOLD > 0 and the request is short, promote
-    low-latency providers (Groq, Cerebras, SambaNova) to the front.
+    Smart complexity-aware ordering: use cheapest capable model for simple
+    tasks, best model for complex ones. Falls back to fast-route legacy
+    behaviour when ratings aren't loaded yet.
     """
-    if FAST_ROUTE_TOKENS <= 0:
-        return PROVIDERS
-    tokens = _estimated_tokens(payload.get("messages", []))
-    if tokens <= FAST_ROUTE_TOKENS:
-        fast = [p for p in PROVIDERS if p["name"] in _FAST_PROVIDERS]
-        slow = [p for p in PROVIDERS if p["name"] not in _FAST_PROVIDERS]
-        log.debug(f"Short request (~{tokens} tokens) — fast-routing to {[p['name'] for p in fast]}")
-        return fast + slow
-    return PROVIDERS
+    messages   = payload.get("messages", [])
+    complexity = classify_complexity(messages)
+    ordered    = _get_smart_ordered(PROVIDERS, complexity)
+    log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
+             f"order={[p['name'] for p in ordered]}")
+    return ordered
 
 # ── Request forwarding ─────────────────────────────────────────────────────────
 
