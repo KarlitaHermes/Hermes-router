@@ -112,6 +112,7 @@ You only need one to start, but add as many as you can — that's what keeps you
 | GitHub Models | Free with any GitHub account | [github.com/settings/tokens](https://github.com/settings/tokens) |
 | Cerebras | Fast inference, free tier | [cloud.cerebras.ai](https://cloud.cerebras.ai) |
 | Groq | Fast inference, free tier | [console.groq.com](https://console.groq.com) |
+| Mistral | Free tier (mistral-small-latest) | [console.mistral.ai](https://console.mistral.ai) |
 
 **Tip:** Most providers let you create more than one key, and you can sign up with
 multiple Google / GitHub accounts to stack even more free quota. Add them all as
@@ -164,15 +165,32 @@ the keys for the providers you actually use — anything left blank is skipped a
 
 | Variable | Description |
 |---|---|
-| `GEMINI_API_KEYS` | Comma-separated Gemini keys |
-| `OPENROUTER_API_KEYS` | Comma-separated OpenRouter keys |
+| `GEMINI_API_KEYS` | Gemini keys (see multi-key formats below) |
+| `OPENROUTER_API_KEYS` | OpenRouter keys |
 | `SAMBANOVA_API_KEY` | SambaNova key |
 | `GITHUB_MODELS_TOKEN` | GitHub Models token |
 | `CEREBRAS_API_KEY` | Cerebras key |
 | `GROQ_API_KEY` | Groq key |
+| `MISTRAL_API_KEY` | Mistral key |
 
-> Multiple keys for one provider? Separate them with commas:
-> `GEMINI_API_KEYS=key_one,key_two,key_three`
+**Three ways to give a provider multiple keys (all work, all combine automatically):**
+
+```bash
+# 1. Comma-separated (canonical)
+GEMINI_API_KEYS=key1,key2,key3
+
+# 2. Numbered suffixes
+GROQ_API_KEY=key1
+GROQ_API_KEY_2=key2
+GROQ_API_KEY_3=key3
+
+# 3. Mix both — they merge and de-duplicate
+MISTRAL_API_KEY=key1
+MISTRAL_API_KEY_2=key2
+MISTRAL_API_KEYS=key3,key4
+```
+
+The router round-robins through all keys for a provider before cascading to the next one.
 
 ### Optional settings (sensible defaults — change only if you want to)
 

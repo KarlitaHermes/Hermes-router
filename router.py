@@ -59,8 +59,39 @@ _FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
 
 
 def _keys(env_var: str) -> list[str]:
-    """Parse comma-separated API keys from an environment variable."""
-    return [k.strip() for k in os.environ.get(env_var, "").split(",") if k.strip()]
+    """Collect all keys for a provider from three naming conventions (combined + de-duped):
+      1. Singular:  MISTRAL_API_KEY=k1
+      2. Plural:    MISTRAL_API_KEYS=k1,k2,k3   (comma-separated)
+      3. Numbered:  MISTRAL_API_KEY_2=k2, MISTRAL_API_KEY_3=k3, ...
+    The plural form is the canonical multi-key env var; singular and numbered are
+    convenience aliases that are merged in automatically.
+    """
+    collected = []
+    # singular (drop the trailing S if the caller passed the plural form)
+    singular = env_var[:-1] if env_var.endswith("S") else env_var
+    if singular != env_var:
+        single = os.environ.get(singular, "").strip()
+        if single:
+            collected.append(single)
+    # plural / comma-separated
+    for piece in os.environ.get(env_var, "").split(","):
+        piece = piece.strip()
+        if piece:
+            collected.append(piece)
+    # numbered suffixes on the singular name (_2, _3, ...)
+    i = 2
+    while True:
+        nv = os.environ.get(f"{singular}_{i}", "").strip()
+        if not nv:
+            break
+        collected.append(nv)
+        i += 1
+    seen, out = set(), []
+    for k in collected:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
 
 
 def _int_env(env_var: str, default: int = 0) -> int:
