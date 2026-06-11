@@ -165,6 +165,15 @@ def _build_providers() -> list[dict]:
             "keys":     groq_keys,
         })
 
+    cohere_keys = _keys("COHERE_API_KEYS") or _keys("COHERE_API_KEY")
+    if cohere_keys:
+        providers.append({
+            "name":     "cohere",
+            "base_url": "https://api.cohere.ai/compatibility/v1",
+            "model":    os.environ.get("COHERE_MODEL", "command-r7b-12-2024"),
+            "keys":     cohere_keys,
+        })
+
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
