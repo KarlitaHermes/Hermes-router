@@ -174,6 +174,15 @@ def _build_providers() -> list[dict]:
             "keys":     cohere_keys,
         })
 
+    zai_keys = _keys("GLM_API_KEYS") or _keys("GLM_API_KEY")
+    if zai_keys:
+        providers.append({
+            "name":     "zai",
+            "base_url": "https://api.z.ai/api/paas/v4",
+            "model":    os.environ.get("ZAI_MODEL", "glm-4.5-flash"),
+            "keys":     zai_keys,
+        })
+
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 

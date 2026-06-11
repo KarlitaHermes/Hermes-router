@@ -116,6 +116,7 @@ You only need one to start, but add as many as you can — that's what keeps you
 | Groq | Fast inference, free tier | [console.groq.com](https://console.groq.com) |
 | Mistral | Free tier (mistral-small-latest) | [console.mistral.ai](https://console.mistral.ai) |
 | Cohere | Free trial (1,000 calls/mo per key) | [dashboard.cohere.com](https://dashboard.cohere.com) |
+| Z.ai (GLM) | Free (glm-4.5-flash, ~1k req/day) | [z.ai](https://z.ai) |
 
 **Tip:** Most providers let you create more than one key, and you can sign up with
 multiple Google / GitHub accounts to stack even more free quota. Add them all as
