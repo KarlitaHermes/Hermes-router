@@ -12,7 +12,7 @@ A lightweight OpenAI-compatible proxy that:
   - Tracks per-provider latency and error rates
 
 Supported providers (configure via .env):
-  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq
+  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq → Mistral → Cohere → Z.ai (GLM)
 
 Quick start:
   pip install -r requirements.txt

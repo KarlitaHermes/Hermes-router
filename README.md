@@ -28,12 +28,15 @@ If that's you, this is a single Python file you run once and forget about.
                     ┌─────────────────────────────────────────┐
    Your app  ─────► │             hermes-router               │
  (OpenAI SDK,       │                                         │
-  curl, etc.)       │   Try Gemini      (key 1 → key 2 → …)    │
-                    │   then OpenRouter (key 1 → key 2 → …)    │
-                    │   then SambaNova                         │
-                    │   then GitHub Models                     │
-                    │   then Cerebras                          │
-                    │   then Groq                              │
+  curl, etc.)       │   Try Gemini      (key 1 → key 2 → …)  │
+                    │   then OpenRouter (key 1 → key 2 → …)  │
+                    │   then SambaNova                        │
+                    │   then GitHub Models                    │
+                    │   then Cerebras                         │
+                    │   then Groq                             │
+                    │   then Mistral                          │
+                    │   then Cohere                           │
+                    │   then Z.ai (GLM)                       │
                     └─────────────────────────────────────────┘
 ```
 
@@ -238,6 +241,8 @@ the keys for the providers you actually use — anything left blank is skipped a
 | `CEREBRAS_API_KEY` | Cerebras key |
 | `GROQ_API_KEY` | Groq key |
 | `MISTRAL_API_KEY` | Mistral key |
+| `COHERE_API_KEY` | Cohere key |
+| `GLM_API_KEY` | Z.ai / GLM key |
 
 **Three ways to give a provider multiple keys (all work, all combine automatically):**
 
@@ -387,6 +392,15 @@ Try Gemini key 1 ──429──► Try Gemini key 2 ──429──► All Gemi
                                                               │ (exhausted)
                                                               ▼
                                                            Try Groq
+                                                              │ (exhausted)
+                                                              ▼
+                                                         Try Mistral
+                                                              │ (exhausted)
+                                                              ▼
+                                                         Try Cohere
+                                                              │ (exhausted)
+                                                              ▼
+                                                       Try Z.ai (GLM)
                                                               │ (exhausted)
                                                               ▼
                                                  503 — all providers exhausted
