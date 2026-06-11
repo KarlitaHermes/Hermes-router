@@ -1,5 +1,7 @@
 # hermes-router
 
+![Hermes Router](hermes-router-banner.png)
+
 **Keep your AI app online for free.** hermes-router sits between your app and a bunch of
 free AI providers (Gemini, OpenRouter, Groq, and more). When one provider hits its rate
 limit, it automatically tries the next one — so your app keeps working instead of erroring out.
