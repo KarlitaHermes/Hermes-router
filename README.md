@@ -158,6 +158,68 @@ Streaming (`"stream": true`) works too.
 
 ---
 
+## Works with any agent framework
+
+hermes-router speaks the OpenAI API, so it drops into any framework that supports a custom
+`base_url` — no code changes beyond the two lines below.
+
+**LangChain**
+```python
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(
+    base_url="http://localhost:8319/v1",
+    api_key="sk-router-1",
+    model="hermes-router",
+)
+```
+
+**LlamaIndex**
+```python
+from llama_index.llms.openai import OpenAI
+
+llm = OpenAI(
+    api_base="http://localhost:8319/v1",
+    api_key="sk-router-1",
+    model="hermes-router",
+)
+```
+
+**CrewAI**
+```python
+from crewai import LLM
+
+llm = LLM(
+    model="openai/hermes-router",
+    base_url="http://localhost:8319/v1",
+    api_key="sk-router-1",
+)
+```
+
+**AutoGen**
+```python
+config_list = [{
+    "model": "hermes-router",
+    "api_key": "sk-router-1",
+    "base_url": "http://localhost:8319/v1",
+}]
+```
+
+**Hermes Agent** (native)
+```yaml
+# config.yaml
+custom_providers:
+  - name: my-router
+    base_url: http://localhost:8319/v1
+    api_key_env: PROXY_API_KEY
+model:
+  default: custom:my-router
+```
+
+Any other framework with an `openai_api_base` / `base_url` setting works the same way.
+
+---
+
 ## Configuration
 
 Everything is set in the `.env` file (or as real environment variables). You only need
