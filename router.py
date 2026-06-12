@@ -365,15 +365,16 @@ def _initialize_ratings(providers: list, pool_ref):
             continue
         key = probe[0]["key"]
         ok, latency, actual = _probe_provider(p, key)
-        overridden = actual != p["model"]
+        original   = p["model"]
+        overridden = actual != original
         if overridden:
-            log.info(f"[ratings]   {name}: model fixed {p['model']} → {actual}")
+            log.info(f"[ratings]   {name}: model fixed {original} → {actual}")
             p["model"] = actual
         rating = _rate_model(actual)
         log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} rating={rating} model={actual} {latency:.0f}ms")
         new_state[name] = {"rating": rating, "model": actual, "available": ok,
                             "latency_ms": round(latency, 1), "overridden": overridden,
-                            "original_model": p["model"] if overridden else actual}
+                            "original_model": original}
     _provider_state = new_state
     try:
         STATE_FILE.write_text(json.dumps({"last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
