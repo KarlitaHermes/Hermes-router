@@ -276,14 +276,25 @@ The router round-robins through all keys for a provider before cascading to the 
 | `GITHUB_MODELS_MODEL` | Which GitHub model to use | `gpt-4o-mini` |
 | `CEREBRAS_MODEL` | Which Cerebras model to use | `gpt-oss-120b` |
 | `GROQ_MODEL` | Which Groq model to use | `llama-3.1-8b-instant` |
+| `MISTRAL_MODEL` | Which Mistral model to use | `mistral-small-latest` |
+| `COHERE_MODEL` | Which Cohere model to use | `command-r7b-12-2024` |
+| `ZAI_MODEL` | Which Z.ai (GLM) model to use | `glm-4.5-flash` |
 | `ROUTER_MODEL_ID` | The model name your app sends | `hermes-router` |
 | `CACHE_TTL_SECONDS` | Cache identical answers for N seconds (`0` = off) | `300` |
 | `CACHE_MAX_SIZE` | How many answers to keep cached | `100` |
-| `FAST_ROUTE_THRESHOLD` | Send short requests to fast providers first (`0` = off) | `0` |
+| `FAST_ROUTE_THRESHOLD` | Requests shorter than this (estimated tokens) prefer low-latency providers (Groq, Cerebras, SambaNova) when ratings tie (`0` = off) | `0` |
+| `ROUTER_STATE_TTL_HOURS` | Reuse saved provider ratings for N hours instead of re-probing (and spending quota) on every restart (`0` = always re-probe) | `24` |
+| `MAX_REQUEST_BYTES` | Largest request body accepted | `10485760` (10 MB) |
+| `WORKER_THREADS` | Server worker threads | `16` |
 | `GROQ_SKIP_TOKENS_OVER` | Skip Groq when a request is bigger than this (it would be rejected anyway). Set `0` to disable, or raise it if you're on a paid Groq tier. | `5500` |
 
 > Any provider can have its own skip ceiling with `{PROVIDER}_SKIP_TOKENS_OVER`,
 > e.g. `CEREBRAS_SKIP_TOKENS_OVER=30000`.
+
+> **Note on the cache:** cached answers are shared across *all* clients of your
+> router (every `PROXY_API_KEYS` holder). That's perfect for personal use, but if
+> you expose one router to multiple untrusted users, set `CACHE_TTL_SECONDS=0` so
+> one user can never receive a response cached from another.
 
 ---
 
