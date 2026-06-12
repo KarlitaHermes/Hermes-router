@@ -136,6 +136,16 @@ def _int_env(env_var: str, default: int = 0) -> int:
         return default
 
 
+def _parse_retry_after(value, default: int = 60) -> int:
+    """Parse a Retry-After header value. RFC 9110 allows either delay-seconds
+    or an HTTP date; some providers also send fractional seconds. Anything we
+    can't read as a number falls back to the default cooldown."""
+    try:
+        return max(1, int(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Provider definitions ───────────────────────────────────────────────────────
 
 def _build_providers() -> list[dict]:
@@ -700,7 +710,7 @@ def chat():
 
             if resp.status_code == 429:
                 stats.record_error(name)
-                retry_after = int(resp.headers.get("Retry-After", 60))
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                 pool.mark_rate_limited(name, key, retry_after=retry_after)
                 log.warning(f"  {name} 429 — cooldown {retry_after}s, trying next key")
                 continue
