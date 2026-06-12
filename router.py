@@ -829,4 +829,10 @@ if __name__ == "__main__":
     _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}
     if _skips:
         log.info(f"Large-payload skip ceilings: {_skips}")
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    try:
+        from waitress import serve
+        log.info("Serving with waitress (production WSGI)")
+        serve(app, host="0.0.0.0", port=PORT, threads=int(os.environ.get("WORKER_THREADS", 16)))
+    except ImportError:
+        log.warning("waitress not installed — falling back to Flask dev server")
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
