@@ -199,6 +199,15 @@ def _build_providers() -> list[dict]:
             "keys":     groq_keys,
         })
 
+    mistral_keys = _keys("MISTRAL_API_KEYS") or _keys("MISTRAL_API_KEY")
+    if mistral_keys:
+        providers.append({
+            "name":     "mistral",
+            "base_url": "https://api.mistral.ai/v1",
+            "model":    os.environ.get("MISTRAL_MODEL", "mistral-small-latest"),
+            "keys":     mistral_keys,
+        })
+
     cohere_keys = _keys("COHERE_API_KEYS") or _keys("COHERE_API_KEY")
     if cohere_keys:
         providers.append({
