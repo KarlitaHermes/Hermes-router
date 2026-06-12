@@ -488,14 +488,18 @@ class ResponseCache:
         self.hits     = 0
         self.misses   = 0
 
-    def _hash(self, model: str, messages: list) -> str:
-        content = json.dumps({"model": model, "messages": messages}, sort_keys=True)
+    def _hash(self, payload: dict) -> str:
+        # Hash the entire request (minus "stream", which doesn't change the
+        # answer) so requests differing only in temperature, max_tokens,
+        # tools, response_format, etc. never collide.
+        relevant = {k: v for k, v in payload.items() if k != "stream"}
+        content = json.dumps(relevant, sort_keys=True, default=str)
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
-    def get(self, model: str, messages: list) -> dict | None:
+    def get(self, payload: dict) -> dict | None:
         if self.ttl <= 0:
             return None
-        key = self._hash(model, messages)
+        key = self._hash(payload)
         with self.lock:
             if key in self._store:
                 data, ts = self._store[key]
@@ -507,10 +511,10 @@ class ResponseCache:
             self.misses += 1
         return None
 
-    def set(self, model: str, messages: list, data: dict):
+    def set(self, payload: dict, data: dict):
         if self.ttl <= 0:
             return
-        key = self._hash(model, messages)
+        key = self._hash(payload)
         with self.lock:
             if len(self._store) >= self.max_size:
                 self._store.popitem(last=False)  # evict oldest
@@ -669,11 +673,10 @@ def chat():
     payload   = request.get_json(force=True)
     streaming = payload.get("stream", False)
     messages  = payload.get("messages", [])
-    model     = payload.get("model", ROUTER_MODEL)
 
     # Cache check (non-streaming only)
     if not streaming:
-        cached = cache.get(model, messages)
+        cached = cache.get(payload)
         if cached is not None:
             log.info("↩ cache hit")
             return jsonify(cached)
@@ -747,7 +750,7 @@ def chat():
             else:
                 data = resp.json()
                 _strip_response(data)
-                cache.set(model, messages, data)
+                cache.set(payload, data)
                 return jsonify(data), resp.status_code
 
         log.warning(f"✗ {name} exhausted — cascading")
