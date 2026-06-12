@@ -272,13 +272,16 @@ def _rate_model(model_name: str) -> int:
     return 3
 
 
-def _discover_best_model(base_url: str, key: str, extra_headers: dict = None) -> str | None:
+def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
+                         free_only: bool = False) -> str | None:
     try:
         hdrs = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
         r = requests.get(f"{base_url.rstrip('/')}/models", headers=hdrs, timeout=10)
         if r.status_code != 200:
             return None
         models = [m["id"] for m in r.json().get("data", []) if isinstance(m.get("id"), str)]
+        if free_only:
+            models = [m for m in models if m.endswith(":free")]
         return min(models, key=_rate_model) if models else None
     except Exception:
         return None
@@ -298,7 +301,10 @@ def _probe_provider(provider: dict, key: str) -> tuple:
         if r.status_code == 200:
             return True, latency, provider["model"]
         if r.status_code in (400, 404):
-            alt = _discover_best_model(provider["base_url"], key, provider.get("headers", {}))
+            # OpenRouter lists paid models alongside free ones — never let
+            # auto-discovery silently pick something that costs credits.
+            alt = _discover_best_model(provider["base_url"], key, provider.get("headers", {}),
+                                       free_only=provider["name"] == "openrouter")
             if alt:
                 body["model"] = alt
                 t0 = time.time()
