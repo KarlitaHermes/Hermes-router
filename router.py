@@ -647,6 +647,8 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
+# Cap request bodies so a buggy client can't exhaust memory (Flask returns 413)
+app.config["MAX_CONTENT_LENGTH"] = _int_env("MAX_REQUEST_BYTES", 10 * 1024 * 1024)
 
 
 def _auth_check():
@@ -679,7 +681,10 @@ def chat():
     if err:
         return err
 
-    payload   = request.get_json(force=True)
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": {"message": "request body must be a JSON object",
+                                  "type": "invalid_request_error"}}), 400
     streaming = payload.get("stream", False)
     messages  = payload.get("messages", [])
 
