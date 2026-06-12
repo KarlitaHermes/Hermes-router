@@ -20,7 +20,7 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging, hashlib
+import json, os, time, threading, logging, hashlib, hmac
 from pathlib import Path
 from collections import deque, OrderedDict
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -650,8 +650,10 @@ app = Flask(__name__)
 
 
 def _auth_check():
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if token not in PROXY_API_KEYS:
+    header = request.headers.get("Authorization", "").strip()
+    token  = header[7:].strip() if header[:7].lower() == "bearer " else header
+    # compare_digest keeps the comparison constant-time per key
+    if not any(hmac.compare_digest(token, k) for k in PROXY_API_KEYS):
         return jsonify({"error": "unauthorized"}), 401
 
 
