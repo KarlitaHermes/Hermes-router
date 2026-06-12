@@ -54,6 +54,7 @@ CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabl
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
 STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
+STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 
 # Providers known for low-latency inference — promoted for short requests
 _FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
@@ -355,8 +356,21 @@ def _initialize_ratings(providers: list, pool_ref):
     global _provider_state
     if STATE_FILE.exists():
         try:
-            _provider_state = json.loads(STATE_FILE.read_text()).get("providers", {})
+            cached_doc = json.loads(STATE_FILE.read_text())
+            _provider_state = cached_doc.get("providers", {})
             log.info(f"[ratings] Loaded cached state ({len(_provider_state)} providers)")
+            # Probes cost a real completion per provider, so skip them while the
+            # state is fresh and still covers every configured provider.
+            age = time.time() - cached_doc.get("last_updated_ts", 0)
+            if (STATE_TTL_HOURS > 0 and age < STATE_TTL_HOURS * 3600
+                    and all(p["name"] in _provider_state for p in providers)):
+                for p in providers:
+                    cached_model = _provider_state[p["name"]].get("model")
+                    if cached_model:
+                        p["model"] = cached_model
+                log.info(f"[ratings] State is {age/3600:.1f}h old (< {STATE_TTL_HOURS}h TTL) "
+                         "— skipping startup probes")
+                return
         except Exception:
             pass
 
@@ -384,6 +398,7 @@ def _initialize_ratings(providers: list, pool_ref):
     _provider_state = new_state
     try:
         STATE_FILE.write_text(json.dumps({"last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                           "last_updated_ts": time.time(),
                                            "providers": new_state}, indent=2))
         log.info("[ratings] State persisted to disk")
     except Exception as e:
