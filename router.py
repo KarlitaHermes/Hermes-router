@@ -329,18 +329,24 @@ def classify_complexity(messages: list) -> int:
     return 5
 
 
-def _get_smart_ordered(providers: list, complexity: int) -> list:
+def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) -> list:
     """
     Sort providers for this complexity: cheapest capable model first, then
     overkill models, then too-weak as last resort. Never blocks.
+
+    When FAST_ROUTE_THRESHOLD is set and the request is shorter than it,
+    low-latency providers win ties between otherwise equally-ranked options.
     """
+    fast_first = FAST_ROUTE_TOKENS > 0 and 0 < est_tokens < FAST_ROUTE_TOKENS
+
     def _key(p):
         state  = _provider_state.get(p["name"], {})
         rating = state.get("rating", _rate_model(p["model"]))
         avail  = state.get("available", True)
+        fast   = 0 if (fast_first and p["name"] in _FAST_PROVIDERS) else 1
         if rating <= complexity:
-            return (0, complexity - rating, 0 if avail else 1)   # perfect match = 0 delta
-        return (1, rating - complexity, 0 if avail else 1)        # too weak — closest first
+            return (0, complexity - rating, 0 if avail else 1, fast)   # perfect match = 0 delta
+        return (1, rating - complexity, 0 if avail else 1, fast)        # too weak — closest first
     return sorted(providers, key=_key)
 
 
@@ -593,12 +599,12 @@ def _estimated_tokens(messages: list) -> int:
 def _ordered_providers(payload: dict) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
-    tasks, best model for complex ones. Falls back to fast-route legacy
-    behaviour when ratings aren't loaded yet.
+    tasks, best model for complex ones. With FAST_ROUTE_THRESHOLD set,
+    short requests break ties in favour of low-latency providers.
     """
     messages   = payload.get("messages", [])
     complexity = classify_complexity(messages)
-    ordered    = _get_smart_ordered(PROVIDERS, complexity)
+    ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages))
     log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
              f"order={[p['name'] for p in ordered]}")
     return ordered
