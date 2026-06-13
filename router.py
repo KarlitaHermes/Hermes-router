@@ -12,7 +12,7 @@ A lightweight OpenAI-compatible proxy that:
   - Tracks per-provider latency and error rates
 
 Supported providers (configure via .env):
-  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq → Mistral → Cohere → Z.ai (GLM)
+  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq → Mistral → Cohere → Z.ai (GLM) → Naga
 
 Quick start:
   pip install -r requirements.txt
@@ -66,7 +66,7 @@ _FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
 KNOWN_MODEL_RATINGS: dict = {
     # 1 — Outstanding
     "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
-    "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
+    "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1, "nemotron-3-ultra": 1,
     # 2 — Best
     "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
     "llama-3.3-70b": 2, "llama-3.1-70b": 2,
@@ -235,6 +235,15 @@ def _build_providers() -> list[dict]:
             "base_url": "https://api.z.ai/api/paas/v4",
             "model":    os.environ.get("ZAI_MODEL", "glm-4.5-flash"),
             "keys":     zai_keys,
+        })
+
+    naga_keys = _keys("NAGA_API_KEYS") or _keys("NAGA_API_KEY")
+    if naga_keys:
+        providers.append({
+            "name":     "naga",
+            "base_url": "https://api.naga.ac/v1",
+            "model":    os.environ.get("NAGA_MODEL", "nemotron-3-ultra-550b-a55b:free"),
+            "keys":     naga_keys,
         })
 
     if not providers:
