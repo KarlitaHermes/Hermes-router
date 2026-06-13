@@ -39,6 +39,10 @@ for arg in "$@"; do
   esac
 done
 
+# How this updater was invoked, for use in messages. Set by the `hermes-router`
+# wrapper to "hermes-router update"; otherwise we're being run directly.
+SELF="${HR_INVOKE:-./update.sh}"
+
 log()  { printf '\033[1;36m[update]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[update]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[update]\033[0m %s\n' "$*"; }
@@ -109,7 +113,7 @@ echo "        ── what's new ──"
 git --no-pager log --oneline "HEAD..origin/${BRANCH}" | sed 's/^/        /'
 
 if [ "$CHECK_ONLY" = "1" ]; then
-  log "run ./update.sh (without --check) to apply it."
+  log "run ${SELF} (without --check) to apply it."
   exit 0
 fi
 
@@ -118,7 +122,7 @@ fi
 # catches edits to TRACKED files (e.g. you hand-tweaked router.py).
 if ! git diff --quiet || ! git diff --cached --quiet; then
   err "you have local changes to tracked files (e.g. router.py)."
-  err "stash them first, then re-run:   git stash && ./update.sh && git stash pop"
+  err "stash them first, then re-run:   git stash && ${SELF} && git stash pop"
   exit 1
 fi
 
@@ -130,7 +134,7 @@ merge_out="$(git merge --ff-only "origin/${BRANCH}" 2>&1)"; merge_rc=$?
 if [ "$merge_rc" -ne 0 ]; then
   if printf '%s' "$merge_out" | grep -q "untracked working tree files"; then
     err "the update adds files that you already have locally (untracked), so it"
-    err "won't overwrite them. Move or delete these, then re-run ./update.sh:"
+    err "won't overwrite them. Move or delete these, then re-run ${SELF}:"
     printf '%s\n' "$merge_out" | grep -E '^[[:space:]]+[^[:space:]]' | sed 's/^[[:space:]]*/        /'
   else
     err "can't fast-forward (your history has diverged from origin)."

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# hermes-router — command-line wrapper
+#
+# Usage:
+#   hermes-router update [--check]   Update to the latest version (safe; auto-rollback)
+#   hermes-router start              Run the router (same as: python router.py)
+#   hermes-router version            Show the installed version
+#   hermes-router help               Show this help
+#
+# Install this command with ./install.sh (symlinks it onto your PATH).
+#
+set -uo pipefail
+
+# Resolve this script's real location (following symlinks) so we can find the
+# repo even when invoked via a symlink on PATH.
+SOURCE="${BASH_SOURCE[0]:-$0}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
+done
+REPO="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+PYTHON="${PYTHON:-python3}"
+
+usage() { awk 'NR>1 && /^#/ {sub(/^#[[:space:]]?/,""); print; next} NR>1 {exit}' "$SOURCE"; }
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+  update)
+    # Hand off to the safe updater; HR_INVOKE makes its messages say the right name.
+    HR_INVOKE="hermes-router update" exec "$REPO/update.sh" "$@"
+    ;;
+  start|run|serve)
+    exec "$PYTHON" "$REPO/router.py" "$@"
+    ;;
+  version|--version|-v)
+    v="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "hermes-router ${v}"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    echo "unknown command: ${cmd}" >&2
+    echo >&2
+    usage >&2
+    exit 1
+    ;;
+esac

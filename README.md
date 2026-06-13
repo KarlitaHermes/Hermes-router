@@ -424,15 +424,26 @@ docker compose up -d
 ## Keeping it up to date
 
 This project gets frequent improvements (new providers, better default models,
-performance fixes). To pull the latest version safely, run the included updater
-from your clone:
+performance fixes). Install the `hermes-router` command once, then updating is a
+single familiar command from anywhere:
 
 ```bash
-./update.sh            # check + update + restart if there's a new version
-./update.sh --check    # just tell me if an update is available (changes nothing)
+./install.sh                    # one-time: adds the `hermes-router` command to your PATH
+
+hermes-router update            # check + update + restart if there's a new version
+hermes-router update --check    # just tell me if an update is available (changes nothing)
+hermes-router start             # run the router (same as: python router.py)
+hermes-router version           # show the installed version
 ```
 
-**It's built so an update can't break your setup:**
+No install? The same updater runs straight from your clone:
+
+```bash
+./update.sh
+./update.sh --check
+```
+
+**Either way, it's built so an update can't break your setup:**
 
 - It **never touches your `.env` or `router_state.json`** — your keys and runtime
   state are left exactly as they are.
@@ -445,11 +456,11 @@ If you run hermes-router as a systemd service named something other than
 `hermes-router`, tell the updater:
 
 ```bash
-HERMES_ROUTER_SERVICE=my-router ./update.sh
+HERMES_ROUTER_SERVICE=my-router hermes-router update
 ```
 
 > Prefer to do it by hand? `git pull` then restart your router — your `.env` is
-> gitignored, so a pull never overwrites your keys. The script just adds the
+> gitignored, so a pull never overwrites your keys. The command just adds the
 > validate-and-rollback safety net on top.
 
 ---
