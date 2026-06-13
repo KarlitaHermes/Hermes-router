@@ -12,7 +12,7 @@ A lightweight OpenAI-compatible proxy that:
   - Tracks per-provider latency and error rates
 
 Supported providers (configure via .env):
-  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq → Mistral → Cohere → Z.ai (GLM) → Naga
+  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq → Mistral → Cohere → Z.ai (GLM) → Naga → NVIDIA NIM
 
 Quick start:
   pip install -r requirements.txt
@@ -66,7 +66,8 @@ _FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
 KNOWN_MODEL_RATINGS: dict = {
     # 1 — Outstanding
     "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
-    "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1, "nemotron-3-ultra": 1,
+    "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
+    "nemotron-3-ultra": 1, "deepseek-v4-flash": 1, "deepseek-v4": 1,
     # 2 — Best
     "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
     "llama-3.3-70b": 2, "llama-3.1-70b": 2,
@@ -244,6 +245,15 @@ def _build_providers() -> list[dict]:
             "base_url": "https://api.naga.ac/v1",
             "model":    os.environ.get("NAGA_MODEL", "nemotron-3-ultra-550b-a55b:free"),
             "keys":     naga_keys,
+        })
+
+    nvidia_keys = _keys("NVIDIA_API_KEYS") or _keys("NVIDIA_API_KEY")
+    if nvidia_keys:
+        providers.append({
+            "name":     "nvidia",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "model":    os.environ.get("NVIDIA_MODEL", "deepseek-ai/deepseek-v4-flash"),
+            "keys":     nvidia_keys,
         })
 
     if not providers:

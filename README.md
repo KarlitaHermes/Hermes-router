@@ -38,6 +38,7 @@ If that's you, this is a single Python file you run once and forget about.
                     │   then Cohere                           │
                     │   then Z.ai (GLM)                       │
                     │   then Naga (Nemotron Ultra)            │
+                    │   then NVIDIA NIM (DeepSeek V4 Flash)  │
                     └─────────────────────────────────────────┘
 ```
 
@@ -122,6 +123,7 @@ You only need one to start, but add as many as you can — that's what keeps you
 | Cohere | Free trial (1,000 calls/mo per key) | [dashboard.cohere.com](https://dashboard.cohere.com) |
 | Z.ai (GLM) | Free (glm-4.5-flash, ~1k req/day) | [z.ai](https://z.ai) |
 | Naga AI | Free (Nemotron-3-Ultra-550B, 100 req/day) | [naga.ac](https://naga.ac) |
+| NVIDIA NIM | Free (77+ models, 40 req/min per key) | [build.nvidia.com](https://build.nvidia.com) |
 
 **Tip:** Most providers let you create more than one key, and you can sign up with
 multiple Google / GitHub accounts to stack even more free quota. Add them all as
@@ -246,6 +248,7 @@ the keys for the providers you actually use — anything left blank is skipped a
 | `COHERE_API_KEY` | Cohere key |
 | `GLM_API_KEY` | Z.ai / GLM key |
 | `NAGA_API_KEY` | Naga AI key |
+| `NVIDIA_API_KEY` | NVIDIA NIM key |
 
 **Three ways to give a provider multiple keys (all work, all combine automatically):**
 
@@ -283,6 +286,7 @@ The router round-robins through all keys for a provider before cascading to the 
 | `COHERE_MODEL` | Which Cohere model to use | `command-r7b-12-2024` |
 | `ZAI_MODEL` | Which Z.ai (GLM) model to use | `glm-4.5-flash` |
 | `NAGA_MODEL` | Which Naga model to use | `nemotron-3-ultra-550b-a55b:free` |
+| `NVIDIA_MODEL` | Which NVIDIA NIM model to use | `deepseek-ai/deepseek-v4-flash` |
 | `ROUTER_MODEL_ID` | The model name your app sends | `hermes-router` |
 | `CACHE_TTL_SECONDS` | Cache identical answers for N seconds (`0` = off) | `300` |
 | `CACHE_MAX_SIZE` | How many answers to keep cached | `100` |
@@ -419,6 +423,9 @@ Try Gemini key 1 ──429──► Try Gemini key 2 ──429──► All Gemi
                                                               │ (exhausted)
                                                               ▼
                                                           Try Naga
+                                                              │ (exhausted)
+                                                              ▼
+                                                       Try NVIDIA NIM
                                                               │ (exhausted)
                                                               ▼
                                                  503 — all providers exhausted
