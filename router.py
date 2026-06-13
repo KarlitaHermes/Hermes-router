@@ -92,6 +92,8 @@ KNOWN_MODEL_RATINGS: dict = {
     "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
     "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
     "nemotron-3-ultra": 1,
+    "gpt-4.5": 1, "claude-3-7": 1, "gemini-2.0-ultra": 1,
+    "deepseek-r2": 1, "qwen3-235b": 1, "qwen3-72b": 1,
     # 2 — Best
     "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
     "llama-3.3-70b": 2, "llama-3.1-70b": 2,
@@ -100,20 +102,31 @@ KNOWN_MODEL_RATINGS: dict = {
     "deepseek-v4-flash": 2, "deepseek-v4": 2,  # capable but slow cold-start → "best", not first-choice
     "deepseek-v3": 2, "deepseek-v2": 2,
     "claude-sonnet": 2, "claude-3-5": 2, "grok-2": 2,
+    "qwen2.5-72b": 2, "qwen-72b": 2, "qwen3-32b": 2,
+    "phi-4": 2, "phi-4-reasoning": 2,
+    "mixtral-8x22b": 2, "wizardlm-2-8x22b": 2,
+    "yi-large": 2, "moonshot-v1": 2,
+    "llama-4-maverick": 2, "llama-4-scout": 2,
     # 3 — Good
     "gemini-2.5-flash-lite": 3, "gemini-1.5-flash": 3,
     "gpt-4o-mini": 3, "gpt-oss-120b": 3,
     "mistral-small": 3, "glm-4.5-flash": 3, "glm-4.7-flash": 3,
     "llama-3.1-8b-instant": 3,
+    "qwen2.5-32b": 3, "qwen3-14b": 3, "qwen3-8b": 3,
+    "phi-3.5": 3, "phi-3-medium": 3,
+    "mixtral-8x7b": 3, "wizardlm-2-7b": 3,
+    "yi-medium": 3, "yi-6b": 3,
     # 4 — Fair
     "command-r7b": 4, "command-r7b-12-2024": 4,
     "llama-3.2-3b": 4, "mistral-7b": 4,
+    "qwen2.5-7b": 4, "qwen3-4b": 4, "phi-3-mini": 4,
+    "phi-3.5-mini": 4, "yi-mini": 4,
 }
 _RATING_PATTERNS: list = [
-    (1, ["pro-exp", "ultra", "opus", "o3", "o1-pro"]),
-    (2, ["70b", "large", "plus", "pro", "turbo", "super", "sonnet"]),
-    (3, ["flash", "small", "mini", "medium", "120b", "8b-instant", "glm-4"]),
-    (4, ["7b", "8b", "lite", "fast", "r7b", "nano", "3b"]),
+    (1, ["pro-exp", "ultra", "opus", "o3", "o1-pro", "405b", "671b", "r1-zero"]),
+    (2, ["70b", "large", "plus", "pro", "turbo", "super", "sonnet", "72b", "32b", "maverick", "scout", "phi-4", "wizardlm"]),
+    (3, ["flash", "small", "mini", "medium", "120b", "8b-instant", "glm-4", "14b", "22b", "mixtral", "qwen", "yi-m", "phi-3"]),
+    (4, ["7b", "8b", "lite", "fast", "r7b", "nano", "3b", "phi-3-mini", "phi-3.5-mini", "yi-mini", "4b"]),
     (5, ["micro", "tiny", "1b"]),
 ]
 _COMPLEXITY_LABELS = {1: "critical", 2: "complex", 3: "standard", 4: "simple", 5: "trivial"}
@@ -386,8 +399,14 @@ def classify_complexity(messages: list) -> int:
     cl = content.lower()
     has_code    = "```" in content or any(k in cl for k in ["def ", "function ", "class ", "import "])
     has_complex = any(k in cl for k in ["implement", "design", "architect", "debug", "refactor",
-                                         "algorithm", "optimize", "analyze", "build", "develop"])
-    has_simple  = any(k in cl for k in ["what is", "who is", "define", "translate", "yes or no"])
+                                         "algorithm", "optimize", "analyze", "build", "develop",
+                                         "summarize", "explain how", "compare", "research", "create a plan",
+                                         "generate", "convert", "migrate", "write tests", "test cases",
+                                         "step by step", "walk me through", "help me understand"])
+    has_simple  = any(k in cl for k in ["what is", "who is", "define", "translate", "yes or no",
+                                         "how many", "give me a number", "true or false", "in one word",
+                                         "spell", "what does", "one sentence", "yes or no answer",
+                                         "what year", "what time", "how old"])
     if tokens > 2000 or (has_code and has_complex): return 1
     if tokens > 800  or has_complex:                return 2
     if tokens > 300  or has_code:                   return 3
