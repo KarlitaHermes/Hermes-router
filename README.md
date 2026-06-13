@@ -488,9 +488,15 @@ The router round-robins through all keys for a provider before cascading to the 
 | `MAX_REQUEST_BYTES` | Largest request body accepted | `10485760` (10 MB) |
 | `WORKER_THREADS` | Server worker threads | `16` |
 | `GROQ_SKIP_TOKENS_OVER` | Skip Groq when a request is bigger than this (it would be rejected anyway). Set `0` to disable, or raise it if you're on a paid Groq tier. | `5500` |
+| `SAMBANOVA_SKIP_TOKENS_OVER` | Skip SambaNova above this size (its default model caps at 32K context) | `30000` |
+| `GITHUB_MODELS_SKIP_TOKENS_OVER` | Skip GitHub Models above this size (gpt-4o free tier ~8K input limit) | `6000` |
+| `COHERE_MAX_OUTPUT_TOKENS` | Clamp `max_tokens` down to this for Cohere (it 400s above its 8192 output cap) | `8192` |
+| `GITHUB_MODELS_MAX_OUTPUT_TOKENS` | Clamp `max_tokens` down to this for GitHub Models | `16384` |
 
-> Any provider can have its own skip ceiling with `{PROVIDER}_SKIP_TOKENS_OVER`,
-> e.g. `CEREBRAS_SKIP_TOKENS_OVER=30000`.
+> Any provider can have its own size ceiling with `{PROVIDER}_SKIP_TOKENS_OVER`
+> (skip oversized requests, e.g. `CEREBRAS_SKIP_TOKENS_OVER=30000`) or an output
+> cap with `{PROVIDER}_MAX_OUTPUT_TOKENS` (clamp `max_tokens` so a provider that
+> rejects large output values still answers). Set either to `0` to disable.
 
 > **Note on the cache:** cached answers are shared across *all* clients of your
 > router (every `PROXY_API_KEYS` holder). That's perfect for personal use, but if
@@ -691,6 +697,12 @@ two different things: provider keys go in `.env`; the key your *app* uses is `PR
 Check `/v1/status` for a `skip_if_tokens_over` value — your prompts may be larger than that
 provider's limit. Raise the limit (e.g. `GROQ_SKIP_TOKENS_OVER=0` to disable) if you're on
 a paid tier.
+
+**A provider keeps returning 400 "max_tokens too large"**
+Some providers reject the whole request when `max_tokens` exceeds their output cap. The
+router clamps it automatically for known cases (Cohere, GitHub Models); for others, set
+`{PROVIDER}_MAX_OUTPUT_TOKENS` to that provider's limit (see `/v1/status` for the current
+value).
 
 **Nothing happens / connection refused**
 Make sure `python router.py` is still running and you're using the right port (default 8319).

@@ -299,16 +299,28 @@ def _build_providers() -> list[dict]:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
     # Per-provider "skip when the request is too big" ceiling. Some free tiers
-    # reject large payloads outright (e.g. Groq's free tier caps tokens-per-minute
-    # at ~6000 and returns 413), so trying them with a big prompt just wastes a
-    # round-trip before cascading. When the estimated request size exceeds a
+    # reject large payloads outright, so trying them with a big prompt just wastes
+    # a round-trip before cascading. When the estimated request size exceeds a
     # provider's ceiling, that provider is skipped entirely.
     #   Configure via  {PROVIDER}_SKIP_TOKENS_OVER  (0 = never skip).
-    # Groq defaults to 5500 to match its free TPM; override if you're on a paid tier.
-    _skip_defaults = {"groq": 5500}
+    # Defaults match each free tier's known limit:
+    #   • groq          ~6000 TPM → 413
+    #   • sambanova     DeepSeek-V3.2 here caps at 32K context → 400
+    #   • github_models gpt-4o free tier ~8K input-token limit → 413
+    _skip_defaults = {"groq": 5500, "sambanova": 30000, "github_models": 6000}
     for p in providers:
         env_var = f"{p['name'].upper()}_SKIP_TOKENS_OVER"
         p["skip_if_tokens_over"] = _int_env(env_var, _skip_defaults.get(p["name"], 0))
+
+    # Per-provider output-token ceiling. Some providers 400 the whole request when
+    # max_tokens exceeds their output cap, so we clamp it down in forward().
+    #   Configure via  {PROVIDER}_MAX_OUTPUT_TOKENS  (0 = no clamp).
+    #   • cohere        command-a caps output at 8192
+    #   • github_models gpt-4o here rejects very large max_tokens (e.g. 65536)
+    _max_out_defaults = {"cohere": 8192, "github_models": 16384}
+    for p in providers:
+        env_var = f"{p['name'].upper()}_MAX_OUTPUT_TOKENS"
+        p["max_output_tokens"] = _int_env(env_var, _max_out_defaults.get(p["name"], 0))
 
     return providers
 
@@ -805,6 +817,18 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
     body.pop("think", None)
     body.pop("thinking", None)
 
+    # Clamp the requested output length to this provider's hard ceiling. Some
+    # providers (e.g. Cohere caps output at 8192) reject the ENTIRE request with
+    # a 400 when max_tokens exceeds their limit — so a client default like
+    # max_tokens=65536 would fail every call. Capping it lets the request through;
+    # the model still produces up to its real maximum.
+    out_cap = provider.get("max_output_tokens", 0)
+    if out_cap:
+        for field in ("max_tokens", "max_completion_tokens"):
+            if isinstance(body.get(field), int) and body[field] > out_cap:
+                log.info(f"  clamping {field} {body[field]}→{out_cap} for {provider['name']}")
+                body[field] = out_cap
+
     url = provider["base_url"].rstrip("/") + "/chat/completions"
     try:
         return _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, 120))
@@ -987,6 +1011,8 @@ def status():
         }
         if p.get("skip_if_tokens_over"):
             entry["skip_if_tokens_over"] = p["skip_if_tokens_over"]
+        if p.get("max_output_tokens"):
+            entry["max_output_tokens"] = p["max_output_tokens"]
         provider_stats[p["name"]] = entry
 
     return jsonify({
