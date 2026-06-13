@@ -123,10 +123,19 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 # ── Apply ────────────────────────────────────────────────────────────────────
+# Nothing below modifies the working tree until this fast-forward succeeds, so a
+# failure here leaves you exactly where you started — no rollback needed.
 log "pulling latest…"
-if ! git merge --ff-only "origin/${BRANCH}"; then
-  err "can't fast-forward (your history has diverged from origin)."
-  err "resolve manually, e.g.:   git pull --rebase origin ${BRANCH}"
+merge_out="$(git merge --ff-only "origin/${BRANCH}" 2>&1)"; merge_rc=$?
+if [ "$merge_rc" -ne 0 ]; then
+  if printf '%s' "$merge_out" | grep -q "untracked working tree files"; then
+    err "the update adds files that you already have locally (untracked), so it"
+    err "won't overwrite them. Move or delete these, then re-run ./update.sh:"
+    printf '%s\n' "$merge_out" | grep -E '^[[:space:]]+[^[:space:]]' | sed 's/^[[:space:]]*/        /'
+  else
+    err "can't fast-forward (your history has diverged from origin)."
+    err "resolve manually, e.g.:   git pull --rebase origin ${BRANCH}"
+  fi
   exit 1
 fi
 
