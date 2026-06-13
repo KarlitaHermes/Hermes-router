@@ -20,7 +20,7 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging, hashlib, hmac
+import json, os, time, threading, logging, hashlib, hmac, itertools
 from pathlib import Path
 from collections import deque, OrderedDict
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -72,6 +72,10 @@ STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-
 # Providers known for low-latency inference — promoted for short requests
 _FAST_PROVIDERS = {"groq", "cerebras", "sambanova", "mistral"}
 
+# Per-request counter for round-robin among equally-rated providers.
+# itertools.count().__next__ is atomic in CPython, so it's thread-safe.
+_rr_counter = itertools.count()
+
 # ── Smart routing: capability ratings ─────────────────────────────────────────
 # 1=outstanding  2=best  3=good  4=fair  5=basic  (lower = more capable)
 # Recommended base model: set ROUTER_BASE_MODEL_PROVIDER + ROUTER_BASE_MODEL
@@ -85,8 +89,9 @@ KNOWN_MODEL_RATINGS: dict = {
     "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
     "llama-3.3-70b": 2, "llama-3.1-70b": 2,
     "mistral-large": 2, "mistral-medium": 2,
-    "command-r-plus": 2, "nvidia/nemotron-3-super": 2, "nemotron": 2,
+    "command-r-plus": 2, "command-a": 2, "nvidia/nemotron-3-super": 2, "nemotron": 2,
     "deepseek-v4-flash": 2, "deepseek-v4": 2,  # capable but slow cold-start → "best", not first-choice
+    "deepseek-v3": 2, "deepseek-v2": 2,
     "claude-sonnet": 2, "claude-3-5": 2, "grok-2": 2,
     # 3 — Good
     "gemini-2.5-flash-lite": 3, "gemini-1.5-flash": 3,
@@ -194,7 +199,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "sambanova",
             "base_url": "https://api.sambanova.ai/v1",
-            "model":    os.environ.get("SAMBANOVA_MODEL", "Meta-Llama-3.3-70B-Instruct"),
+            "model":    os.environ.get("SAMBANOVA_MODEL", "DeepSeek-V3.2"),
             "keys":     sambanova_keys,
         })
 
@@ -203,7 +208,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "github_models",
             "base_url": "https://models.inference.ai.azure.com",
-            "model":    os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o-mini"),
+            "model":    os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o"),
             "keys":     github_keys,
         })
 
@@ -221,7 +226,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "groq",
             "base_url": "https://api.groq.com/openai/v1",
-            "model":    os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"),
+            "model":    os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
             "keys":     groq_keys,
         })
 
@@ -230,7 +235,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "mistral",
             "base_url": "https://api.mistral.ai/v1",
-            "model":    os.environ.get("MISTRAL_MODEL", "mistral-small-latest"),
+            "model":    os.environ.get("MISTRAL_MODEL", "mistral-medium-latest"),
             "keys":     mistral_keys,
         })
 
@@ -239,7 +244,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "cohere",
             "base_url": "https://api.cohere.ai/compatibility/v1",
-            "model":    os.environ.get("COHERE_MODEL", "command-r7b-12-2024"),
+            "model":    os.environ.get("COHERE_MODEL", "command-a-03-2025"),
             "keys":     cohere_keys,
         })
 
@@ -390,6 +395,12 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
 
     When FAST_ROUTE_THRESHOLD is set and the request is shorter than it,
     low-latency providers win ties between otherwise equally-ranked options.
+
+    Round-robin: providers that tie on every criterion (same rating, same
+    availability) are rotated each request so load spreads across them instead
+    of always hitting the same one first. We rotate the list by a per-request
+    counter before sorting; the sort is stable, so equal-keyed providers keep
+    their (rotated) relative order.
     """
     fast_first = FAST_ROUTE_TOKENS > 0 and 0 < est_tokens < FAST_ROUTE_TOKENS
 
@@ -401,7 +412,11 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         if rating <= complexity:
             return (0, complexity - rating, 0 if avail else 1, fast)   # perfect match = 0 delta
         return (1, rating - complexity, 0 if avail else 1, fast)        # too weak — closest first
-    return sorted(providers, key=_key)
+
+    n = len(providers)
+    offset = next(_rr_counter) % n if n else 0
+    rotated = providers[offset:] + providers[:offset]
+    return sorted(rotated, key=_key)
 
 
 def _initialize_ratings(providers: list, pool_ref):

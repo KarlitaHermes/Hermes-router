@@ -54,6 +54,9 @@ automatically. The first one that answers wins. Your app never sees the failures
 
 - **Smart routing** — sizes up each request and matches it to the right model: cheap
   models for simple questions, powerful ones for hard tasks. No overkill, no under-power.
+- **Round-robin load spreading** — when several providers are equally good for a request,
+  it rotates between them instead of always hitting the same one, so no single free tier
+  burns out first.
 - **Key rotation** — uses every key you give it for a provider before moving on.
 - **Smart cooldowns** — a rate-limited key sits out for a while instead of being hammered.
 - **Connection reuse** — keeps connections to providers open (HTTP keep-alive), so it
@@ -113,6 +116,11 @@ Hard coding / long context           →  a score-2 model              (Llama-70
 Providers that *can* handle the request are tried first (weakest-capable first); more
 powerful providers sit behind them as backup; models too weak for the task are the very
 last resort. If the chosen provider is rate-limited, the cascade takes over from there.
+
+When several providers are an equally good fit (same capability score), the router
+**rotates between them request by request** — so if you have, say, four free providers all
+good enough for a task, the load spreads evenly instead of draining one provider's quota
+first. The moment one is rate-limited, it's skipped and the next equal one steps in.
 
 ### Bonus: fast routing for snappy chats
 
