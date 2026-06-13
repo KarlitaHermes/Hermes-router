@@ -128,6 +128,32 @@ For very short requests (set `FAST_ROUTE_THRESHOLD`, e.g. `200` tokens), low-lat
 providers (Groq, Cerebras, SambaNova, Mistral) jump the queue when two providers are
 otherwise equally good — shaving a few hundred milliseconds off quick back-and-forth turns.
 
+### Bonus: health-aware routing & the circuit breaker
+
+The router also watches how each provider has been *behaving lately* and reacts so a
+flaky provider doesn't slow you down:
+
+- **Health-aware routing** — every provider keeps a short rolling record of its recent
+  outcomes (network errors and `5xx` server errors count against it; rate-limits and
+  bad-request errors don't, since those aren't the provider's fault). A provider that's
+  been failing a lot quietly **sinks** within its group, so healthy providers get tried
+  first. This only kicks in once there's enough evidence — a brand-new or quiet provider
+  is treated as healthy, and when *everyone* is healthy the ordering (including the
+  round-robin above) is exactly as it was. Capability matching always wins: a healthy but
+  weaker model never jumps ahead of the right model for the job.
+
+- **Circuit breaker** — if a provider crosses the failure threshold (by default, at least
+  4 recent outcomes with ≥ 50% of them failing), its "circuit" **opens**: the router skips
+  it entirely for a cooldown (~60s) instead of wasting round-trips on it. After the
+  cooldown it's *probed* again (half-open) — one success closes the circuit and gives it a
+  clean slate. Safety net: if *every* provider's circuit is open at once, the router probes
+  them all rather than hard-failing, so you always get an answer while options remain.
+
+Both features reuse the existing per-provider tracking — no new dependencies — and are
+tunable via the `BREAKER_*` env knobs (see [Optional settings](#optional-settings-sensible-defaults--change-only-if-you-want-to)).
+Current breaker state per provider shows up at `/v1/status` under each provider's
+`breaker` field.
+
 ---
 
 ## What you'll need
@@ -364,6 +390,10 @@ The router round-robins through all keys for a provider before cascading to the 
 | `CACHE_MAX_SIZE` | How many answers to keep cached | `100` |
 | `FAST_ROUTE_THRESHOLD` | Requests shorter than this (estimated tokens) prefer low-latency providers (Groq, Cerebras, SambaNova, Mistral) when ratings tie (`0` = off). Try `200` for snappier chat. | `0` |
 | `ROUTER_STATE_TTL_HOURS` | Reuse saved provider ratings for N hours instead of re-probing (and spending quota) on every restart (`0` = always re-probe) | `24` |
+| `BREAKER_WINDOW` | How many recent outcomes the circuit breaker weighs per provider | `8` |
+| `BREAKER_MIN_SAMPLES` | Minimum recent outcomes before a breaker can trip | `4` |
+| `BREAKER_ERROR_RATE` | Trip the breaker when this fraction of the window are health failures | `0.5` |
+| `BREAKER_COOLDOWN` | Seconds a tripped breaker stays open before the provider is probed again | `60` |
 | `MAX_REQUEST_BYTES` | Largest request body accepted | `10485760` (10 MB) |
 | `WORKER_THREADS` | Server worker threads | `16` |
 | `GROQ_SKIP_TOKENS_OVER` | Skip Groq when a request is bigger than this (it would be rejected anyway). Set `0` to disable, or raise it if you're on a paid Groq tier. | `5500` |

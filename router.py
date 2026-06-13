@@ -69,6 +69,13 @@ FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabl
 STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
 STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 
+# Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
+# of rotation for a cooldown, then probed again (half-open). Overridable via env.
+BREAKER_WINDOW      = int(os.environ.get("BREAKER_WINDOW", 8))          # recent outcomes to weigh
+BREAKER_MIN_SAMPLES = int(os.environ.get("BREAKER_MIN_SAMPLES", 4))     # min samples before it can trip
+BREAKER_ERROR_RATE  = float(os.environ.get("BREAKER_ERROR_RATE", 0.5))  # trip at >= this health-fail fraction
+BREAKER_COOLDOWN    = int(os.environ.get("BREAKER_COOLDOWN", 60))       # seconds the breaker stays open
+
 # Providers known for low-latency inference — promoted for short requests
 _FAST_PROVIDERS = {"groq", "cerebras", "sambanova", "mistral"}
 
@@ -409,9 +416,19 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         rating = state.get("rating", _rate_model(p["model"]))
         avail  = state.get("available", True)
         fast   = 0 if (fast_first and p["name"] in _FAST_PROVIDERS) else 1
+        # Health-aware terms — tier/sort_within stay FIRST so capability matching
+        # is never overridden by health (a healthy weak model must not outrank the
+        # correct-capability one). When every candidate is healthy these two terms
+        # are constant (0), leaving the existing round-robin/tie order untouched.
+        breaker_open = 1 if stats.breaker_open(p["name"]) else 0  # open breakers sink within tier
+        health       = stats.health_bucket(p["name"])            # 0 healthy / 1 degraded / 2 bad
         if rating <= complexity:
-            return (0, complexity - rating, 0 if avail else 1, fast)   # perfect match = 0 delta
-        return (1, rating - complexity, 0 if avail else 1, fast)        # too weak — closest first
+            tier        = 0
+            sort_within = complexity - rating   # 0 = perfect match, larger = overkill
+        else:
+            tier        = 1
+            sort_within = rating - complexity   # too weak — closest first
+        return (tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
 
     n = len(providers)
     offset = next(_rr_counter) % n if n else 0
@@ -524,7 +541,8 @@ class ProviderStats:
     def _ensure(self, name: str):
         if name not in self._data:
             self._data[name] = {"latency_sum": 0.0, "latency_count": 0,
-                                "error_count": 0, "request_count": 0}
+                                "error_count": 0, "request_count": 0,
+                                "health": deque(maxlen=BREAKER_WINDOW), "open_until": 0.0}
 
     def record_success(self, name: str, latency_s: float):
         with self.lock:
@@ -540,6 +558,54 @@ class ProviderStats:
             s = self._data[name]
             s["error_count"]   += 1
             s["request_count"] += 1
+
+    # ── Circuit breaker ──────────────────────────────────────────────────────
+    def record_health(self, name: str, ok: bool):
+        """Record a HEALTH outcome (separate from request stats — breaker only).
+        On failure: trip the breaker open once the window has enough samples and
+        the health-fail fraction crosses the threshold. On success: half-open
+        recovery — close the breaker and wipe the window for a clean slate."""
+        with self.lock:
+            self._ensure(name)
+            s   = self._data[name]
+            win = s["health"]
+            win.append(ok)
+            if ok:
+                s["open_until"] = 0.0
+                win.clear()
+            elif len(win) >= BREAKER_MIN_SAMPLES:
+                fails = sum(1 for x in win if not x)
+                if fails / len(win) >= BREAKER_ERROR_RATE:
+                    s["open_until"] = time.time() + BREAKER_COOLDOWN
+
+    def breaker_open(self, name: str) -> bool:
+        with self.lock:
+            s = self._data.get(name)
+            return bool(s) and time.time() < s.get("open_until", 0.0)
+
+    def breaker_status(self, name: str) -> dict:
+        with self.lock:
+            s   = self._data.get(name, {})
+            now = time.time()
+            open_until = s.get("open_until", 0.0)
+            win   = s.get("health", ())
+            fails = sum(1 for x in win if not x)
+            return {"open": now < open_until,
+                    "opens_in_s": max(0, round(open_until - now)),
+                    "recent_health_fails": fails}
+
+    def health_bucket(self, name: str) -> int:
+        """Recent error-rate bucket for routing: 0 healthy / 1 degraded / 2 bad.
+        Too few samples → 0 (unknown = healthy; don't penalize new providers)."""
+        with self.lock:
+            s = self._data.get(name)
+            if not s:
+                return 0
+            win = s.get("health", ())
+            if len(win) < BREAKER_MIN_SAMPLES:
+                return 0
+            err_rate = sum(1 for x in win if not x) / len(win)
+            return 0 if err_rate < 0.10 else (1 if err_rate < 0.50 else 2)
 
     def summary(self, name: str) -> dict:
         with self.lock:
@@ -779,9 +845,20 @@ def chat():
             return jsonify(cached)
 
     est_tokens = _estimated_tokens(messages)
+    ordered    = _ordered_providers(payload)
 
-    for provider in _ordered_providers(payload):
+    # Circuit breaker: skip providers whose breaker is open. SAFETY — if EVERY
+    # candidate is open, treat them all as half-open probes (skip none) so we
+    # always make forward progress instead of hard-failing while options remain.
+    any_closed = any(not stats.breaker_open(p["name"]) for p in ordered)
+
+    for provider in ordered:
         name     = provider["name"]
+
+        # Breaker open → skip (unless all are open, then probe everything).
+        if any_closed and stats.breaker_open(name):
+            log.info(f"⨂ skipping {name} (circuit open)")
+            continue
 
         # Skip providers whose payload ceiling this request would exceed
         # (e.g. Groq's free TPM) — avoids a guaranteed 413 round-trip.
@@ -805,11 +882,13 @@ def chat():
 
             if resp is None:
                 stats.record_error(name)
+                stats.record_health(name, False)   # network/timeout = provider health failure
                 pool.mark_rate_limited(name, key, retry_after=30)
                 continue
 
             if resp.status_code == 429:
                 stats.record_error(name)
+                # 429 is NOT a health failure — key cooldown already handles it.
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                 pool.mark_rate_limited(name, key, retry_after=retry_after)
                 log.warning(f"  {name} 429 — cooldown {retry_after}s, trying next key")
@@ -817,26 +896,31 @@ def chat():
 
             if resp.status_code in (400, 401, 403):
                 stats.record_error(name)
+                # request/auth-specific — NOT a provider health failure.
                 log.error(f"  {name} {resp.status_code} — skipping provider: {resp.text[:200]}")
                 break
 
             if resp.status_code == 413:
                 stats.record_error(name)
+                # payload-specific — NOT a provider health failure.
                 log.warning(f"  {name} 413 — payload too large, cascading")
                 break
 
             if resp.status_code >= 500:
                 stats.record_error(name)
+                stats.record_health(name, False)   # 5xx = provider health failure
                 pool.mark_rate_limited(name, key, retry_after=15)
                 continue
 
             if not (200 <= resp.status_code < 300):
                 stats.record_error(name)
+                stats.record_health(name, False)   # unexpected non-2xx = health failure
                 log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
                 break
 
             # Success
             stats.record_success(name, elapsed)
+            stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
             log.info(f"  ✓ {name} {resp.status_code} ({elapsed*1000:.0f}ms)")
             if streaming:
                 return Response(
@@ -880,6 +964,7 @@ def status():
         entry = {
             "keys":  keys.get(p["name"], []),
             "stats": stats.summary(p["name"]),
+            "breaker": stats.breaker_status(p["name"]),
         }
         if p.get("skip_if_tokens_over"):
             entry["skip_if_tokens_over"] = p["skip_if_tokens_over"]
@@ -900,6 +985,12 @@ def status():
             "enabled":         FAST_ROUTE_TOKENS > 0,
             "threshold_tokens": FAST_ROUTE_TOKENS,
             "fast_providers":  sorted(_FAST_PROVIDERS),
+        },
+        "circuit_breaker": {
+            "window":      BREAKER_WINDOW,
+            "min_samples": BREAKER_MIN_SAMPLES,
+            "error_rate":  BREAKER_ERROR_RATE,
+            "cooldown_s":  BREAKER_COOLDOWN,
         },
     })
 
