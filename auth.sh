@@ -139,7 +139,7 @@ cmd_add() {
   local total
   total=$(count_keys "$base")
   ok "$provider now has $total key(s) in the credential pool."
-  log "Restart the router to apply changes: hr start"
+  log "Apply the change with:  hr restart"
 }
 
 # ── hr auth list ─────────────────────────────────────────────────────────────

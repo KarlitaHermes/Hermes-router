@@ -5,8 +5,10 @@
 # Usage:
 #   hr auth add <provider>   Add API key(s) for a provider (stored in .env)
 #   hr auth list             Show all providers and how many keys are configured
-#   hr update [--check]      Update to the latest version (safe; auto-rollback)
+#   hr status                Live health dashboard for the running router
 #   hr start                 Run the router (same as: python router.py)
+#   hr restart               Restart the router so .env/key changes take effect
+#   hr update [--check]      Update to the latest version (safe; auto-rollback)
 #   hr version               Show the installed version
 #   hr help                  Show this help
 #
@@ -33,6 +35,12 @@ shift 2>/dev/null || true
 case "$cmd" in
   auth)
     exec "$REPO/auth.sh" "$@"
+    ;;
+  status)
+    exec "$REPO/status.sh" "$@"
+    ;;
+  restart)
+    exec "$REPO/restart.sh" "$@"
     ;;
   update)
     # Hand off to the safe updater; HR_INVOKE makes its messages say the right name.

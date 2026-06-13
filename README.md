@@ -205,6 +205,97 @@ listed, you're ready to go.
 
 ---
 
+## The `hr` command
+
+hermes-router ships with a small command-line tool for managing your router — adding
+keys, checking health, restarting, and updating — without editing files or memorising
+`curl` incantations. Install it once:
+
+```bash
+./install.sh
+```
+
+This adds two commands to your PATH that point at the same tool: **`hermes-router`** and
+the shorthand **`hr`**. Use whichever you like — every example below works with both.
+
+> Don't want to install anything? Each command also runs straight from the clone as a
+> script — e.g. `./auth.sh list`, `./status.sh`, `./restart.sh`, `./update.sh`.
+
+### All commands at a glance
+
+| Command | What it does |
+|---|---|
+| `hr auth add <provider>` | Add one or more API keys for a provider (prompts you, input hidden) |
+| `hr auth list` | Show every provider and how many keys it has configured |
+| `hr status` | Live health dashboard — rating, health, keys, and latency per provider |
+| `hr start` | Run the router (same as `python router.py`) |
+| `hr restart` | Restart the router so `.env`/key changes take effect |
+| `hr update` | Pull the latest version and restart safely (auto-rollback on failure) |
+| `hr update --check` | Tell you if an update is available — changes nothing |
+| `hr version` | Show the installed version |
+| `hr help` | Show the command list |
+
+The natural lifecycle: **configure** (`auth`) → **run** (`start` / `restart`) →
+**watch** (`status`) → **maintain** (`update`).
+
+### Managing API keys — `hr auth`
+
+Add keys interactively instead of hand-editing `.env`. Your input is hidden as you type,
+and keys are appended with the exact numbering the router expects (`GROQ_API_KEY`,
+`GROQ_API_KEY_2`, `GROQ_API_KEY_3`, …) so they all join the credential pool automatically.
+
+```bash
+hr auth add groq          # prompts for a key, then offers to add more
+hr auth list              # see what's configured
+hr restart                # apply the new keys
+```
+
+Valid provider names are the ones the router ships with:
+`gemini`, `openrouter`, `cerebras`, `sambanova`, `github_models`, `mistral`, `groq`,
+`cohere`, `naga`, `nvidia`.
+
+### Watching health — `hr status`
+
+A glanceable dashboard of the running router. Providers are sorted best-rated first;
+unhealthy ones and any tripped circuit breakers are highlighted.
+
+```bash
+hr status                 # the dashboard
+hr status --json          # raw JSON (handy for scripts)
+```
+
+```
+  hermes-router — localhost:8319
+
+  Provider        Rating  Health                 Keys             Latency
+  ─────────────── ─────── ────────────────────── ──────────────── ─────────
+  github_models   1       ✅ ok                   1 ready          1820ms
+  groq            2       ✅ ok                   2 ready          126ms
+  nvidia          2       ⨂ open (probes in 38s)  4 (1 cooling)    —
+  gemini          3       ✅ ok                   6 ready          834ms
+
+  cache: on · hit-rate 0.0 · 0/200 entries
+  breaker: trips at 50% fails over last 8 · opens 60s
+```
+
+- **Health** — `✅ ok`, `⚠ degraded` (erroring lately), `⚠ unavailable`, or
+  `⨂ open` (circuit breaker tripped — the provider is being skipped and will be
+  re-probed when the countdown hits zero).
+- **Keys** — how many are in the pool, and how many are temporarily cooling after a
+  rate-limit.
+
+### Restarting — `hr restart`
+
+Restarts the router so changes to `.env` (e.g. after `hr auth add`) take effect. It
+restarts your systemd service if you have one, otherwise it stops the running process
+and relaunches it in the background (logging to `router.log`), then health-checks it.
+
+```bash
+hr restart
+```
+
+---
+
 ## Getting free API keys
 
 You only need one to start, but add as many as you can — that's what keeps you online.
@@ -454,16 +545,12 @@ docker compose up -d
 ## Keeping it up to date
 
 This project gets frequent improvements (new providers, better default models,
-performance fixes). Install the `hermes-router` command once, then updating is a
-single familiar command from anywhere:
+performance fixes). Once you've installed [the `hr` command](#the-hr-command), updating
+is a single familiar command from anywhere:
 
 ```bash
-./install.sh                    # one-time: adds the `hermes-router` command to your PATH
-
-hermes-router update            # check + update + restart if there's a new version
-hermes-router update --check    # just tell me if an update is available (changes nothing)
-hermes-router start             # run the router (same as: python router.py)
-hermes-router version           # show the installed version
+hr update            # check + update + restart if there's a new version
+hr update --check    # just tell me if an update is available (changes nothing)
 ```
 
 No install? The same updater runs straight from your clone:
@@ -483,10 +570,10 @@ No install? The same updater runs straight from your clone:
   so you're never left worse off than before you ran it.
 
 If you run hermes-router as a systemd service named something other than
-`hermes-router`, tell the updater:
+`hermes-router`, tell the updater (and `hr restart`):
 
 ```bash
-HERMES_ROUTER_SERVICE=my-router hermes-router update
+HERMES_ROUTER_SERVICE=my-router hr update
 ```
 
 > Prefer to do it by hand? `git pull` then restart your router — your `.env` is
@@ -505,6 +592,9 @@ HERMES_ROUTER_SERVICE=my-router hermes-router update
 | `GET /v1/status` | Yes | Live view of every key, provider stats, and cache metrics |
 
 ### Checking status
+
+The friendly way is [`hr status`](#watching-health--hr-status) (a formatted dashboard).
+To get the raw JSON — for monitoring or scripts — hit the endpoint directly:
 
 ```bash
 curl http://localhost:8319/v1/status \
