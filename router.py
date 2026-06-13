@@ -243,7 +243,7 @@ def _build_providers() -> list[dict]:
         providers.append({
             "name":     "naga",
             "base_url": "https://api.naga.ac/v1",
-            "model":    os.environ.get("NAGA_MODEL", "nemotron-3-ultra-550b-a55b:free"),
+            "model":    os.environ.get("NAGA_MODEL", "nemotron-3-super-120b-a12b:free"),
             "keys":     naga_keys,
         })
 
@@ -276,6 +276,11 @@ def _build_providers() -> list[dict]:
 
 PROVIDERS = _build_providers()
 
+# Providers whose /models endpoint mixes paid models in with the free ones.
+# When auto-discovering a replacement model for these, restrict to :free ids so
+# a probe can never silently promote the router onto a paid model.
+_FREE_ONLY_DISCOVERY = {"openrouter", "naga"}
+
 # ── Credential pool ────────────────────────────────────────────────────────────
 
 # ── Smart routing helpers ─────────────────────────────────────────────────────
@@ -307,7 +312,13 @@ def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
 
 
 def _probe_provider(provider: dict, key: str) -> tuple:
-    """Returns (success, latency_ms, model_used). Auto-discovers alt model on 400/404."""
+    """Returns (success, latency_ms, model_used). Auto-discovers alt model on 400/404.
+
+    A read-timeout means the provider accepted the request and is still
+    generating — alive but slow. Large MoE models can cold-start for 30–60s,
+    past the probe window, so a read-timeout counts as available rather than
+    wrongly dropping a working provider to the back of its rating tier. Only a
+    connection failure (host unreachable) counts as down."""
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
     hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
             **provider.get("headers", {})}
@@ -320,10 +331,10 @@ def _probe_provider(provider: dict, key: str) -> tuple:
         if r.status_code == 200:
             return True, latency, provider["model"]
         if r.status_code in (400, 404):
-            # OpenRouter lists paid models alongside free ones — never let
+            # Providers that list paid models alongside free ones — never let
             # auto-discovery silently pick something that costs credits.
             alt = _discover_best_model(provider["base_url"], key, provider.get("headers", {}),
-                                       free_only=provider["name"] == "openrouter")
+                                       free_only=provider["name"] in _FREE_ONLY_DISCOVERY)
             if alt:
                 body["model"] = alt
                 t0 = time.time()
@@ -331,6 +342,9 @@ def _probe_provider(provider: dict, key: str) -> tuple:
                 if r2.status_code == 200:
                     return True, (time.time() - t0) * 1000, alt
         return False, (time.time() - t0) * 1000, provider["model"]
+    except requests.exceptions.ReadTimeout:
+        # Connected, still generating — alive, just slow (cold MoE start).
+        return True, (time.time() - t0) * 1000, provider["model"]
     except Exception:
         return False, (time.time() - t0) * 1000, provider["model"]
 

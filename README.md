@@ -37,7 +37,7 @@ If that's you, this is a single Python file you run once and forget about.
                     │   then Mistral                          │
                     │   then Cohere                           │
                     │   then Z.ai (GLM)                       │
-                    │   then Naga (Nemotron Ultra)            │
+                    │   then Naga (Nemotron Super)            │
                     │   then NVIDIA NIM (DeepSeek V4 Flash)  │
                     └─────────────────────────────────────────┘
 ```
@@ -122,7 +122,7 @@ You only need one to start, but add as many as you can — that's what keeps you
 | Mistral | Free tier (mistral-small-latest) | [console.mistral.ai](https://console.mistral.ai) |
 | Cohere | Free trial (1,000 calls/mo per key) | [dashboard.cohere.com](https://dashboard.cohere.com) |
 | Z.ai (GLM) | Free (glm-4.5-flash, ~1k req/day) | [z.ai](https://z.ai) |
-| Naga AI | Free (Nemotron-3-Ultra-550B, 100 req/day) | [naga.ac](https://naga.ac) |
+| Naga AI | Free (Nemotron-3-Super-120B, 100 req/day) | [naga.ac](https://naga.ac) |
 | NVIDIA NIM | Free (77+ models, 40 req/min per key) | [build.nvidia.com](https://build.nvidia.com) |
 
 **Tip:** Most providers let you create more than one key, and you can sign up with
@@ -285,7 +285,7 @@ The router round-robins through all keys for a provider before cascading to the 
 | `MISTRAL_MODEL` | Which Mistral model to use | `mistral-small-latest` |
 | `COHERE_MODEL` | Which Cohere model to use | `command-r7b-12-2024` |
 | `ZAI_MODEL` | Which Z.ai (GLM) model to use | `glm-4.5-flash` |
-| `NAGA_MODEL` | Which Naga model to use | `nemotron-3-ultra-550b-a55b:free` |
+| `NAGA_MODEL` | Which Naga model to use | `nemotron-3-super-120b-a12b:free` |
 | `NVIDIA_MODEL` | Which NVIDIA NIM model to use | `deepseek-ai/deepseek-v4-flash` |
 | `ROUTER_MODEL_ID` | The model name your app sends | `hermes-router` |
 | `CACHE_TTL_SECONDS` | Cache identical answers for N seconds (`0` = off) | `300` |
