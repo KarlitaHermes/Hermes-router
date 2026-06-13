@@ -15,7 +15,7 @@ log() { printf '\033[1;36m[install]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[install]\033[0m %s\n' "$*" >&2; }
 ok()  { printf '\033[1;32m[install]\033[0m %s\n' "$*"; }
 
-chmod +x "$REPO/hermes-router" "$REPO/update.sh" 2>/dev/null || true
+chmod +x "$REPO/hermes-router" "$REPO/update.sh" "$REPO/auth.sh" 2>/dev/null || true
 
 # Prefer a user-local bin already on PATH; fall back to ~/.local/bin.
 BINDIR=""

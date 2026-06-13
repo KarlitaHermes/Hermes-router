@@ -3,10 +3,12 @@
 # hermes-router (also: hr) — command-line wrapper
 #
 # Usage:
-#   hr update [--check]   Update to the latest version (safe; auto-rollback)
-#   hr start              Run the router (same as: python router.py)
-#   hr version            Show the installed version
-#   hr help               Show this help
+#   hr auth add <provider>   Add API key(s) for a provider (stored in .env)
+#   hr auth list             Show all providers and how many keys are configured
+#   hr update [--check]      Update to the latest version (safe; auto-rollback)
+#   hr start                 Run the router (same as: python router.py)
+#   hr version               Show the installed version
+#   hr help                  Show this help
 #
 # Install with ./install.sh — creates both `hermes-router` and `hr` on your PATH.
 #
@@ -29,6 +31,9 @@ cmd="${1:-help}"
 shift 2>/dev/null || true
 
 case "$cmd" in
+  auth)
+    exec "$REPO/auth.sh" "$@"
+    ;;
   update)
     # Hand off to the safe updater; HR_INVOKE makes its messages say the right name.
     HR_INVOKE="hermes-router update" exec "$REPO/update.sh" "$@"
