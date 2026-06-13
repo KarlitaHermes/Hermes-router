@@ -421,6 +421,39 @@ docker compose up -d
 
 ---
 
+## Keeping it up to date
+
+This project gets frequent improvements (new providers, better default models,
+performance fixes). To pull the latest version safely, run the included updater
+from your clone:
+
+```bash
+./update.sh            # check + update + restart if there's a new version
+./update.sh --check    # just tell me if an update is available (changes nothing)
+```
+
+**It's built so an update can't break your setup:**
+
+- It **never touches your `.env` or `router_state.json`** — your keys and runtime
+  state are left exactly as they are.
+- It **validates the new code before restarting anything.**
+- If the download, dependency install, or the post-restart health check fails, it
+  **automatically rolls back** to the exact version you were on and restarts that —
+  so you're never left worse off than before you ran it.
+
+If you run hermes-router as a systemd service named something other than
+`hermes-router`, tell the updater:
+
+```bash
+HERMES_ROUTER_SERVICE=my-router ./update.sh
+```
+
+> Prefer to do it by hand? `git pull` then restart your router — your `.env` is
+> gitignored, so a pull never overwrites your keys. The script just adds the
+> validate-and-rollback safety net on top.
+
+---
+
 ## API endpoints
 
 | Endpoint | Needs auth? | What it's for |

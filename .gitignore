@@ -1,6 +1,9 @@
 # Environment — never commit real keys
 .env
 
+# Runtime state (probe results / ratings cache) — regenerated on start
+router_state.json
+
 # Python
 __pycache__/
 *.py[cod]
