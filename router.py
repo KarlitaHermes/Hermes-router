@@ -47,6 +47,19 @@ logging.basicConfig(
 )
 log = logging.getLogger("hermes-router")
 
+# Shared HTTP session — reuses TCP/TLS connections to each provider host across
+# requests (HTTP keep-alive), so we don't pay a fresh ~100–300ms handshake on
+# every call. Thread-safe for sending; pool_maxsize covers our worker threads.
+# max_retries=0 because the cascade handles retries, not urllib3.
+_HTTP = requests.Session()
+_http_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=20,
+    pool_maxsize=max(32, int(os.environ.get("WORKER_THREADS", 16)) * 2),
+    max_retries=0,
+)
+_HTTP.mount("https://", _http_adapter)
+_HTTP.mount("http://", _http_adapter)
+
 PORT              = int(os.environ.get("PORT", 8319))
 PROXY_API_KEYS    = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-router-1").split(",") if k.strip()]
 ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
@@ -57,7 +70,7 @@ STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.jso
 STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 
 # Providers known for low-latency inference — promoted for short requests
-_FAST_PROVIDERS = {"groq", "cerebras", "sambanova"}
+_FAST_PROVIDERS = {"groq", "cerebras", "sambanova", "mistral"}
 
 # ── Smart routing: capability ratings ─────────────────────────────────────────
 # 1=outstanding  2=best  3=good  4=fair  5=basic  (lower = more capable)
@@ -67,12 +80,13 @@ KNOWN_MODEL_RATINGS: dict = {
     # 1 — Outstanding
     "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
     "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
-    "nemotron-3-ultra": 1, "deepseek-v4-flash": 1, "deepseek-v4": 1,
+    "nemotron-3-ultra": 1,
     # 2 — Best
     "gemini-2.5-flash": 2, "gemini-2.0-flash": 2,
     "llama-3.3-70b": 2, "llama-3.1-70b": 2,
     "mistral-large": 2, "mistral-medium": 2,
     "command-r-plus": 2, "nvidia/nemotron-3-super": 2, "nemotron": 2,
+    "deepseek-v4-flash": 2, "deepseek-v4": 2,  # capable but slow cold-start → "best", not first-choice
     "claude-sonnet": 2, "claude-3-5": 2, "grok-2": 2,
     # 3 — Good
     "gemini-2.5-flash-lite": 3, "gemini-1.5-flash": 3,
@@ -300,7 +314,7 @@ def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
                          free_only: bool = False) -> str | None:
     try:
         hdrs = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
-        r = requests.get(f"{base_url.rstrip('/')}/models", headers=hdrs, timeout=10)
+        r = _HTTP.get(f"{base_url.rstrip('/')}/models", headers=hdrs, timeout=10)
         if r.status_code != 200:
             return None
         models = [m["id"] for m in r.json().get("data", []) if isinstance(m.get("id"), str)]
@@ -326,7 +340,7 @@ def _probe_provider(provider: dict, key: str) -> tuple:
             "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
     t0 = time.time()
     try:
-        r = requests.post(url, headers=hdrs, json=body, timeout=12)
+        r = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
         latency = (time.time() - t0) * 1000
         if r.status_code == 200:
             return True, latency, provider["model"]
@@ -338,7 +352,7 @@ def _probe_provider(provider: dict, key: str) -> tuple:
             if alt:
                 body["model"] = alt
                 t0 = time.time()
-                r2 = requests.post(url, headers=hdrs, json=body, timeout=12)
+                r2 = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
                 if r2.status_code == 200:
                     return True, (time.time() - t0) * 1000, alt
         return False, (time.time() - t0) * 1000, provider["model"]
@@ -693,7 +707,7 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
 
     url = provider["base_url"].rstrip("/") + "/chat/completions"
     try:
-        return requests.post(url, headers=headers, json=body, stream=streaming, timeout=(10, 120))
+        return _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, 120))
     except requests.exceptions.RequestException as e:
         log.error(f"  Network error → {provider['name']}: {e}")
         return None

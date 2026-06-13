@@ -45,16 +45,80 @@ If that's you, this is a single Python file you run once and forget about.
 When a provider is rate-limited or exhausted, hermes-router moves down the list
 automatically. The first one that answers wins. Your app never sees the failures.
 
+> The order above is the *fallback* order — but hermes-router doesn't blindly start
+> at the top every time. It first sizes up your request and picks the best-fit
+> provider for it (a cheap model for an easy question, a powerful one for a hard
+> task). See **[How it picks a provider](#how-it-picks-a-provider-smart-routing)** below.
+
 **Extra niceties:**
 
+- **Smart routing** — sizes up each request and matches it to the right model: cheap
+  models for simple questions, powerful ones for hard tasks. No overkill, no under-power.
 - **Key rotation** — uses every key you give it for a provider before moving on.
 - **Smart cooldowns** — a rate-limited key sits out for a while instead of being hammered.
+- **Connection reuse** — keeps connections to providers open (HTTP keep-alive), so it
+  doesn't pay a fresh ~100–300 ms handshake on every single request.
 - **Response cache** — repeated identical questions return instantly without spending quota.
 - **Large-payload skip** — providers that reject big requests (like Groq's free tier) are
   skipped automatically when your prompt is too long, instead of wasting a failed attempt.
 - **Thinking-field cleanup** — strips `reasoning_content` / `think` fields that some models
   add but others reject, which would otherwise cause errors when falling back.
 - **Built-in monitoring** — see latency, error rates, and cache hits at `/v1/status`.
+
+---
+
+## How it picks a provider (smart routing)
+
+This is the part that makes hermes-router more than a dumb fallback list. You don't
+have to understand it to use the router — but here's what's happening under the hood.
+
+### Step 1: every model gets a capability score (1–5)
+
+Lower number = more capable model.
+
+| Score | Meaning | Example models |
+|:---:|---|---|
+| **1** | Outstanding | GPT-4o, Claude Opus, Gemini Pro |
+| **2** | Best | Llama-70B, Mistral Large, Nemotron Super, DeepSeek V4 |
+| **3** | Good | Gemini Flash, GPT-4o-mini, Mistral Small |
+| **4** | Fair | Cohere R7B, Llama-8B |
+| **5** | Basic | tiny <1B models |
+
+You don't set these by hand — the router knows ratings for common models and guesses
+sensibly for the rest (e.g. anything with `70b` in the name → score 2).
+
+### Step 2: every request gets a difficulty score (1–5)
+
+No AI call is used for this — it's a fast keyword + length check.
+
+| Difficulty | What triggers it |
+|:---:|---|
+| **1** (critical) | very long prompt, or code + words like "implement / debug / refactor" |
+| **2** (complex) | long prompt, or "design / architect / optimize" |
+| **3** (standard) | medium prompt, or contains a code block |
+| **4** (simple) | short prompt |
+| **5** (trivial) | tiny factual question — "what is X", "translate Y" |
+
+### Step 3: match the request to the cheapest model that can handle it
+
+The rule is simple: **use the weakest model that's still good enough.** A capable model
+is wasted (and slower) on "what's 2+2", and a weak model fails a hard coding task.
+
+```
+Easy question  ("what is Python?")   →  a score-4 model answers it   (fast, cheap)
+Standard task                        →  a score-3 model              (Gemini Flash, Mistral)
+Hard coding / long context           →  a score-2 model              (Llama-70B, DeepSeek V4)
+```
+
+Providers that *can* handle the request are tried first (weakest-capable first); more
+powerful providers sit behind them as backup; models too weak for the task are the very
+last resort. If the chosen provider is rate-limited, the cascade takes over from there.
+
+### Bonus: fast routing for snappy chats
+
+For very short requests (set `FAST_ROUTE_THRESHOLD`, e.g. `200` tokens), low-latency
+providers (Groq, Cerebras, SambaNova, Mistral) jump the queue when two providers are
+otherwise equally good — shaving a few hundred milliseconds off quick back-and-forth turns.
 
 ---
 
@@ -290,7 +354,7 @@ The router round-robins through all keys for a provider before cascading to the 
 | `ROUTER_MODEL_ID` | The model name your app sends | `hermes-router` |
 | `CACHE_TTL_SECONDS` | Cache identical answers for N seconds (`0` = off) | `300` |
 | `CACHE_MAX_SIZE` | How many answers to keep cached | `100` |
-| `FAST_ROUTE_THRESHOLD` | Requests shorter than this (estimated tokens) prefer low-latency providers (Groq, Cerebras, SambaNova) when ratings tie (`0` = off) | `0` |
+| `FAST_ROUTE_THRESHOLD` | Requests shorter than this (estimated tokens) prefer low-latency providers (Groq, Cerebras, SambaNova, Mistral) when ratings tie (`0` = off). Try `200` for snappier chat. | `0` |
 | `ROUTER_STATE_TTL_HOURS` | Reuse saved provider ratings for N hours instead of re-probing (and spending quota) on every restart (`0` = always re-probe) | `24` |
 | `MAX_REQUEST_BYTES` | Largest request body accepted | `10485760` (10 MB) |
 | `WORKER_THREADS` | Server worker threads | `16` |
@@ -458,6 +522,26 @@ a paid tier.
 
 **Nothing happens / connection refused**
 Make sure `python router.py` is still running and you're using the right port (default 8319).
+
+---
+
+## Words you might not know
+
+New to this? Here's the jargon, in plain English:
+
+- **API key** — a password that lets your app use a provider's AI. Free providers give
+  you one when you sign up.
+- **Rate limit** — a cap on how many requests you can make in a window (e.g. "30 per
+  minute"). Hit it and the provider replies with an error (`429`) instead of an answer.
+- **Cascade / fallback** — when one provider says no, automatically trying the next one.
+- **Cooldown** — after a key gets rate-limited, the router rests it for a bit before
+  reusing it, so it isn't hammered while it's blocked.
+- **Token** — roughly ¾ of a word. Both your prompt and the reply are measured in tokens;
+  limits and prompt sizes are usually counted this way.
+- **Proxy** — a middleman. Your app talks to hermes-router, and hermes-router talks to the
+  real providers on your behalf.
+- **OpenAI-compatible** — speaks the same request/response format as OpenAI's API, so
+  existing tools work by only changing the URL.
 
 ---
 
