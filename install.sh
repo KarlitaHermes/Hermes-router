@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Installs the `hermes-router` command so you can run `hermes-router update`
-# (and `hermes-router start`) from anywhere — instead of ./update.sh.
+# Installs the `hermes-router` command (and the `hr` shorthand) so you can
+# run `hr update`, `hr start`, etc. from anywhere — instead of ./update.sh.
 #
 # It just symlinks the launcher in this repo onto your PATH; nothing is copied
-# or hidden, and `git pull` / `hermes-router update` keep it current.
+# or hidden, and `git pull` / `hr update` keep it current.
 #
 set -uo pipefail
 
@@ -25,25 +25,30 @@ done
 [ -n "$BINDIR" ] || BINDIR="$HOME/.local/bin"
 
 mkdir -p "$BINDIR" 2>/dev/null || true
-LINK="$BINDIR/hermes-router"
 
-if ln -sf "$REPO/hermes-router" "$LINK" 2>/dev/null; then
-  :
-elif command -v sudo >/dev/null 2>&1; then
-  log "need elevated permission to write to $BINDIR…"
-  sudo ln -sf "$REPO/hermes-router" "$LINK" || { err "failed to create symlink in $BINDIR"; exit 1; }
-else
-  err "couldn't write to $BINDIR (no sudo available). Pick a writable dir, e.g.:"
-  err "  mkdir -p ~/.local/bin && ln -sf \"$REPO/hermes-router\" ~/.local/bin/hermes-router"
-  exit 1
-fi
+_symlink() {
+  local name="$1"
+  local link="$BINDIR/$name"
+  if ln -sf "$REPO/hermes-router" "$link" 2>/dev/null; then
+    ok "installed: $link -> $REPO/hermes-router"
+  elif command -v sudo >/dev/null 2>&1; then
+    log "need elevated permission to write to $BINDIR…"
+    sudo ln -sf "$REPO/hermes-router" "$link" || { err "failed to create symlink $link"; exit 1; }
+    ok "installed: $link -> $REPO/hermes-router"
+  else
+    err "couldn't write to $BINDIR (no sudo available). Pick a writable dir, e.g.:"
+    err "  mkdir -p ~/.local/bin && ln -sf \"$REPO/hermes-router\" ~/.local/bin/$name"
+    exit 1
+  fi
+}
 
-ok "installed: $LINK -> $REPO/hermes-router"
+_symlink hermes-router
+_symlink hr
 
 # Is the chosen dir actually on PATH right now?
 case ":$PATH:" in
   *":$BINDIR:"*)
-    ok "try it:  hermes-router update --check"
+    ok "try it:  hr update --check"
     ;;
   *)
     err "$BINDIR is not on your PATH yet. Add this line to your shell config"

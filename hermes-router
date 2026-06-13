@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# hermes-router — command-line wrapper
+# hermes-router (also: hr) — command-line wrapper
 #
 # Usage:
-#   hermes-router update [--check]   Update to the latest version (safe; auto-rollback)
-#   hermes-router start              Run the router (same as: python router.py)
-#   hermes-router version            Show the installed version
-#   hermes-router help               Show this help
+#   hr update [--check]   Update to the latest version (safe; auto-rollback)
+#   hr start              Run the router (same as: python router.py)
+#   hr version            Show the installed version
+#   hr help               Show this help
 #
-# Install this command with ./install.sh (symlinks it onto your PATH).
+# Install with ./install.sh — creates both `hermes-router` and `hr` on your PATH.
 #
 set -uo pipefail
 
