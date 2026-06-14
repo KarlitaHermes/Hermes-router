@@ -21,6 +21,49 @@ providers · one structured `auth.json` for all your keys.
 
 ---
 
+## Architecture
+
+A single Python file (`router.py`) running a small Flask/Waitress server. One request
+flows through it like this:
+
+```
+  ┌──────────┐   OpenAI-format request    ┌─────────────────────────────────────┐
+  │ Your app │ ─────────────────────────► │            hermes-router            │
+  └──────────┘   Bearer PROXY_API_KEYS    │                                     │
+       ▲                                   │  1. Auth check (PROXY_API_KEYS)     │
+       │                                   │  2. Cache lookup (exact match)      │
+       │         OpenAI-format response    │  3. Rate the request (1–5)          │
+       └────────────────────────────────► │  4. Order providers by fit + health │
+                                           │  5. Try providers, rotate keys      │
+                                           └───────────────┬─────────────────────┘
+                                                           │ first one that succeeds
+                                           ┌───────────────▼─────────────────────┐
+                                           │ Gemini · OpenRouter · Groq · Mistral │
+                                           │ Cohere · NVIDIA · … (11 providers)   │
+                                           └──────────────────────────────────────┘
+```
+
+**The moving parts:**
+
+- **Credential pool** — every provider can hold many keys (from `auth.json`, then `.env`).
+  Keys are rotated round-robin; a key that gets rate-limited is put on a short cooldown and
+  skipped until it recovers.
+- **Smart routing** — each request is scored 1–5 for difficulty (by length and content, no
+  extra API call), and each model is scored 1–5 for capability. The router picks the
+  *cheapest* model that can still handle the request, and rotates among equally-good ones.
+- **Failover** — if a provider errors or times out, the router cascades to the next one
+  automatically, so a single failure never reaches your app.
+- **Circuit breaker** — a provider that keeps failing is pulled out of rotation for a
+  cooldown, then re-probed. Healthy providers are always preferred.
+- **Response cache** — identical requests can be served from an in-memory cache (TTL-based),
+  saving free-tier quota.
+
+Everything is configured by environment variables (see [Commands](#commands)); keys live in
+`auth.json`. Nothing is hidden or installed system-wide — `install.sh` only symlinks the
+`hr` command onto your PATH.
+
+---
+
 ## Setup
 
 **Requirements:** Python 3.10+ and at least one free API key (see the table below).
