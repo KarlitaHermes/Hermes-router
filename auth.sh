@@ -8,108 +8,118 @@
 #   hr auth help             Show this help
 #
 # Supported providers:
-#   gemini  openrouter  cerebras  sambanova  github_models
-#   mistral  groq  cohere  naga  nvidia
+#   gemini  openrouter  sambanova  github_models  cerebras
+#   groq  mistral  cohere  zai  naga  nvidia
 #
-# Keys are stored in .env next to this script (or override with HR_ENV_FILE).
-# The router loads them as a credential pool — multiple keys per provider
-# are round-robined and individually cooled down on rate-limits.
+# Keys are stored in auth.json next to this script (override with ROUTER_AUTH_FILE).
+# This is the router's own credential store — self-contained, independent of any
+# host application. The router reads auth.json first, then any .env keys as fallback.
 #
-# Key numbering matches the router's loader:
-#   GROQ_API_KEY      ← first key
-#   GROQ_API_KEY_2    ← second
-#   GROQ_API_KEY_3    ← third   ... and so on
+#   { "providers": { "openrouter": ["key1", "key2"], "gemini": ["key"] } }
+#
+# Multiple keys per provider are round-robined and individually cooled on rate-limits.
 #
 set -uo pipefail
 
 cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
 REPO="$(pwd)"
-ENV_FILE="${HR_ENV_FILE:-$REPO/.env}"
+AUTH_FILE="${ROUTER_AUTH_FILE:-$REPO/auth.json}"
+PYTHON="${PYTHON:-python3}"
 
 log()  { printf '\033[1;36m[auth]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[auth]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[auth]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[auth]\033[0m %s\n' "$*"; }
 
-PROVIDERS_LIST="gemini openrouter cerebras sambanova github_models mistral groq cohere naga nvidia"
+PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia"
 
-# Map provider name → env var base (matches the live router's env_var field)
-env_var_for() {
+# Normalize a provider name to its canonical form (accepts a couple of aliases).
+canonical_provider() {
   case "${1,,}" in
-    gemini)                echo "GOOGLE_API_KEY" ;;
-    openrouter)            echo "OPENROUTER_API_KEY" ;;
-    cerebras)              echo "CEREBRAS_API_KEY" ;;
-    sambanova)             echo "SAMBANOVA_API_KEY" ;;
-    github_models|github)  echo "GITHUB_MODELS_TOKEN" ;;
-    mistral)               echo "MISTRAL_API_KEY" ;;
-    groq)                  echo "GROQ_API_KEY" ;;
-    cohere)                echo "COHERE_API_KEY" ;;
-    naga)                  echo "NAGA_API_KEY" ;;
-    nvidia)                echo "NVIDIA_API_KEY" ;;
+    gemini|google)         echo "gemini" ;;
+    openrouter|or)         echo "openrouter" ;;
+    sambanova|samba)       echo "sambanova" ;;
+    github_models|github)  echo "github_models" ;;
+    cerebras)              echo "cerebras" ;;
+    groq)                  echo "groq" ;;
+    mistral)               echo "mistral" ;;
+    cohere)                echo "cohere" ;;
+    zai|glm|z.ai)          echo "zai" ;;
+    naga)                  echo "naga" ;;
+    nvidia|nim)            echo "nvidia" ;;
     *)                     echo "" ;;
   esac
 }
 
-# Count how many keys are already stored for a given env var base.
-# Counts: BASE=, BASE_2=, BASE_3=, ... (stops at first gap, same as router loader).
+# Count keys stored for a provider in auth.json.
 count_keys() {
-  local base="$1"
-  local count=0
-  [ -f "$ENV_FILE" ] || { echo 0; return; }
-  grep -qE "^${base}=" "$ENV_FILE" 2>/dev/null && count=$((count + 1))
-  local i=2
-  while grep -qE "^${base}_${i}=" "$ENV_FILE" 2>/dev/null; do
-    count=$((count + 1))
-    i=$((i + 1))
-  done
-  echo "$count"
+  local provider="$1"
+  "$PYTHON" - "$AUTH_FILE" "$provider" <<'PY'
+import json, sys, os
+path, provider = sys.argv[1], sys.argv[2]
+try:
+    doc = json.load(open(path))
+except Exception:
+    doc = {}
+print(len(doc.get("providers", {}).get(provider, [])))
+PY
 }
 
-# Append one key to .env and echo back the variable name used.
+# Append one key to auth.json for a provider. Prints the new total, or "DUPLICATE".
 append_key() {
-  local base="$1"
+  local provider="$1"
   local key="$2"
-  local existing
-  existing=$(count_keys "$base")
-  touch "$ENV_FILE"
-  if [ "$existing" -eq 0 ]; then
-    # Add a blank line before the first key for readability if .env is non-empty
-    [ -s "$ENV_FILE" ] && echo "" >> "$ENV_FILE"
-    printf '%s=%s\n' "$base" "$key" >> "$ENV_FILE"
-    echo "$base"
-  else
-    local slot=$((existing + 1))
-    printf '%s_%d=%s\n' "$base" "$slot" "$key" >> "$ENV_FILE"
-    echo "${base}_${slot}"
-  fi
+  "$PYTHON" - "$AUTH_FILE" "$provider" "$key" <<'PY'
+import json, sys, os
+path, provider, key = sys.argv[1], sys.argv[2], sys.argv[3]
+doc = {}
+if os.path.exists(path):
+    try:
+        doc = json.load(open(path))
+    except Exception:
+        doc = {}
+if not isinstance(doc, dict):
+    doc = {}
+providers = doc.setdefault("providers", {})
+keys = providers.setdefault(provider, [])
+if key in keys:
+    print("DUPLICATE")
+else:
+    keys.append(key)
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    os.chmod(path, 0o600)  # keys are secrets — owner read/write only
+    print(len(keys))
+PY
 }
 
 # ── hr auth add <provider> ────────────────────────────────────────────────────
 
 cmd_add() {
-  local provider="${1:-}"
-  if [ -z "$provider" ]; then
+  local raw="${1:-}"
+  if [ -z "$raw" ]; then
     err "Usage: hr auth add <provider>"
     err "Providers: $PROVIDERS_LIST"
     exit 1
   fi
 
-  local base
-  base=$(env_var_for "$provider")
-  if [ -z "$base" ]; then
-    err "Unknown provider: '$provider'"
+  local provider
+  provider=$(canonical_provider "$raw")
+  if [ -z "$provider" ]; then
+    err "Unknown provider: '$raw'"
     err "Supported: $PROVIDERS_LIST"
     exit 1
   fi
 
   local existing
-  existing=$(count_keys "$base")
+  existing=$(count_keys "$provider")
   if [ "$existing" -gt 0 ]; then
     log "$provider already has $existing key(s). New keys will be added to the pool."
   else
     log "No keys found for $provider yet. Adding the first one."
   fi
-  log "Keys will be saved to: $ENV_FILE"
+  log "Keys will be saved to: $AUTH_FILE"
   echo ""
 
   while true; do
@@ -121,13 +131,17 @@ cmd_add() {
     if [ -z "$key" ]; then
       warn "Empty key — skipped."
     else
-      local var_name
-      var_name=$(append_key "$base" "$key")
-      ok "Saved as ${var_name}  (ends in: ...${key: -8})"
+      local result
+      result=$(append_key "$provider" "$key")
+      if [ "$result" = "DUPLICATE" ]; then
+        warn "That key is already stored for $provider — skipped."
+      else
+        ok "Saved  (ends in: ...${key: -8})  — $provider now has $result key(s)"
+      fi
     fi
 
     echo ""
-    printf '\033[1;36m[auth]\033[0m Add another key for $provider? [y/N]: '
+    printf '\033[1;36m[auth]\033[0m Add another key for %s? [y/N]: ' "$provider"
     read -r again
     echo ""
     case "$again" in
@@ -137,7 +151,7 @@ cmd_add() {
   done
 
   local total
-  total=$(count_keys "$base")
+  total=$(count_keys "$provider")
   ok "$provider now has $total key(s) in the credential pool."
   log "Apply the change with:  hr restart"
 }
@@ -145,32 +159,30 @@ cmd_add() {
 # ── hr auth list ─────────────────────────────────────────────────────────────
 
 cmd_list() {
-  if [ ! -f "$ENV_FILE" ]; then
-    warn "No .env file found at: $ENV_FILE"
+  if [ ! -f "$AUTH_FILE" ]; then
+    warn "No auth.json found at: $AUTH_FILE"
     warn "Run 'hr auth add <provider>' to create one."
     exit 0
   fi
 
   echo ""
-  printf '  %-16s  %-6s  %s\n' "Provider" "Keys" "Env var"
-  printf '  %-16s  %-6s  %s\n' "────────────────" "──────" "───────────────────────"
+  printf '  %-16s  %s\n' "Provider" "Keys"
+  printf '  %-16s  %s\n' "────────────────" "──────"
 
   local total_keys=0
   for provider in $PROVIDERS_LIST; do
-    local base
-    base=$(env_var_for "$provider")
     local count
-    count=$(count_keys "$base")
+    count=$(count_keys "$provider")
     total_keys=$((total_keys + count))
     if [ "$count" -eq 0 ]; then
-      printf '  %-16s  \033[1;31m%-6s\033[0m  %s\n' "$provider" "none" "$base"
+      printf '  %-16s  \033[1;31m%s\033[0m\n' "$provider" "none"
     else
-      printf '  %-16s  \033[1;32m%-6s\033[0m  %s\n' "$provider" "$count key(s)" "$base"
+      printf '  %-16s  \033[1;32m%s\033[0m\n' "$provider" "$count key(s)"
     fi
   done
 
   echo ""
-  log "$total_keys total key(s) across all providers — stored in: $ENV_FILE"
+  log "$total_keys total key(s) across all providers — stored in: $AUTH_FILE"
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────

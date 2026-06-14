@@ -68,6 +68,32 @@ CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
 STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
 STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
+AUTH_FILE         = Path(os.environ.get("ROUTER_AUTH_FILE", "./auth.json"))  # router's own key store
+
+
+def _load_auth_json() -> dict[str, list[str]]:
+    """Load provider API keys from auth.json — the router's own credential store,
+    managed by `hr auth add`. This makes the router self-contained: keys live with
+    the router, independent of any host application.
+
+      Format: {"providers": {"openrouter": ["key1", "key2"], "gemini": ["key"]}}
+
+    Returns {provider_name: [keys]}. A missing or invalid file is non-fatal —
+    the router simply falls back to keys from .env (see _keys_for)."""
+    if not AUTH_FILE.exists():
+        return {}
+    try:
+        doc = json.loads(AUTH_FILE.read_text())
+        out: dict[str, list[str]] = {}
+        for name, keys in doc.get("providers", {}).items():
+            if isinstance(keys, list):
+                out[name] = [str(k).strip() for k in keys if str(k).strip()]
+        return out
+    except Exception as e:
+        log.warning(f"Could not read {AUTH_FILE}: {e}")
+        return {}
+
+_AUTH_KEYS = _load_auth_json()
 
 # Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
 # of rotation for a cooldown, then probed again (half-open). Overridable via env.
@@ -169,6 +195,20 @@ def _keys(env_var: str) -> list[str]:
     return out
 
 
+def _keys_for(provider_name: str, env_var: str) -> list[str]:
+    """All keys for a provider: auth.json entries first (the primary store that
+    `hr auth add` writes to), then any matching .env keys as a fallback. Deduped,
+    order preserved. A provider with keys in EITHER source is enabled."""
+    merged = list(_AUTH_KEYS.get(provider_name, []))
+    merged += _keys(env_var)
+    seen, out = set(), []
+    for k in merged:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
 def _int_env(env_var: str, default: int = 0) -> int:
     """Parse an integer env var, falling back to default on missing/invalid."""
     try:
@@ -192,7 +232,7 @@ def _parse_retry_after(value, default: int = 60) -> int:
 def _build_providers() -> list[dict]:
     providers = []
 
-    gemini_keys = _keys("GEMINI_API_KEYS")
+    gemini_keys = _keys_for("gemini", "GEMINI_API_KEYS")
     if gemini_keys:
         providers.append({
             "name":     "gemini",
@@ -201,7 +241,7 @@ def _build_providers() -> list[dict]:
             "keys":     gemini_keys,
         })
 
-    openrouter_keys = _keys("OPENROUTER_API_KEYS")
+    openrouter_keys = _keys_for("openrouter", "OPENROUTER_API_KEYS")
     if openrouter_keys:
         providers.append({
             "name":     "openrouter",
@@ -214,7 +254,7 @@ def _build_providers() -> list[dict]:
             },
         })
 
-    sambanova_keys = _keys("SAMBANOVA_API_KEYS") or _keys("SAMBANOVA_API_KEY")
+    sambanova_keys = _keys_for("sambanova", "SAMBANOVA_API_KEYS")
     if sambanova_keys:
         providers.append({
             "name":     "sambanova",
@@ -223,7 +263,7 @@ def _build_providers() -> list[dict]:
             "keys":     sambanova_keys,
         })
 
-    github_keys = _keys("GITHUB_MODELS_TOKENS") or _keys("GITHUB_MODELS_TOKEN")
+    github_keys = _keys_for("github_models", "GITHUB_MODELS_TOKENS")
     if github_keys:
         providers.append({
             "name":     "github_models",
@@ -232,7 +272,7 @@ def _build_providers() -> list[dict]:
             "keys":     github_keys,
         })
 
-    cerebras_keys = _keys("CEREBRAS_API_KEYS") or _keys("CEREBRAS_API_KEY")
+    cerebras_keys = _keys_for("cerebras", "CEREBRAS_API_KEYS")
     if cerebras_keys:
         providers.append({
             "name":     "cerebras",
@@ -241,7 +281,7 @@ def _build_providers() -> list[dict]:
             "keys":     cerebras_keys,
         })
 
-    groq_keys = _keys("GROQ_API_KEYS") or _keys("GROQ_API_KEY")
+    groq_keys = _keys_for("groq", "GROQ_API_KEYS")
     if groq_keys:
         providers.append({
             "name":     "groq",
@@ -250,7 +290,7 @@ def _build_providers() -> list[dict]:
             "keys":     groq_keys,
         })
 
-    mistral_keys = _keys("MISTRAL_API_KEYS") or _keys("MISTRAL_API_KEY")
+    mistral_keys = _keys_for("mistral", "MISTRAL_API_KEYS")
     if mistral_keys:
         providers.append({
             "name":     "mistral",
@@ -259,7 +299,7 @@ def _build_providers() -> list[dict]:
             "keys":     mistral_keys,
         })
 
-    cohere_keys = _keys("COHERE_API_KEYS") or _keys("COHERE_API_KEY")
+    cohere_keys = _keys_for("cohere", "COHERE_API_KEYS")
     if cohere_keys:
         providers.append({
             "name":     "cohere",
@@ -268,7 +308,7 @@ def _build_providers() -> list[dict]:
             "keys":     cohere_keys,
         })
 
-    zai_keys = _keys("GLM_API_KEYS") or _keys("GLM_API_KEY")
+    zai_keys = _keys_for("zai", "GLM_API_KEYS")
     if zai_keys:
         providers.append({
             "name":     "zai",
@@ -277,7 +317,7 @@ def _build_providers() -> list[dict]:
             "keys":     zai_keys,
         })
 
-    naga_keys = _keys("NAGA_API_KEYS") or _keys("NAGA_API_KEY")
+    naga_keys = _keys_for("naga", "NAGA_API_KEYS")
     if naga_keys:
         providers.append({
             "name":     "naga",
@@ -286,7 +326,7 @@ def _build_providers() -> list[dict]:
             "keys":     naga_keys,
         })
 
-    nvidia_keys = _keys("NVIDIA_API_KEYS") or _keys("NVIDIA_API_KEY")
+    nvidia_keys = _keys_for("nvidia", "NVIDIA_API_KEYS")
     if nvidia_keys:
         providers.append({
             "name":     "nvidia",

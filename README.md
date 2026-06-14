@@ -174,9 +174,8 @@ cd hermes-router
 # 2. Install the two dependencies (Flask + requests)
 pip install -r requirements.txt
 
-# 3. Create your config file and add your API keys
-cp .env.example .env
-nano .env          # paste in at least one provider's key
+# 3. Add at least one provider's API key (stored in auth.json)
+hr auth add openrouter     # prompts for the key, input hidden
 
 # 4. Start it
 python router.py
@@ -240,19 +239,36 @@ The natural lifecycle: **configure** (`auth`) → **run** (`start` / `restart`) 
 
 ### Managing API keys — `hr auth`
 
-Add keys interactively instead of hand-editing `.env`. Your input is hidden as you type,
-and keys are appended with the exact numbering the router expects (`GROQ_API_KEY`,
-`GROQ_API_KEY_2`, `GROQ_API_KEY_3`, …) so they all join the credential pool automatically.
+Keys live in **`auth.json`** — the router's own credential store, kept right next to
+the router. This makes hermes-router self-contained: the keys travel with it, with no
+dependency on any host application. Add keys interactively (input hidden as you type);
+each is appended to the provider's pool so they all round-robin automatically.
 
 ```bash
-hr auth add groq          # prompts for a key, then offers to add more
+hr auth add openrouter    # prompts for a key, then offers to add more
 hr auth list              # see what's configured
 hr restart                # apply the new keys
 ```
 
+`auth.json` looks like this (and is git-ignored, so real keys are never committed):
+
+```json
+{
+  "providers": {
+    "openrouter": ["sk-or-key1", "sk-or-key2"],
+    "gemini": ["AIzaSy-key"]
+  }
+}
+```
+
 Valid provider names are the ones the router ships with:
-`gemini`, `openrouter`, `cerebras`, `sambanova`, `github_models`, `mistral`, `groq`,
-`cohere`, `naga`, `nvidia`.
+`gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`, `mistral`, `groq`,
+`cohere`, `zai`, `naga`, `nvidia`.
+
+> **Keys in `.env` still work.** The router reads `auth.json` first, then falls back to
+> any `*_API_KEY(S)` variables in `.env`. Existing `.env` setups keep working unchanged;
+> `auth.json` is just the preferred, self-contained store going forward. Point the router
+> at a different file with `ROUTER_AUTH_FILE=/path/to/auth.json`.
 
 ### Watching health — `hr status`
 

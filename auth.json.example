@@ -1,0 +1,11 @@
+{
+  "providers": {
+    "openrouter": [
+      "sk-or-your-first-openrouter-key",
+      "sk-or-your-second-openrouter-key"
+    ],
+    "gemini": [
+      "AIzaSy-your-gemini-key"
+    ]
+  }
+}
