@@ -71,7 +71,7 @@ rollback() {
 # restart_service() returns 0 if it restarted a systemd unit, 2 if none exists.
 restart_service() {
   if command -v systemctl >/dev/null 2>&1 \
-     && systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}\.service"; then
+     && systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
     log "restarting systemd service '${SERVICE}'…"
     if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
       sudo systemctl restart "$SERVICE"
