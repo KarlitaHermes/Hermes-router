@@ -167,6 +167,23 @@ creating multiple keys per provider (and signing up with multiple Google/GitHub 
 > automatically — your app sends the same OpenAI-format request regardless of which
 > provider handles it.
 
+### Model overrides
+
+Each provider has a default model that works out of the box. You can switch to a
+different model for any provider without editing config files:
+
+```bash
+hr model list                              # see all providers and their active model
+hr model set anthropic claude-sonnet-4-6   # upgrade Anthropic to Sonnet
+hr model set openai gpt-4o                 # use full GPT-4o instead of mini
+hr model set gemini gemini-2.5-pro         # switch Gemini to Pro
+hr model reset anthropic                   # revert back to the default
+hr restart                                 # apply changes
+```
+
+Overrides are stored as plain variables in `.env` (e.g. `ANTHROPIC_MODEL=claude-sonnet-4-6`)
+and active overrides are highlighted in `hr model list`.
+
 ---
 
 ## Commands
@@ -178,6 +195,9 @@ The `./install.sh` step puts `hr` (and the full name `hermes-router`) on your PA
 | `hr setup` | Interactive first-run wizard — add a key, start the router, verify it works |
 | `hr auth add <provider>` | Add one or more API keys for a provider (prompts you, input hidden) |
 | `hr auth list` | Show every provider and how many keys it has |
+| `hr model list` | Show every provider and its active model (default or overridden) |
+| `hr model set <provider> <model>` | Override the model used for a specific provider |
+| `hr model reset <provider>` | Revert a provider back to its default model |
 | `hr start` | Run the router (same as `python router.py`) |
 | `hr status` | Live dashboard — per-provider health, latency, cache stats |
 | `hr restart` | Restart the router so key/config changes take effect |
@@ -187,7 +207,7 @@ The `./install.sh` step puts `hr` (and the full name `hermes-router`) on your PA
 | `hr help` | Show all commands |
 
 Valid provider names: `gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`,
-`groq`, `mistral`, `cohere`, `zai`, `naga`, `nvidia`.
+`groq`, `mistral`, `cohere`, `zai`, `naga`, `nvidia`, `openai`, `anthropic`.
 
 **Settings** live in `.env` (all optional — sensible defaults):
 
@@ -198,6 +218,10 @@ Valid provider names: `gemini`, `openrouter`, `sambanova`, `github_models`, `cer
 | `ROUTER_AUTH_FILE` | `./auth.json` | Where keys are stored |
 | `CACHE_TTL_SECONDS` | `300` | Response cache lifetime (`0` disables) |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Model override (set via `hr model set`) |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Model override (set via `hr model set`) |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Model override (set via `hr model set`) |
+| `<PROVIDER>_MODEL` | *(varies)* | Same pattern applies to all providers |
 
 ---
 
