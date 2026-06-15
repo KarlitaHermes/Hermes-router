@@ -31,7 +31,7 @@ err()  { printf '\033[1;31m[auth]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[auth]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[auth]\033[0m %s\n' "$*"; }
 
-PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia"
+PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia openai anthropic"
 
 # Normalize a provider name to its canonical form (accepts a couple of aliases).
 canonical_provider() {
@@ -47,6 +47,8 @@ canonical_provider() {
     zai|glm|z.ai)          echo "zai" ;;
     naga)                  echo "naga" ;;
     nvidia|nim)            echo "nvidia" ;;
+    openai|gpt)            echo "openai" ;;
+    anthropic|claude)      echo "anthropic" ;;
     *)                     echo "" ;;
   esac
 }

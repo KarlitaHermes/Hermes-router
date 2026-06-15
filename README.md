@@ -140,6 +140,8 @@ the router. It's git-ignored, so real keys are never committed.
 You only need one to start — add more to stay online longer. You can stack quota by
 creating multiple keys per provider (and signing up with multiple Google/GitHub accounts).
 
+**Free providers** — you only need one to start. Stack quota by adding multiple keys per provider.
+
 | Provider | Free tier | Sign up |
 |---|---|---|
 | Gemini | Generous per-minute limits | [aistudio.google.com](https://aistudio.google.com) |
@@ -153,6 +155,17 @@ creating multiple keys per provider (and signing up with multiple Google/GitHub 
 | Z.ai (GLM) | ~1k requests/day | [z.ai](https://z.ai) |
 | Naga AI | 100 requests/day per key | [naga.ac](https://naga.ac) |
 | NVIDIA NIM | 40 requests/min per key | [build.nvidia.com](https://build.nvidia.com) |
+
+**Paid providers** — add your existing API key; the router handles everything else.
+
+| Provider | Default model | API keys |
+|---|---|---|
+| OpenAI | `gpt-4o-mini` | [platform.openai.com](https://platform.openai.com/api-keys) |
+| Anthropic | `claude-haiku-4-5` | [console.anthropic.com](https://console.anthropic.com) |
+
+> Anthropic's API uses a different wire format from OpenAI. hermes-router translates
+> automatically — your app sends the same OpenAI-format request regardless of which
+> provider handles it.
 
 ---
 

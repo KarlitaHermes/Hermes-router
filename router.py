@@ -11,8 +11,9 @@ A lightweight OpenAI-compatible proxy that:
   - Routes short requests to low-latency providers first (optional)
   - Tracks per-provider latency and error rates
 
-Supported providers (configure via .env):
-  Gemini → OpenRouter → SambaNova → GitHub Models → Cerebras → Groq → Mistral → Cohere → Z.ai (GLM) → Naga → NVIDIA NIM
+Supported providers (configure via .env or auth.json):
+  Free:  Gemini · OpenRouter · SambaNova · GitHub Models · Cerebras · Groq · Mistral · Cohere · Z.ai · Naga · NVIDIA NIM
+  Paid:  OpenAI · Anthropic
 
 Quick start:
   pip install -r requirements.txt
@@ -335,6 +336,25 @@ def _build_providers() -> list[dict]:
             "keys":     nvidia_keys,
         })
 
+    openai_keys = _keys_for("openai", "OPENAI_API_KEYS")
+    if openai_keys:
+        providers.append({
+            "name":     "openai",
+            "base_url": "https://api.openai.com/v1",
+            "model":    os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            "keys":     openai_keys,
+        })
+
+    anthropic_keys = _keys_for("anthropic", "ANTHROPIC_API_KEYS")
+    if anthropic_keys:
+        providers.append({
+            "name":     "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "model":    os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+            "keys":     anthropic_keys,
+            "protocol": "anthropic",   # triggers format translation in forward()
+        })
+
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
@@ -402,6 +422,22 @@ def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
         return None
 
 
+def _probe_anthropic(provider: dict, key: str) -> tuple:
+    """Probe Anthropic using the Messages API (not OpenAI-format /chat/completions)."""
+    url  = "https://api.anthropic.com/v1/messages"
+    hdrs = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+    body = {"model": provider["model"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}
+    t0 = time.time()
+    try:
+        r = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
+        latency = (time.time() - t0) * 1000
+        return r.status_code == 200, latency, provider["model"]
+    except requests.exceptions.ReadTimeout:
+        return True, (time.time() - t0) * 1000, provider["model"]
+    except Exception:
+        return False, (time.time() - t0) * 1000, provider["model"]
+
+
 def _probe_provider(provider: dict, key: str) -> tuple:
     """Returns (success, latency_ms, model_used). Auto-discovers alt model on 400/404.
 
@@ -410,6 +446,9 @@ def _probe_provider(provider: dict, key: str) -> tuple:
     past the probe window, so a read-timeout counts as available rather than
     wrongly dropping a working provider to the back of its rating tier. Only a
     connection failure (host unreachable) counts as down."""
+    if provider.get("protocol") == "anthropic":
+        return _probe_anthropic(provider, key)
+
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
     hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
             **provider.get("headers", {})}
@@ -809,6 +848,133 @@ def _streaming_generator(resp: requests.Response):
     if buf:
         yield buf
 
+# ── Anthropic format translation ──────────────────────────────────────────────
+# Anthropic's Messages API uses a different format from OpenAI. These helpers
+# translate transparently so the caller never has to know which provider they hit.
+
+def _to_anthropic_body(payload: dict, model: str) -> dict:
+    """Convert an OpenAI chat-completions request body to Anthropic Messages format."""
+    system_parts = []
+    messages = []
+    for msg in payload.get("messages", []):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        # Flatten list content to plain text
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if role == "system":
+            system_parts.append(content)
+        else:
+            # Merge consecutive same-role messages (Anthropic requires alternating roles)
+            if messages and messages[-1]["role"] == role:
+                messages[-1]["content"] += "\n" + content
+            else:
+                messages.append({"role": role, "content": content})
+
+    body: dict = {
+        "model":      model,
+        "messages":   messages,
+        "max_tokens": payload.get("max_tokens") or 1024,
+    }
+    if system_parts:
+        body["system"] = "\n".join(system_parts)
+    if payload.get("stream"):
+        body["stream"] = True
+    if payload.get("temperature") is not None:
+        body["temperature"] = payload["temperature"]
+    stop = payload.get("stop")
+    if stop:
+        body["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+    return body
+
+
+def _from_anthropic_response(data: dict) -> dict:
+    """Convert an Anthropic Messages response to OpenAI chat-completion format."""
+    content = "".join(
+        b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+    )
+    stop_reason = data.get("stop_reason", "end_turn")
+    finish_reason = "stop" if stop_reason in ("end_turn", "stop_sequence") else "length"
+    usage = data.get("usage", {})
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+    return {
+        "id":      data.get("id", "msg_unknown"),
+        "object":  "chat.completion",
+        "created": int(time.time()),
+        "model":   data.get("model", ""),
+        "choices": [{
+            "index":         0,
+            "message":       {"role": "assistant", "content": content},
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens":     prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens":      prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def _anthropic_streaming_generator(resp: requests.Response):
+    """Translate Anthropic SSE stream to OpenAI SSE format token-by-token."""
+    msg_id       = f"chatcmpl-{int(time.time())}"
+    model        = ""
+    created      = int(time.time())
+    finish_reason = "stop"
+    first_chunk  = True
+
+    buf = b""
+    for raw_chunk in resp.iter_content(chunk_size=None):
+        buf += raw_chunk
+        while b"\n" in buf:
+            line_bytes, buf = buf.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            try:
+                event = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            etype = event.get("type")
+
+            if etype == "message_start":
+                msg    = event.get("message", {})
+                msg_id = msg.get("id", msg_id)
+                model  = msg.get("model", "")
+                # Emit role chunk
+                chunk = {"id": msg_id, "object": "chat.completion.chunk", "created": created,
+                         "model": model,
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+                                      "finish_reason": None}]}
+                yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+                first_chunk = False
+
+            elif etype == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text  = delta.get("text", "")
+                    chunk = {"id": msg_id, "object": "chat.completion.chunk", "created": created,
+                             "model": model,
+                             "choices": [{"index": 0, "delta": {"content": text},
+                                          "finish_reason": None}]}
+                    yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+
+            elif etype == "message_delta":
+                sr = event.get("delta", {}).get("stop_reason", "end_turn")
+                finish_reason = "stop" if sr in ("end_turn", "stop_sequence") else "length"
+
+            elif etype == "message_stop":
+                chunk = {"id": msg_id, "object": "chat.completion.chunk", "created": created,
+                         "model": model,
+                         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}
+                yield ("data: " + json.dumps(chunk) + "\n\n").encode()
+                yield b"data: [DONE]\n\n"
+
 # ── Complexity-aware provider ordering ────────────────────────────────────────
 
 def _estimated_tokens(messages: list) -> int:
@@ -832,6 +998,25 @@ def _ordered_providers(payload: dict) -> list[dict]:
 # ── Request forwarding ─────────────────────────────────────────────────────────
 
 def forward(provider: dict, key: str, payload: dict, streaming: bool) -> requests.Response | None:
+    # Anthropic uses a different wire format — translate and send directly.
+    if provider.get("protocol") == "anthropic":
+        model = payload.get("model", "")
+        if not model or model in ("", ROUTER_MODEL, "auto"):
+            model = provider["model"]
+        cleaned = []
+        for msg in payload.get("messages", []):
+            m = dict(msg)
+            _strip_message(m)
+            cleaned.append(m)
+        body = _to_anthropic_body({**payload, "messages": cleaned}, model)
+        hdrs = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+        try:
+            return _HTTP.post("https://api.anthropic.com/v1/messages",
+                              headers=hdrs, json=body, stream=streaming, timeout=(10, 120))
+        except requests.exceptions.RequestException as e:
+            log.error(f"  Network error → anthropic: {e}")
+            return None
+
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type":  "application/json",
@@ -1005,17 +1190,22 @@ def chat():
             stats.record_success(name, elapsed)
             stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
             log.info(f"  ✓ {name} {resp.status_code} ({elapsed*1000:.0f}ms)")
+            is_anthropic = provider.get("protocol") == "anthropic"
             if streaming:
+                gen = (_anthropic_streaming_generator(resp) if is_anthropic
+                       else _streaming_generator(resp))
                 return Response(
-                    stream_with_context(_streaming_generator(resp)),
-                    content_type=resp.headers.get("Content-Type", "text/event-stream"),
+                    stream_with_context(gen),
+                    content_type="text/event-stream",
                     headers={"X-Provider": name},
                 )
             else:
-                data = resp.json()
-                _strip_response(data)
+                data = (_from_anthropic_response(resp.json()) if is_anthropic
+                        else resp.json())
+                if not is_anthropic:
+                    _strip_response(data)
                 cache.set(payload, data)
-                return jsonify(data), resp.status_code
+                return jsonify(data), 200
 
         log.warning(f"✗ {name} exhausted — cascading")
 
