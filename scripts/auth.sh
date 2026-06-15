@@ -21,8 +21,8 @@
 #
 set -uo pipefail
 
-cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
-REPO="$(pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO" || { echo "cannot cd to repo dir"; exit 1; }
 AUTH_FILE="${ROUTER_AUTH_FILE:-$REPO/auth.json}"
 PYTHON="${PYTHON:-python3}"
 

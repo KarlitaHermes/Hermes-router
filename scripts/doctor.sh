@@ -7,8 +7,8 @@
 #
 set -uo pipefail
 
-cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
-REPO="$(pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO" || { echo "cannot cd to repo dir"; exit 1; }
 
 pass() { printf '  \033[1;32m[✓]\033[0m %s\n' "$*"; }
 fail() { printf '  \033[1;31m[✗]\033[0m %s\n' "$*"; ISSUES=$((ISSUES+1)); }

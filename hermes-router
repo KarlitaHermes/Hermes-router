@@ -45,25 +45,25 @@ shift 2>/dev/null || true
 
 case "$cmd" in
   setup)
-    exec "$REPO/setup.sh" "$@"
+    exec "$REPO/scripts/setup.sh" "$@"
     ;;
   auth)
-    exec "$REPO/auth.sh" "$@"
+    exec "$REPO/scripts/auth.sh" "$@"
     ;;
   model)
-    exec "$REPO/model.sh" "$@"
+    exec "$REPO/scripts/model.sh" "$@"
     ;;
   status)
-    exec "$REPO/status.sh" "$@"
+    exec "$REPO/scripts/status.sh" "$@"
     ;;
   restart)
-    exec "$REPO/restart.sh" "$@"
+    exec "$REPO/scripts/restart.sh" "$@"
     ;;
   doctor)
-    exec "$REPO/doctor.sh" "$@"
+    exec "$REPO/scripts/doctor.sh" "$@"
     ;;
   update)
-    HR_INVOKE="hermes-router update" exec "$REPO/update.sh" "$@"
+    HR_INVOKE="hermes-router update" exec "$REPO/scripts/update.sh" "$@"
     ;;
   start|run|serve)
     exec "$PYTHON" "$REPO/router.py" "$@"

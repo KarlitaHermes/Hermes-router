@@ -7,8 +7,8 @@
 #
 set -uo pipefail
 
-cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
-REPO="$(pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO" || { echo "cannot cd to repo dir"; exit 1; }
 
 log()  { printf '\033[1;36m[setup]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[setup]\033[0m %s\n' "$*" >&2; }
@@ -60,7 +60,7 @@ if [ "${total_keys:-0}" -gt 0 ]; then
       printf '\033[1;36m[setup]\033[0m Provider name: '
       read -r provider
       echo ""
-      [ -n "$provider" ] && bash "$REPO/auth.sh" add "$provider" || true
+      [ -n "$provider" ] && bash "$REPO/scripts/auth.sh" add "$provider" || true
       ;;
   esac
 else
@@ -77,7 +77,7 @@ else
   read -r provider
   echo ""
   if [ -n "$provider" ]; then
-    bash "$REPO/auth.sh" add "$provider" || true
+    bash "$REPO/scripts/auth.sh" add "$provider" || true
   else
     warn "Skipped — run 'hr auth add <provider>' before starting the router."
   fi

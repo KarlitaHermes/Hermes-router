@@ -24,7 +24,8 @@
 #
 set -uo pipefail
 
-cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO" || { echo "cannot cd to repo dir"; exit 1; }
 
 PYTHON="${PYTHON:-python3}"
 PORT="${PORT:-8319}"

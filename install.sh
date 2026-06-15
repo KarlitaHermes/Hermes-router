@@ -95,9 +95,10 @@ else
 fi
 
 # ── 4. Make scripts executable ────────────────────────────────────────────────
-chmod +x "$REPO/hermes-router" "$REPO/install.sh" "$REPO/update.sh" \
-         "$REPO/auth.sh" "$REPO/status.sh" "$REPO/restart.sh" \
-         "$REPO/setup.sh" "$REPO/doctor.sh" 2>/dev/null || true
+chmod +x "$REPO/hermes-router" "$REPO/install.sh" \
+         "$REPO/scripts/auth.sh" "$REPO/scripts/status.sh" "$REPO/scripts/restart.sh" \
+         "$REPO/scripts/setup.sh" "$REPO/scripts/doctor.sh" \
+         "$REPO/scripts/update.sh" "$REPO/scripts/model.sh" 2>/dev/null || true
 
 # ── 5. Symlink `hr` and `hermes-router` on PATH ───────────────────────────────
 BINDIR=""

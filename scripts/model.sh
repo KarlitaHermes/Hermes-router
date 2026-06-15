@@ -18,8 +18,8 @@
 #
 set -uo pipefail
 
-cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
-REPO="$(pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO" || { echo "cannot cd to repo dir"; exit 1; }
 ENV_FILE="$REPO/.env"
 PYTHON="${REPO}/venv/bin/python"
 [ -f "$PYTHON" ] || PYTHON=python3
