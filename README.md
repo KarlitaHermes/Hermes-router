@@ -68,23 +68,33 @@ Everything is configured by environment variables (see [Commands](#commands)); k
 
 **Requirements:** Python 3.10+ and at least one free API key (see the table below).
 
+### One-liner install
+
 ```bash
-# 1. Get the code
-git clone https://github.com/Shaf2665/Hermes-router.git
-cd Hermes-router
-
-# 2. Install dependencies + the `hr` command
-pip install -r requirements.txt
-./install.sh
-
-# 3. Add at least one provider's API key (saved to auth.json, input hidden)
-hr auth add openrouter
-
-# 4. Start it
-hr start          # or: python router.py
+curl -fsSL https://raw.githubusercontent.com/Shaf2665/Hermes-router/main/get.sh | bash
 ```
 
-You'll see `hermes-router starting on :8319`. Check it:
+This clones the repo to `~/.local/share/hermes-router`, creates a venv, installs
+dependencies, and puts `hr` on your PATH — all in one step.
+
+Then run the interactive setup wizard:
+
+```bash
+hr setup
+```
+
+It walks you through adding your first API key and starting the router.
+
+### Manual install (if you already cloned)
+
+```bash
+git clone https://github.com/Shaf2665/Hermes-router.git
+cd Hermes-router
+./install.sh     # creates venv, installs deps, symlinks hr
+hr setup         # interactive wizard: add a key + start the router
+```
+
+Check it's running:
 
 ```bash
 curl http://localhost:8319/health
@@ -152,11 +162,13 @@ The `./install.sh` step puts `hr` (and the full name `hermes-router`) on your PA
 
 | Command | What it does |
 |---|---|
+| `hr setup` | Interactive first-run wizard — add a key, start the router, verify it works |
 | `hr auth add <provider>` | Add one or more API keys for a provider (prompts you, input hidden) |
 | `hr auth list` | Show every provider and how many keys it has |
 | `hr start` | Run the router (same as `python router.py`) |
 | `hr status` | Live dashboard — per-provider health, latency, cache stats |
 | `hr restart` | Restart the router so key/config changes take effect |
+| `hr doctor` | Diagnose installation issues (Python, venv, keys, PATH, router health) |
 | `hr update` | Update to the latest version (safe; auto-rolls-back on failure) |
 | `hr version` | Show the installed version |
 | `hr help` | Show all commands |
