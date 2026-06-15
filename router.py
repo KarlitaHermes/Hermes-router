@@ -879,7 +879,15 @@ def _to_anthropic_body(payload: dict, model: str) -> dict:
         "max_tokens": payload.get("max_tokens") or 1024,
     }
     if system_parts:
-        body["system"] = "\n".join(system_parts)
+        system_text = "\n".join(system_parts)
+        # Anthropic prompt caching: mark system prompt for caching when it's long
+        # enough to qualify (≥ 1024 tokens; estimated as ≥ 4096 chars). Cached
+        # tokens are billed at 10% on subsequent requests — transparent to the caller.
+        if len(system_text) >= 4096:
+            body["system"] = [{"type": "text", "text": system_text,
+                                "cache_control": {"type": "ephemeral"}}]
+        else:
+            body["system"] = system_text
     if payload.get("stream"):
         body["stream"] = True
     if payload.get("temperature") is not None:
@@ -900,7 +908,7 @@ def _from_anthropic_response(data: dict) -> dict:
     usage = data.get("usage", {})
     prompt_tokens = usage.get("input_tokens", 0)
     completion_tokens = usage.get("output_tokens", 0)
-    return {
+    out: dict = {
         "id":      data.get("id", "msg_unknown"),
         "object":  "chat.completion",
         "created": int(time.time()),
@@ -916,6 +924,13 @@ def _from_anthropic_response(data: dict) -> dict:
             "total_tokens":      prompt_tokens + completion_tokens,
         },
     }
+    # Pass through Anthropic cache token counts when present so callers can
+    # observe cache savings without breaking OpenAI-compatible clients.
+    if usage.get("cache_read_input_tokens"):
+        out["usage"]["cache_read_input_tokens"] = usage["cache_read_input_tokens"]
+    if usage.get("cache_creation_input_tokens"):
+        out["usage"]["cache_creation_input_tokens"] = usage["cache_creation_input_tokens"]
+    return out
 
 
 def _anthropic_streaming_generator(resp: requests.Response):
