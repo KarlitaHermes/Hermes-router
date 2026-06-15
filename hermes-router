@@ -3,16 +3,18 @@
 # hermes-router (also: hr) — command-line wrapper
 #
 # Usage:
-#   hr auth add <provider>   Add API key(s) for a provider (stored in .env)
+#   hr setup                 Interactive first-run wizard (start here)
+#   hr auth add <provider>   Add API key(s) for a provider
 #   hr auth list             Show all providers and how many keys are configured
-#   hr status                Live health dashboard for the running router
 #   hr start                 Run the router (same as: python router.py)
-#   hr restart               Restart the router so .env/key changes take effect
+#   hr status                Live health dashboard for the running router
+#   hr restart               Restart the router so key/config changes take effect
+#   hr doctor                Diagnose installation issues
 #   hr update [--check]      Update to the latest version (safe; auto-rollback)
 #   hr version               Show the installed version
-#   hr help                  Show this help
+#   hr help                  Show all commands
 #
-# Install with ./install.sh — creates both `hermes-router` and `hr` on your PATH.
+# Install with ./install.sh — creates venv, installs deps, and puts `hr` on PATH.
 #
 set -uo pipefail
 
@@ -25,7 +27,13 @@ while [ -h "$SOURCE" ]; do
   case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
 done
 REPO="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
-PYTHON="${PYTHON:-python3}"
+
+# Prefer the venv Python created by install.sh; fall back to system python3.
+if [ -f "$REPO/venv/bin/python" ]; then
+  PYTHON="${PYTHON:-$REPO/venv/bin/python}"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
 
 usage() { awk 'NR>1 && /^#/ {sub(/^#[[:space:]]?/,""); print; next} NR>1 {exit}' "$SOURCE"; }
 
@@ -33,6 +41,9 @@ cmd="${1:-help}"
 shift 2>/dev/null || true
 
 case "$cmd" in
+  setup)
+    exec "$REPO/setup.sh" "$@"
+    ;;
   auth)
     exec "$REPO/auth.sh" "$@"
     ;;
@@ -42,8 +53,10 @@ case "$cmd" in
   restart)
     exec "$REPO/restart.sh" "$@"
     ;;
+  doctor)
+    exec "$REPO/doctor.sh" "$@"
+    ;;
   update)
-    # Hand off to the safe updater; HR_INVOKE makes its messages say the right name.
     HR_INVOKE="hermes-router update" exec "$REPO/update.sh" "$@"
     ;;
   start|run|serve)

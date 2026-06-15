@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+#
+# hr setup — interactive first-run wizard
+#
+# Checks your install, walks you through adding a provider key,
+# and optionally starts the router and confirms it's alive.
+#
+set -uo pipefail
+
+cd "$(dirname "$0")" || { echo "cannot cd to script dir"; exit 1; }
+REPO="$(pwd)"
+
+log()  { printf '\033[1;36m[setup]\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m[setup]\033[0m %s\n' "$*" >&2; }
+ok()   { printf '\033[1;32m[setup]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[setup]\033[0m %s\n' "$*"; }
+step() { printf '\n\033[1;35m── Step %s: %s\033[0m\n\n' "$1" "$2"; }
+
+PORT="${PORT:-8319}"
+AUTH_FILE="${ROUTER_AUTH_FILE:-$REPO/auth.json}"
+VENV_PYTHON="$REPO/venv/bin/python"
+
+echo ""
+echo "  ┌──────────────────────────────────┐"
+echo "  │   hermes-router  ·  setup        │"
+echo "  └──────────────────────────────────┘"
+echo ""
+
+# ── Step 1: Verify install ────────────────────────────────────────────────────
+step 1 "Checking installation"
+
+if [ ! -f "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import flask, waitress, requests" 2>/dev/null; then
+  warn "venv or dependencies missing — running install.sh first..."
+  bash "$REPO/install.sh" || { err "install.sh failed. Fix errors above, then re-run: hr setup"; exit 1; }
+else
+  ok "Installation OK"
+fi
+
+# ── Step 2: API keys ─────────────────────────────────────────────────────────
+step 2 "API keys"
+
+total_keys=$("$VENV_PYTHON" - "$AUTH_FILE" 2>/dev/null <<'PY'
+import json, sys, os
+path = sys.argv[1]
+try:
+    doc = json.load(open(path))
+    print(sum(len(v) for v in doc.get("providers", {}).values()))
+except Exception:
+    print(0)
+PY
+)
+
+if [ "${total_keys:-0}" -gt 0 ]; then
+  ok "$total_keys key(s) already configured"
+  printf '\n\033[1;36m[setup]\033[0m Add keys for another provider? [y/N]: '
+  read -r ans
+  echo ""
+  case "${ans:-n}" in
+    [yY]*)
+      printf '\033[1;36m[setup]\033[0m Provider name: '
+      read -r provider
+      echo ""
+      [ -n "$provider" ] && bash "$REPO/auth.sh" add "$provider" || true
+      ;;
+  esac
+else
+  warn "No API keys found — you need at least one to get LLM responses."
+  echo ""
+  echo "  Free providers (sign up and get a key):"
+  echo "    gemini       aistudio.google.com   (generous free tier)"
+  echo "    openrouter   openrouter.ai          (50 req/day per key)"
+  echo "    groq         console.groq.com       (fast, free tier)"
+  echo "    cerebras     cloud.cerebras.ai      (fast inference)"
+  echo "    sambanova    cloud.sambanova.ai     (free Llama models)"
+  echo ""
+  printf '\033[1;36m[setup]\033[0m Which provider do you have a key for? (or Enter to skip): '
+  read -r provider
+  echo ""
+  if [ -n "$provider" ]; then
+    bash "$REPO/auth.sh" add "$provider" || true
+  else
+    warn "Skipped — run 'hr auth add <provider>' before starting the router."
+  fi
+fi
+
+# ── Step 3: Start the router ──────────────────────────────────────────────────
+step 3 "Start the router"
+
+if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+  ok "Router is already running on port $PORT"
+else
+  printf '\033[1;36m[setup]\033[0m Start the router now? [Y/n]: '
+  read -r ans
+  echo ""
+  case "${ans:-y}" in
+    [nN]*)
+      warn "Skipped — run 'hr start' when ready."
+      ;;
+    *)
+      log "Starting router (logs → $REPO/router.log)..."
+      PORT="$PORT" nohup "$VENV_PYTHON" "$REPO/router.py" \
+        >> "$REPO/router.log" 2>&1 &
+      ROUTER_PID=$!
+      echo "$ROUTER_PID" > "$REPO/router.pid"
+
+      # Wait up to 6s for the router to bind
+      alive=0
+      for i in 1 2 3 4 5 6; do
+        sleep 1
+        if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+          ok "Router started on port $PORT (PID $ROUTER_PID)"
+          alive=1
+          break
+        fi
+      done
+      if [ "$alive" -eq 0 ]; then
+        err "Router didn't respond after 6s."
+        err "Check logs:  tail -20 $REPO/router.log"
+      fi
+      ;;
+  esac
+fi
+
+# ── Step 4: Verify ────────────────────────────────────────────────────────────
+step 4 "Verifying"
+
+if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+  ok "Router is alive at http://localhost:${PORT}"
+  echo ""
+  echo "  Quick check:  curl http://localhost:${PORT}/health"
+  echo "  Live status:  hr status"
+  echo ""
+  echo "  Connect your app (Python):"
+  echo "    from openai import OpenAI"
+  echo "    client = OpenAI(base_url='http://localhost:${PORT}/v1', api_key='sk-router-1')"
+  echo ""
+else
+  warn "Router isn't responding on port $PORT."
+  echo "  Start it with:  hr start"
+fi
+
+echo ""
+ok "Setup complete!"
+echo ""
