@@ -285,6 +285,8 @@ Valid provider names: `gemini`, `openrouter`, `sambanova`, `github_models`, `cer
 | `<PROVIDER>_EMBED_MODEL` | *(gemini/mistral/cohere set)* | Same pattern for embeddings; set empty to disable |
 | `METRICS_REQUIRE_AUTH` | `0` | Require the proxy key on `/metrics` (`1` to enable) |
 | `<PROVIDER>_SUPPORTS_TOOLS` | *(auto-probed)* | Force tool-capability on/off for a provider (`1`/`0`), overriding the startup probe |
+| `<PROVIDER>_REASONING` | *(auto-probed)* | Force reasoning-model on/off for a provider (`1`/`0`), overriding the startup probe |
+| `REASONING_TOKEN_RESERVE` | `4096` | Extra output budget added for reasoning models so hidden chain-of-thought doesn't eat the answer (`0` disables) |
 
 ---
 
