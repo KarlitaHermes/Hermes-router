@@ -1425,6 +1425,18 @@ def status():
             "stats": stats.summary(p["name"]),
             "breaker": stats.breaker_status(p["name"]),
         }
+        # Surface the internal routing signals (rating + probe latency + model)
+        # so dashboards can show them. Added only when known, so un-probed
+        # providers still fall back to the dashboard's "?"/"—" placeholders.
+        st = _provider_state.get(p["name"], {})
+        if st.get("rating") is not None:
+            entry["rating"] = st["rating"]
+        if st.get("latency_ms"):
+            entry["latency_ms"] = st["latency_ms"]
+        if st.get("model"):
+            entry["model"] = st["model"]
+        if "available" in st:
+            entry["available"] = st["available"]
         if p.get("skip_if_tokens_over"):
             entry["skip_if_tokens_over"] = p["skip_if_tokens_over"]
         if p.get("max_output_tokens"):
