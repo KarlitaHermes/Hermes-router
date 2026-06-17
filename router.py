@@ -382,6 +382,25 @@ def _build_providers() -> list[dict]:
         env_var = f"{p['name'].upper()}_MAX_OUTPUT_TOKENS"
         p["max_output_tokens"] = _int_env(env_var, _max_out_defaults.get(p["name"], 0))
 
+    # Per-provider embedding model. Only providers with a non-empty embed model
+    # take part in /v1/embeddings routing (OpenRouter, Groq, etc. are chat-only).
+    # Each uses the same base_url with an /embeddings path; the wire format is
+    # OpenAI-compatible, so no translation is needed. Configure or enable more
+    # via {PROVIDER}_EMBED_MODEL (empty string disables a provider for embeds).
+    # NVIDIA is intentionally omitted: its embedding models are "asymmetric" and
+    # require an input_type (query/passage) parameter that the OpenAI embeddings
+    # format doesn't carry, so they can't be served by clean passthrough. Enable
+    # one explicitly with NVIDIA_EMBED_MODEL if you know it accepts OpenAI format.
+    _embed_defaults = {
+        "gemini":  "gemini-embedding-001",
+        "mistral": "mistral-embed",
+        "openai":  "text-embedding-3-small",
+        "cohere":  "embed-v4.0",
+    }
+    for p in providers:
+        env_var = f"{p['name'].upper()}_EMBED_MODEL"
+        p["embed_model"] = os.environ.get(env_var, _embed_defaults.get(p["name"], ""))
+
     return providers
 
 
@@ -727,6 +746,7 @@ class ProviderStats:
                 "avg_latency_ms": round(s.get("latency_sum", 0) / lc * 1000) if lc else None,
                 "error_rate":     round(ec / rc, 3) if rc else 0.0,
                 "total_requests": rc,
+                "errors":         ec,
             }
 
     def all_summaries(self) -> dict:
@@ -1116,11 +1136,46 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
         log.error(f"  Network error → {provider['name']}: {e}")
         return None
 
+
+def _embed_ordered() -> list[dict]:
+    """Embedding-capable providers in a STABLE priority order — deliberately NOT
+    round-robined like chat. Different providers return different vector
+    dimensions (e.g. gemini 3072, cohere 1536, mistral 1024), and vectors of
+    different dimensions can't be compared in one store. So we keep hitting the
+    same provider and only fail over (accepting a dimension change) when it's
+    actually down. Open breakers and unhealthy providers sink to the back; the
+    sort is stable, so healthy providers keep their config order as the priority.
+
+    For STRICT single-dimension guarantees, disable the others' embed models
+    (e.g. MISTRAL_EMBED_MODEL= and COHERE_EMBED_MODEL= empty in .env)."""
+    embed_providers = [p for p in PROVIDERS if p.get("embed_model")]
+    return sorted(embed_providers, key=lambda p: (1 if stats.breaker_open(p["name"]) else 0,
+                                                  stats.health_bucket(p["name"])))
+
+
+def forward_embeddings(provider: dict, key: str, payload: dict) -> requests.Response | None:
+    """POST an OpenAI-format embeddings request to a provider, substituting the
+    provider's configured embed model. No streaming, no format translation."""
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+        **provider.get("headers", {}),
+    }
+    body = dict(payload)
+    body["model"] = provider["embed_model"]   # always the provider's real embed model
+    url = provider["base_url"].rstrip("/") + "/embeddings"
+    try:
+        return _HTTP.post(url, headers=headers, json=body, timeout=(10, 120))
+    except requests.exceptions.RequestException as e:
+        log.error(f"  Network error → {provider['name']} embeddings: {e}")
+        return None
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 # Cap request bodies so a buggy client can't exhaust memory (Flask returns 413)
 app.config["MAX_CONTENT_LENGTH"] = _int_env("MAX_REQUEST_BYTES", 10 * 1024 * 1024)
+START_TIME = time.time()   # for uptime in /metrics
 
 
 def _auth_check():
@@ -1267,6 +1322,82 @@ def chat():
     return jsonify({"error": {"message": "All providers exhausted", "type": "router_error"}}), 503
 
 
+@app.route("/v1/embeddings", methods=["POST"])
+def embeddings():
+    err = _auth_check()
+    if err:
+        return err
+
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict) or "input" not in payload:
+        return jsonify({"error": {"message": "request body must be a JSON object with an 'input' field",
+                                  "type": "invalid_request_error"}}), 400
+
+    ordered = _embed_ordered()
+    if not ordered:
+        return jsonify({"error": {"message": "no embedding-capable providers configured "
+                                             "(set e.g. GEMINI_API_KEYS or MISTRAL_API_KEYS)",
+                                  "type": "router_error"}}), 503
+
+    # Embeddings are deterministic — identical input is a perfect cache hit.
+    cached = cache.get(payload)
+    if cached is not None:
+        log.info("↩ cache hit (embeddings)")
+        return jsonify(cached)
+
+    any_closed = any(not stats.breaker_open(p["name"]) for p in ordered)
+
+    for provider in ordered:
+        name = provider["name"]
+        if any_closed and stats.breaker_open(name):
+            log.info(f"⨂ skipping {name} embeddings (circuit open)")
+            continue
+
+        attempts = len(pool.pools.get(name, [])) or 1
+        for _ in range(attempts):
+            key = pool.get_key(name)
+            if not key:
+                log.warning(f"All {name} keys cooling — skipping provider")
+                break
+
+            log.info(f"→ Trying {name} embeddings ({provider['embed_model']}) ...{key[-6:]}")
+            t0   = time.time()
+            resp = forward_embeddings(provider, key, payload)
+            elapsed = time.time() - t0
+
+            if resp is None:
+                stats.record_error(name); stats.record_health(name, False)
+                pool.mark_rate_limited(name, key, retry_after=30)
+                continue
+            if resp.status_code == 429:
+                stats.record_error(name)
+                pool.mark_rate_limited(name, key, retry_after=_parse_retry_after(resp.headers.get("Retry-After")))
+                log.warning(f"  {name} 429 — cooldown, trying next key")
+                continue
+            if resp.status_code in (400, 401, 403, 404):
+                stats.record_error(name)   # request/auth/model-specific, not a health failure
+                log.error(f"  {name} embeddings {resp.status_code} — skipping provider: {resp.text[:200]}")
+                break
+            if resp.status_code >= 500:
+                stats.record_error(name); stats.record_health(name, False)
+                pool.mark_rate_limited(name, key, retry_after=15)
+                continue
+            if not (200 <= resp.status_code < 300):
+                stats.record_error(name); stats.record_health(name, False)
+                log.warning(f"  {name} embeddings unexpected {resp.status_code} — skipping provider")
+                break
+
+            stats.record_success(name, elapsed); stats.record_health(name, True)
+            log.info(f"  ✓ {name} embeddings ({elapsed*1000:.0f}ms)")
+            data = resp.json()
+            cache.set(payload, data)
+            return jsonify(data), 200
+
+        log.warning(f"✗ {name} embeddings exhausted — cascading")
+
+    return jsonify({"error": {"message": "All embedding providers exhausted", "type": "router_error"}}), 503
+
+
 @app.route("/v1/status")
 def status():
     """Show key cooldown state, latency/error stats, and cache metrics."""
@@ -1325,9 +1456,56 @@ def status():
     })
 
 
+@app.route("/metrics")
+def metrics():
+    """Prometheus text-format metrics for scraping (Grafana, etc.). Exposes only
+    counts and timings — never request content — so it's unauthenticated like
+    /health. Set METRICS_REQUIRE_AUTH=1 to require the proxy key instead."""
+    if _int_env("METRICS_REQUIRE_AUTH", 0):
+        err = _auth_check()
+        if err:
+            return err
+
+    out: list[str] = []
+
+    def emit(name, mtype, help_, samples):
+        out.append(f"# HELP {name} {help_}")
+        out.append(f"# TYPE {name} {mtype}")
+        for labels, val in samples:
+            tag = ("{" + ",".join(f'{k}="{v}"' for k, v in labels.items()) + "}") if labels else ""
+            out.append(f"{name}{tag} {val}")
+
+    emit("hermes_router_uptime_seconds", "gauge", "Seconds since the router started",
+         [({}, round(time.time() - START_TIME))])
+    emit("hermes_router_providers", "gauge", "Number of configured providers",
+         [({}, len(PROVIDERS))])
+
+    req, errs, lat, brk = [], [], [], []
+    for p in PROVIDERS:
+        name = p["name"]
+        s = stats.summary(name)
+        req.append(({"provider": name}, s["total_requests"]))
+        errs.append(({"provider": name}, s["errors"]))
+        if s["avg_latency_ms"] is not None:
+            lat.append(({"provider": name}, s["avg_latency_ms"]))
+        brk.append(({"provider": name}, 1 if stats.breaker_open(name) else 0))
+    emit("hermes_router_requests_total", "counter", "Total requests routed per provider", req)
+    emit("hermes_router_errors_total", "counter", "Total errored requests per provider", errs)
+    emit("hermes_router_avg_latency_ms", "gauge", "Mean successful-request latency in ms per provider", lat)
+    emit("hermes_router_circuit_breaker_open", "gauge", "1 if the provider's circuit breaker is open, else 0", brk)
+
+    emit("hermes_router_cache_hits_total", "counter", "Response-cache hits", [({}, cache.hits)])
+    emit("hermes_router_cache_misses_total", "counter", "Response-cache misses", [({}, cache.misses)])
+    emit("hermes_router_cache_size", "gauge", "Entries currently in the response cache", [({}, cache.size)])
+
+    return Response("\n".join(out) + "\n", content_type="text/plain; version=0.0.4")
+
+
 if __name__ == "__main__":
     log.info(f"hermes-router starting on :{PORT}")
     log.info(f"Providers: {[p['name'] for p in PROVIDERS]}")
+    _embed = {p["name"]: p["embed_model"] for p in PROVIDERS if p.get("embed_model")}
+    log.info(f"Embeddings (/v1/embeddings): {_embed if _embed else 'no embed-capable providers'}")
     log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE})")
     log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
     _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}

@@ -117,6 +117,33 @@ print(resp.choices[0].message.content)
 
 `api_key` is any value from `PROXY_API_KEYS` (default `sk-router-1`; set your own in `.env`).
 
+### Embeddings
+
+The same endpoint also speaks the OpenAI **embeddings** API, backed by free providers
+(Gemini, Mistral, Cohere). Point any embeddings client at it:
+
+```python
+resp = client.embeddings.create(model="hermes-router", input="hello world")
+print(len(resp.data[0].embedding))   # e.g. 3072 from Gemini
+```
+
+Unlike chat, embeddings use a **stable provider** (not round-robin): vectors from
+different providers have different dimensions and can't be mixed in one store, so the
+router keeps hitting the same provider and only fails over if it goes down. For a strict
+single-dimension guarantee, disable the others' embed models (e.g. `MISTRAL_EMBED_MODEL=`
+and `COHERE_EMBED_MODEL=` empty in `.env`).
+
+### Monitoring (`/metrics`)
+
+A Prometheus-compatible endpoint is exposed at `/metrics` (unauthenticated by default —
+it reveals only counts and timings, never request content). Point Prometheus/Grafana at
+it to track per-provider requests, errors, latency, circuit-breaker state, cache hits, and
+uptime. Set `METRICS_REQUIRE_AUTH=1` to require the proxy key.
+
+```bash
+curl http://localhost:8319/metrics
+```
+
 ### Where your keys live
 
 `hr auth add` writes to **`auth.json`** — the router's own credential store, kept next to
@@ -222,6 +249,9 @@ Valid provider names: `gemini`, `openrouter`, `sambanova`, `github_models`, `cer
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model override (set via `hr model set`) |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Model override (set via `hr model set`) |
 | `<PROVIDER>_MODEL` | *(varies)* | Same pattern applies to all providers |
+| `GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Embedding model (empty disables this provider for `/v1/embeddings`) |
+| `<PROVIDER>_EMBED_MODEL` | *(gemini/mistral/cohere set)* | Same pattern for embeddings; set empty to disable |
+| `METRICS_REQUIRE_AUTH` | `0` | Require the proxy key on `/metrics` (`1` to enable) |
 
 ---
 
