@@ -498,6 +498,40 @@ def _probe_provider(provider: dict, key: str) -> tuple:
         return False, (time.time() - t0) * 1000, provider["model"]
 
 
+_TOOL_PROBE = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Get the current weather for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                   "required": ["city"]}}}]
+
+
+def _probe_tools(provider: dict, key: str, model: str) -> bool:
+    """Detect whether a provider's model supports function calling. Sends a tiny
+    request that forces a tool call (tool_choice=required, falling back to auto
+    for providers that reject 'required') and checks whether the model actually
+    emits one. Anthropic providers always support tools."""
+    if provider.get("protocol") == "anthropic":
+        return True
+    url  = provider["base_url"].rstrip("/") + "/chat/completions"
+    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+            **provider.get("headers", {})}
+    base = {"model": model, "max_tokens": 64, "tools": _TOOL_PROBE,
+            "messages": [{"role": "user", "content": "What is the weather in Paris? Use the get_weather tool."}]}
+    for choice in ("required", "auto"):
+        try:
+            r = _HTTP.post(url, headers=hdrs, json={**base, "tool_choice": choice}, timeout=12)
+        except Exception:
+            return False
+        if r.status_code != 200:
+            continue   # provider may reject tool_choice=required → try auto
+        try:
+            msg = (r.json().get("choices") or [{}])[0].get("message") or {}
+            if msg.get("tool_calls"):
+                return True
+        except Exception:
+            return False
+    return False
+
+
 def classify_complexity(messages: list) -> int:
     """Heuristic: 1 (critical) → 5 (trivial). No LLM call."""
     content = " ".join(
@@ -605,10 +639,20 @@ def _initialize_ratings(providers: list, pool_ref):
             log.info(f"[ratings]   {name}: model fixed {original} → {actual}")
             p["model"] = actual
         rating = _rate_model(actual)
-        log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} rating={rating} model={actual} {latency:.0f}ms")
+        # Tool-capability: an explicit env override wins; otherwise probe (only
+        # when reachable — no point asking a down provider).
+        env_tools = os.environ.get(f"{name.upper()}_SUPPORTS_TOOLS")
+        if env_tools is not None:
+            supports_tools = env_tools.strip().lower() not in ("0", "false", "no", "")
+        elif ok:
+            supports_tools = _probe_tools(p, key, actual)
+        else:
+            supports_tools = False
+        log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} rating={rating} model={actual} "
+                 f"{latency:.0f}ms tools={'yes' if supports_tools else 'no'}")
         new_state[name] = {"rating": rating, "model": actual, "available": ok,
                             "latency_ms": round(latency, 1), "overridden": overridden,
-                            "original_model": original}
+                            "original_model": original, "supports_tools": supports_tools}
     _provider_state = new_state
     try:
         STATE_FILE.write_text(json.dumps({"last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1291,6 +1335,14 @@ def _estimated_tokens(messages: list) -> int:
     return sum(len(_message_text(m)) for m in messages) // 4
 
 
+def _supports_tools(provider: dict) -> bool:
+    """Whether this provider's model handles function calling, from the startup
+    probe. Unknown (e.g. state from before this feature, or never probed) is
+    treated optimistically as capable so we never hard-fail on missing data."""
+    val = _provider_state.get(provider["name"], {}).get("supports_tools")
+    return True if val is None else bool(val)
+
+
 def _ordered_providers(payload: dict) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
@@ -1460,6 +1512,14 @@ def _route_completion(payload: dict, streaming: bool):
     est_tokens = _estimated_tokens(messages)
     ordered    = _ordered_providers(payload)
 
+    # Tool-aware routing: when the request carries tools, prefer providers whose
+    # model actually supports function calling — otherwise a provider that
+    # silently ignores tools would return plain text instead of the tool call.
+    # SAFETY — only enforce this when at least one tool-capable provider is
+    # available; if none are, fall through to all of them rather than hard-fail.
+    needs_tools  = bool(payload.get("tools"))
+    enforce_tool = needs_tools and any(_supports_tools(p) for p in ordered)
+
     # Circuit breaker: skip providers whose breaker is open. SAFETY — if EVERY
     # candidate is open, treat them all as half-open probes (skip none) so we
     # always make forward progress instead of hard-failing while options remain.
@@ -1471,6 +1531,11 @@ def _route_completion(payload: dict, streaming: bool):
         # Breaker open → skip (unless all are open, then probe everything).
         if any_closed and stats.breaker_open(name):
             log.info(f"⨂ skipping {name} (circuit open)")
+            continue
+
+        # Tool request → skip providers whose model can't do function calling.
+        if enforce_tool and not _supports_tools(provider):
+            log.info(f"⚒ skipping {name} (no tool support)")
             continue
 
         # Skip providers whose payload ceiling this request would exceed
@@ -1715,6 +1780,8 @@ def status():
             entry["model"] = st["model"]
         if "available" in st:
             entry["available"] = st["available"]
+        if "supports_tools" in st:
+            entry["supports_tools"] = st["supports_tools"]
         if p.get("skip_if_tokens_over"):
             entry["skip_if_tokens_over"] = p["skip_if_tokens_over"]
         if p.get("max_output_tokens"):

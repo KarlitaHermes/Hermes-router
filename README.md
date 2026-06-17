@@ -139,8 +139,10 @@ print(msg.content[0].text)
 
 Streaming (`client.messages.stream(...)`) and **tool use** both work — Anthropic
 `tools`, `tool_use`, and `tool_result` are translated to/from OpenAI function calling
-in both streaming and non-streaming mode (provided the chosen provider's model supports
-function calling).
+in both streaming and non-streaming mode. When a request carries tools, the router
+**automatically routes only to providers whose model supports function calling**
+(detected at startup), so a request never lands on a model that would silently ignore
+the tools. Override detection per provider with `<PROVIDER>_SUPPORTS_TOOLS=1` / `=0`.
 
 Note the `model` you pass is **ignored** — hermes-router routes to the cheapest capable
 free provider, so an Anthropic-SDK app transparently gets the same multi-provider
@@ -282,6 +284,7 @@ Valid provider names: `gemini`, `openrouter`, `sambanova`, `github_models`, `cer
 | `GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Embedding model (empty disables this provider for `/v1/embeddings`) |
 | `<PROVIDER>_EMBED_MODEL` | *(gemini/mistral/cohere set)* | Same pattern for embeddings; set empty to disable |
 | `METRICS_REQUIRE_AUTH` | `0` | Require the proxy key on `/metrics` (`1` to enable) |
+| `<PROVIDER>_SUPPORTS_TOOLS` | *(auto-probed)* | Force tool-capability on/off for a provider (`1`/`0`), overriding the startup probe |
 
 ---
 
