@@ -992,9 +992,49 @@ def _anthropic_streaming_generator(resp: requests.Response):
 
 # ── Complexity-aware provider ordering ────────────────────────────────────────
 
+# Accurate token counting via tiktoken when available. The encoder is loaded
+# lazily on first use (not at import) so startup never blocks on tiktoken's
+# one-time vocab download, and any failure (no tiktoken, offline, etc.) falls
+# back to the character heuristic — the router always works regardless.
+_ENCODER = "uninitialized"  # sentinel; resolves to an encoder or None on first use
+
+
+def _get_encoder():
+    global _ENCODER
+    if _ENCODER == "uninitialized":
+        try:
+            import tiktoken
+            _ENCODER = tiktoken.get_encoding("o200k_base")
+        except Exception as e:
+            log.warning(f"tiktoken unavailable ({e}); using char/4 token estimate")
+            _ENCODER = None
+    return _ENCODER
+
+
+def _message_text(m: dict) -> str:
+    """Extract plain text from a message whose content is either a string or a
+    list of multimodal parts (only text parts contribute to the token count)."""
+    content = m.get("content", "")
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return str(content)
+
+
 def _estimated_tokens(messages: list) -> int:
-    """Rough token estimate: total content characters / 4."""
-    return sum(len(str(m.get("content", ""))) for m in messages) // 4
+    """Token count for a message list. Uses tiktoken for an accurate count when
+    available, otherwise a characters/4 heuristic. Adds a small per-message
+    framing overhead (~4 tokens) plus 3 priming tokens, matching how chat
+    models actually bill structured messages."""
+    enc = _get_encoder()
+    if enc is not None:
+        total = 3
+        for m in messages:
+            total += 4 + len(enc.encode(_message_text(m)))
+        return total
+    return sum(len(_message_text(m)) for m in messages) // 4
 
 
 def _ordered_providers(payload: dict) -> list[dict]:
