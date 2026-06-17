@@ -532,6 +532,34 @@ def _probe_tools(provider: dict, key: str, model: str) -> bool:
     return False
 
 
+def _probe_reasoning(provider: dict, key: str, model: str) -> bool:
+    """Detect whether a provider's model is a 'reasoning' model — one that spends
+    output tokens on hidden chain-of-thought before answering. These return empty
+    content if max_tokens is too small to cover the thinking. We probe with a
+    small budget and a trivial prompt: a reasoning model exposes a reasoning field
+    or burns the whole budget thinking (empty content, truncated), while a normal
+    model just answers. Anthropic's thinking is opt-in, so it's treated as normal."""
+    if provider.get("protocol") == "anthropic":
+        return False
+    url  = provider["base_url"].rstrip("/") + "/chat/completions"
+    hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+            **provider.get("headers", {})}
+    body = {"model": model, "max_tokens": 24,
+            "messages": [{"role": "user", "content": "Reply with just the word: ready"}]}
+    try:
+        r = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
+        if r.status_code != 200:
+            return False
+        choice = (r.json().get("choices") or [{}])[0]
+        msg     = choice.get("message") or {}
+        content = (msg.get("content") or "").strip()
+        if msg.get("reasoning_content") or msg.get("reasoning"):
+            return True
+        return not content and choice.get("finish_reason") == "length"
+    except Exception:
+        return False
+
+
 def classify_complexity(messages: list) -> int:
     """Heuristic: 1 (critical) → 5 (trivial). No LLM call."""
     content = " ".join(
@@ -648,11 +676,21 @@ def _initialize_ratings(providers: list, pool_ref):
             supports_tools = _probe_tools(p, key, actual)
         else:
             supports_tools = False
+        # Reasoning-model detection (env override wins, else probe when reachable).
+        env_reason = os.environ.get(f"{name.upper()}_REASONING")
+        if env_reason is not None:
+            reasoning = env_reason.strip().lower() not in ("0", "false", "no", "")
+        elif ok:
+            reasoning = _probe_reasoning(p, key, actual)
+        else:
+            reasoning = False
         log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} rating={rating} model={actual} "
-                 f"{latency:.0f}ms tools={'yes' if supports_tools else 'no'}")
+                 f"{latency:.0f}ms tools={'yes' if supports_tools else 'no'} "
+                 f"reasoning={'yes' if reasoning else 'no'}")
         new_state[name] = {"rating": rating, "model": actual, "available": ok,
                             "latency_ms": round(latency, 1), "overridden": overridden,
-                            "original_model": original, "supports_tools": supports_tools}
+                            "original_model": original, "supports_tools": supports_tools,
+                            "reasoning": reasoning}
     _provider_state = new_state
     try:
         STATE_FILE.write_text(json.dumps({"last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -871,6 +909,7 @@ cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE)
 def _strip_message(msg: dict):
     """Remove thinking fields from a message dict in-place."""
     msg.pop("reasoning_content", None)
+    msg.pop("reasoning", None)
     msg.pop("think", None)
     if isinstance(msg.get("content"), list):
         msg["content"] = [
@@ -903,6 +942,7 @@ def _streaming_generator(resp: requests.Response):
                     for choice in event.get("choices", []):
                         delta = choice.get("delta", {})
                         delta.pop("reasoning_content", None)
+                        delta.pop("reasoning", None)
                         delta.pop("think", None)
                     yield ("data: " + json.dumps(event) + "\n").encode("utf-8")
                     continue
@@ -1403,6 +1443,18 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
     body.pop("think", None)
     body.pop("thinking", None)
 
+    # Reasoning models spend output tokens on hidden chain-of-thought, so a small
+    # client max_tokens can be entirely consumed by thinking — leaving empty
+    # content. Give reasoning providers extra headroom on top of what the client
+    # asked for, so the actual answer still fits. (The model stops when done, so
+    # short answers stay short.) Tune/disable with REASONING_TOKEN_RESERVE.
+    if _provider_state.get(provider["name"], {}).get("reasoning"):
+        reserve = _int_env("REASONING_TOKEN_RESERVE", 4096)
+        if reserve > 0:
+            for field in ("max_tokens", "max_completion_tokens"):
+                if isinstance(body.get(field), int):
+                    body[field] += reserve
+
     # Clamp the requested output length to this provider's hard ceiling. Some
     # providers (e.g. Cohere caps output at 8192) reject the ENTIRE request with
     # a 400 when max_tokens exceeds their limit — so a client default like
@@ -1782,6 +1834,8 @@ def status():
             entry["available"] = st["available"]
         if "supports_tools" in st:
             entry["supports_tools"] = st["supports_tools"]
+        if "reasoning" in st:
+            entry["reasoning"] = st["reasoning"]
         if p.get("skip_if_tokens_over"):
             entry["skip_if_tokens_over"] = p["skip_if_tokens_over"]
         if p.get("max_output_tokens"):
