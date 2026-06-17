@@ -1010,6 +1010,131 @@ def _anthropic_streaming_generator(resp: requests.Response):
                 yield ("data: " + json.dumps(chunk) + "\n\n").encode()
                 yield b"data: [DONE]\n\n"
 
+
+# ── Anthropic INBOUND translation (accept the Anthropic SDK's /v1/messages) ───
+# The mirror image of the helpers above: these let a client using the Anthropic
+# SDK talk to the router. An incoming Anthropic request is converted to OpenAI
+# format, routed through the normal pipeline, and the response is converted back.
+
+_OPENAI_TO_ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens",
+                             "tool_calls": "tool_use", "content_filter": "end_turn"}
+
+
+def _anthropic_request_to_openai(body: dict) -> dict:
+    """Convert an Anthropic /v1/messages request into an OpenAI chat payload.
+    The model is deliberately NOT preserved — the router picks a model per
+    provider — so an Anthropic-SDK client transparently gets multi-provider
+    failover instead of being pinned to whatever model string it sent."""
+    messages = []
+    system = body.get("system")
+    if isinstance(system, list):   # Anthropic allows system as a list of text blocks
+        system = "\n".join(b.get("text", "") for b in system
+                           if isinstance(b, dict) and b.get("type") == "text")
+    if system:
+        messages.append({"role": "system", "content": system})
+    for m in body.get("messages", []):
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = "".join(b.get("text", "") for b in content
+                              if isinstance(b, dict) and b.get("type") == "text")
+        messages.append({"role": m.get("role", "user"), "content": content})
+
+    payload: dict = {"model": ROUTER_MODEL, "messages": messages}
+    if body.get("stream"):
+        payload["stream"] = True
+    for field in ("max_tokens", "temperature", "top_p"):
+        if body.get(field) is not None:
+            payload[field] = body[field]
+    if body.get("stop_sequences"):
+        payload["stop"] = body["stop_sequences"]
+    return payload
+
+
+def _openai_response_to_anthropic(data: dict) -> dict:
+    """Convert an OpenAI chat-completion response to Anthropic Messages format."""
+    choice = (data.get("choices") or [{}])[0]
+    text   = (choice.get("message") or {}).get("content") or ""
+    finish = choice.get("finish_reason") or "stop"
+    usage  = data.get("usage") or {}
+    return {
+        "id":            data.get("id", "msg_unknown"),
+        "type":          "message",
+        "role":          "assistant",
+        "model":         data.get("model", ROUTER_MODEL),
+        "content":       [{"type": "text", "text": text}],
+        "stop_reason":   _OPENAI_TO_ANTHROPIC_STOP.get(finish, "end_turn"),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens":  usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _openai_stream_to_anthropic(gen):
+    """Translate an OpenAI-format SSE stream (bytes, as yielded by the routing
+    pipeline) into the Anthropic Messages SSE event sequence the Anthropic SDK
+    expects: message_start → content_block_start → content_block_delta* →
+    content_block_stop → message_delta → message_stop."""
+    msg_id  = f"msg_{int(time.time())}"
+    model   = ROUTER_MODEL
+    finish  = "stop"
+    started = False
+
+    def start_events():
+        yield _sse("message_start", {"type": "message_start", "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        yield _sse("content_block_start", {"type": "content_block_start",
+            "index": 0, "content_block": {"type": "text", "text": ""}})
+
+    buf = ""
+    for chunk in gen:
+        if isinstance(chunk, (bytes, bytearray)):
+            chunk = chunk.decode("utf-8", errors="replace")
+        buf += chunk
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            model  = obj.get("model") or model
+            choice = (obj.get("choices") or [{}])[0]
+            piece  = (choice.get("delta") or {}).get("content")
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+            if piece:
+                if not started:
+                    started = True
+                    yield from start_events()
+                yield _sse("content_block_delta", {"type": "content_block_delta",
+                    "index": 0, "delta": {"type": "text_delta", "text": piece}})
+
+    if not started:          # empty completion — still emit a valid envelope
+        yield from start_events()
+    yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield _sse("message_delta", {"type": "message_delta",
+        "delta": {"stop_reason": _OPENAI_TO_ANTHROPIC_STOP.get(finish, "end_turn"),
+                  "stop_sequence": None}, "usage": {"output_tokens": 0}})
+    yield _sse("message_stop", {"type": "message_stop"})
+
+
+def _anthropic_error(message: str) -> dict:
+    """Anthropic-format error envelope."""
+    return {"type": "error", "error": {"type": "api_error", "message": message}}
+
 # ── Complexity-aware provider ordering ────────────────────────────────────────
 
 # Accurate token counting via tiktoken when available. The encoder is loaded
@@ -1181,6 +1306,9 @@ START_TIME = time.time()   # for uptime in /metrics
 def _auth_check():
     header = request.headers.get("Authorization", "").strip()
     token  = header[7:].strip() if header[:7].lower() == "bearer " else header
+    if not token:
+        # The Anthropic SDK sends the key via x-api-key, not Authorization.
+        token = request.headers.get("x-api-key", "").strip()
     # compare_digest keeps the comparison constant-time per key
     if not any(hmac.compare_digest(token, k) for k in PROXY_API_KEYS):
         return jsonify({"error": "unauthorized"}), 401
@@ -1202,25 +1330,23 @@ def models():
     ]})
 
 
-@app.route("/v1/chat/completions", methods=["POST"])
-def chat():
-    err = _auth_check()
-    if err:
-        return err
-
-    payload = request.get_json(force=True, silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": {"message": "request body must be a JSON object",
-                                  "type": "invalid_request_error"}}), 400
-    streaming = payload.get("stream", False)
-    messages  = payload.get("messages", [])
+def _route_completion(payload: dict, streaming: bool):
+    """Core routing + failover pipeline, shared by /v1/chat/completions and the
+    Anthropic-compatible /v1/messages. Takes an OpenAI-format payload and returns
+    one of:
+        ("json",   data_dict)            non-streaming success (OpenAI format)
+        ("stream", generator, provider)  streaming success; generator yields
+                                         OpenAI-format SSE regardless of upstream
+        ("error",  error_dict, status)   every provider exhausted
+    """
+    messages = payload.get("messages", [])
 
     # Cache check (non-streaming only)
     if not streaming:
         cached = cache.get(payload)
         if cached is not None:
             log.info("↩ cache hit")
-            return jsonify(cached)
+            return ("json", cached)
 
     est_tokens = _estimated_tokens(messages)
     ordered    = _ordered_providers(payload)
@@ -1304,22 +1430,65 @@ def chat():
             if streaming:
                 gen = (_anthropic_streaming_generator(resp) if is_anthropic
                        else _streaming_generator(resp))
-                return Response(
-                    stream_with_context(gen),
-                    content_type="text/event-stream",
-                    headers={"X-Provider": name},
-                )
+                return ("stream", gen, name)
             else:
                 data = (_from_anthropic_response(resp.json()) if is_anthropic
                         else resp.json())
                 if not is_anthropic:
                     _strip_response(data)
                 cache.set(payload, data)
-                return jsonify(data), 200
+                return ("json", data)
 
         log.warning(f"✗ {name} exhausted — cascading")
 
-    return jsonify({"error": {"message": "All providers exhausted", "type": "router_error"}}), 503
+    return ("error", {"error": {"message": "All providers exhausted", "type": "router_error"}}, 503)
+
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat():
+    err = _auth_check()
+    if err:
+        return err
+
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": {"message": "request body must be a JSON object",
+                                  "type": "invalid_request_error"}}), 400
+
+    result = _route_completion(payload, payload.get("stream", False))
+    if result[0] == "json":
+        return jsonify(result[1]), 200
+    if result[0] == "stream":
+        _, gen, name = result
+        return Response(stream_with_context(gen), content_type="text/event-stream",
+                        headers={"X-Provider": name})
+    return jsonify(result[1]), result[2]
+
+
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages API endpoint — lets the Anthropic SDK use the router
+    plug-and-play. The request is translated to OpenAI format, routed through the
+    same multi-provider pipeline as /v1/chat/completions, and translated back."""
+    err = _auth_check()
+    if err:
+        return err
+
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict) or "messages" not in body:
+        return jsonify(_anthropic_error("request body must be a JSON object with a 'messages' field")), 400
+
+    streaming = bool(body.get("stream", False))
+    payload   = _anthropic_request_to_openai(body)
+    result    = _route_completion(payload, streaming)
+
+    if result[0] == "json":
+        return jsonify(_openai_response_to_anthropic(result[1])), 200
+    if result[0] == "stream":
+        _, gen, name = result
+        return Response(stream_with_context(_openai_stream_to_anthropic(gen)),
+                        content_type="text/event-stream", headers={"X-Provider": name})
+    return jsonify(_anthropic_error(result[1].get("error", {}).get("message", "error"))), result[2]
 
 
 @app.route("/v1/embeddings", methods=["POST"])

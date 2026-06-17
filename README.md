@@ -7,17 +7,19 @@ free AI providers (Gemini, OpenRouter, Groq, and more). When one provider hits i
 limit, it automatically falls back to the next — so your app keeps working instead of
 erroring out.
 
-It speaks the **OpenAI API**, so any tool or library that already talks to OpenAI works
-unchanged — just point it at hermes-router instead.
+It speaks **both the OpenAI API and the Anthropic API**, so any tool or library that
+already talks to either works unchanged — just point it at hermes-router instead.
 
 ```
-  Your app ──► hermes-router ──► Gemini → OpenRouter → Groq → … (tries each until one works)
- (OpenAI SDK)   localhost:8319
+  Your app ──────► hermes-router ──► Gemini → OpenRouter → Groq → … (tries each until one works)
+ (OpenAI SDK or    localhost:8319
+  Anthropic SDK)
 ```
 
-**Highlights:** automatic key rotation & failover · smart routing (sends each request to
-the cheapest model that can handle it) · response caching · circuit breaker for unhealthy
-providers · one structured `auth.json` for all your keys.
+**Highlights:** OpenAI **and** Anthropic API compatible · automatic key rotation &
+failover · smart routing (sends each request to the cheapest model that can handle it) ·
+embeddings · response caching · circuit breaker for unhealthy providers · Prometheus
+`/metrics` · one structured `auth.json` for all your keys.
 
 ---
 
@@ -116,6 +118,29 @@ print(resp.choices[0].message.content)
 ```
 
 `api_key` is any value from `PROXY_API_KEYS` (default `sk-router-1`; set your own in `.env`).
+
+### Use it from the Anthropic SDK
+
+Already built on the Anthropic SDK? Point its `base_url` at hermes-router — no code
+changes. The router accepts Anthropic's `/v1/messages` format (and `x-api-key` header),
+translates it, and routes across **all** your free providers:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(api_key="sk-router-1", base_url="http://localhost:8319")
+msg = client.messages.create(
+    model="claude-3-5-sonnet-20241022",   # model name is ignored — the router picks
+    max_tokens=100,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(msg.content[0].text)
+```
+
+Streaming (`client.messages.stream(...)`) works too. Note the `model` you pass is
+**ignored** — hermes-router routes to the cheapest capable free provider, so an
+Anthropic-SDK app transparently gets the same multi-provider failover. (Use the
+`OPENAI`/`ANTHROPIC` providers if you specifically want those paid models.)
 
 ### Embeddings
 
