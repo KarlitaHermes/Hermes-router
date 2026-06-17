@@ -23,6 +23,14 @@ Prometheus `/metrics` · one structured `auth.json` for all your keys.
 
 ## Documentation
 
+**New to AI? Start here** — these assume zero experience:
+
+- 🚀 **[Getting started](documentation/getting-started.md)** — what this is, key terms, your first message
+- 🤖 **[Build your first AI agent](documentation/build-an-agent.md)** — chatbot → memory → tools, copy-paste
+- 📖 **[Concepts](documentation/concepts.md)** — plain-language glossary (LLM, token, agent, RAG…)
+
+**Reference:**
+
 - **[Providers](documentation/providers.md)** — free & paid providers, sign-up links, capabilities
 - **[Usage](documentation/usage.md)** — OpenAI SDK, Anthropic SDK, tool use, embeddings
 - **[Configuration](documentation/configuration.md)** — `auth.json`, all `.env` settings, model overrides
