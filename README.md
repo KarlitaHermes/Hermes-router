@@ -137,10 +137,15 @@ msg = client.messages.create(
 print(msg.content[0].text)
 ```
 
-Streaming (`client.messages.stream(...)`) works too. Note the `model` you pass is
-**ignored** — hermes-router routes to the cheapest capable free provider, so an
-Anthropic-SDK app transparently gets the same multi-provider failover. (Use the
-`OPENAI`/`ANTHROPIC` providers if you specifically want those paid models.)
+Streaming (`client.messages.stream(...)`) and **tool use** both work — Anthropic
+`tools`, `tool_use`, and `tool_result` are translated to/from OpenAI function calling
+in both streaming and non-streaming mode (provided the chosen provider's model supports
+function calling).
+
+Note the `model` you pass is **ignored** — hermes-router routes to the cheapest capable
+free provider, so an Anthropic-SDK app transparently gets the same multi-provider
+failover. (Use the `OPENAI`/`ANTHROPIC` providers if you specifically want those paid
+models.)
 
 ### Embeddings
 

@@ -1024,7 +1024,12 @@ def _anthropic_request_to_openai(body: dict) -> dict:
     """Convert an Anthropic /v1/messages request into an OpenAI chat payload.
     The model is deliberately NOT preserved — the router picks a model per
     provider — so an Anthropic-SDK client transparently gets multi-provider
-    failover instead of being pinned to whatever model string it sent."""
+    failover instead of being pinned to whatever model string it sent.
+
+    Tool use is mapped both ways: Anthropic `tools`/`tool_choice`, assistant
+    `tool_use` content blocks, and user `tool_result` blocks become the OpenAI
+    equivalents (function tools, message `tool_calls`, and `role:"tool"`
+    messages)."""
     messages = []
     system = body.get("system")
     if isinstance(system, list):   # Anthropic allows system as a list of text blocks
@@ -1032,12 +1037,42 @@ def _anthropic_request_to_openai(body: dict) -> dict:
                            if isinstance(b, dict) and b.get("type") == "text")
     if system:
         messages.append({"role": "system", "content": system})
+
     for m in body.get("messages", []):
+        role    = m.get("role", "user")
         content = m.get("content", "")
-        if isinstance(content, list):
-            content = "".join(b.get("text", "") for b in content
-                              if isinstance(b, dict) and b.get("type") == "text")
-        messages.append({"role": m.get("role", "user"), "content": content})
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        # List content: text / tool_use (assistant calls) / tool_result (user returns).
+        text_parts, tool_calls, tool_msgs = [], [], []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text":
+                text_parts.append(b.get("text", ""))
+            elif bt == "tool_use":
+                tool_calls.append({"id": b.get("id"), "type": "function",
+                                   "function": {"name": b.get("name", ""),
+                                                "arguments": json.dumps(b.get("input", {}))}})
+            elif bt == "tool_result":
+                rc = b.get("content", "")
+                if isinstance(rc, list):
+                    rc = "".join(x.get("text", "") for x in rc
+                                 if isinstance(x, dict) and x.get("type") == "text")
+                tool_msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id"),
+                                  "content": rc if isinstance(rc, str) else json.dumps(rc)})
+        # OpenAI carries tool results as standalone role:"tool" messages, not nested.
+        if tool_msgs:
+            messages.extend(tool_msgs)
+            if any(text_parts):
+                messages.append({"role": role, "content": "".join(text_parts)})
+        else:
+            msg = {"role": role, "content": "".join(text_parts) or None}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            messages.append(msg)
 
     payload: dict = {"model": ROUTER_MODEL, "messages": messages}
     if body.get("stream"):
@@ -1047,22 +1082,53 @@ def _anthropic_request_to_openai(body: dict) -> dict:
             payload[field] = body[field]
     if body.get("stop_sequences"):
         payload["stop"] = body["stop_sequences"]
+    if body.get("tools"):
+        payload["tools"] = [{"type": "function", "function": {
+            "name": t.get("name", ""), "description": t.get("description", ""),
+            "parameters": t.get("input_schema", {})}}
+            for t in body["tools"] if isinstance(t, dict) and t.get("name")]
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        ttype = tc.get("type")
+        if ttype == "auto":
+            payload["tool_choice"] = "auto"
+        elif ttype == "any":
+            payload["tool_choice"] = "required"
+        elif ttype == "tool" and tc.get("name"):
+            payload["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
     return payload
 
 
 def _openai_response_to_anthropic(data: dict) -> dict:
-    """Convert an OpenAI chat-completion response to Anthropic Messages format."""
-    choice = (data.get("choices") or [{}])[0]
-    text   = (choice.get("message") or {}).get("content") or ""
-    finish = choice.get("finish_reason") or "stop"
-    usage  = data.get("usage") or {}
+    """Convert an OpenAI chat-completion response to Anthropic Messages format,
+    including assistant tool calls (-> tool_use content blocks)."""
+    choice  = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    finish  = choice.get("finish_reason") or "stop"
+    usage   = data.get("usage") or {}
+
+    blocks = []
+    if message.get("content"):
+        blocks.append({"type": "text", "text": message["content"]})
+    tool_calls = message.get("tool_calls") or []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {}
+        blocks.append({"type": "tool_use", "id": tc.get("id"),
+                       "name": fn.get("name"), "input": args})
+    if not blocks:
+        blocks = [{"type": "text", "text": ""}]
+
     return {
         "id":            data.get("id", "msg_unknown"),
         "type":          "message",
         "role":          "assistant",
         "model":         data.get("model", ROUTER_MODEL),
-        "content":       [{"type": "text", "text": text}],
-        "stop_reason":   _OPENAI_TO_ANTHROPIC_STOP.get(finish, "end_turn"),
+        "content":       blocks,
+        "stop_reason":   "tool_use" if tool_calls else _OPENAI_TO_ANTHROPIC_STOP.get(finish, "end_turn"),
         "stop_sequence": None,
         "usage": {
             "input_tokens":  usage.get("prompt_tokens", 0),
@@ -1078,20 +1144,28 @@ def _sse(event: str, data: dict) -> str:
 def _openai_stream_to_anthropic(gen):
     """Translate an OpenAI-format SSE stream (bytes, as yielded by the routing
     pipeline) into the Anthropic Messages SSE event sequence the Anthropic SDK
-    expects: message_start → content_block_start → content_block_delta* →
-    content_block_stop → message_delta → message_stop."""
-    msg_id  = f"msg_{int(time.time())}"
-    model   = ROUTER_MODEL
-    finish  = "stop"
-    started = False
+    expects: message_start → (content_block_start → content_block_delta* →
+    content_block_stop)* → message_delta → message_stop.
 
-    def start_events():
-        yield _sse("message_start", {"type": "message_start", "message": {
+    Handles both text deltas (text_delta) and streamed tool calls
+    (tool_use blocks with input_json_delta). Anthropic allows only one content
+    block open at a time, so we close the current block before opening the next
+    and give each OpenAI tool-call index its own Anthropic block."""
+    msg_id   = f"msg_{int(time.time())}"
+    model    = ROUTER_MODEL
+    finish   = "stop"
+    started  = False           # message_start emitted?
+    saw_tool = False
+    next_index  = 0            # next Anthropic content-block index to allocate
+    open_kind   = None         # None | "text" | "tool"
+    open_index  = None         # Anthropic index of the currently open block
+    tool_blocks = {}           # OpenAI tool-call index -> Anthropic block index
+
+    def message_start():
+        return _sse("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": model,
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": 0, "output_tokens": 0}}})
-        yield _sse("content_block_start", {"type": "content_block_start",
-            "index": 0, "content_block": {"type": "text", "text": ""}})
 
     buf = ""
     for chunk in gen:
@@ -1112,22 +1186,57 @@ def _openai_stream_to_anthropic(gen):
                 continue
             model  = obj.get("model") or model
             choice = (obj.get("choices") or [{}])[0]
-            piece  = (choice.get("delta") or {}).get("content")
+            delta  = choice.get("delta") or {}
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
-            if piece:
-                if not started:
-                    started = True
-                    yield from start_events()
-                yield _sse("content_block_delta", {"type": "content_block_delta",
-                    "index": 0, "delta": {"type": "text_delta", "text": piece}})
 
-    if not started:          # empty completion — still emit a valid envelope
-        yield from start_events()
-    yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            if not started:
+                started = True
+                yield message_start()
+
+            # ---- text delta ----
+            piece = delta.get("content")
+            if piece:
+                if open_kind != "text":
+                    if open_kind is not None:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": open_index})
+                    open_index, open_kind = next_index, "text"
+                    next_index += 1
+                    yield _sse("content_block_start", {"type": "content_block_start",
+                        "index": open_index, "content_block": {"type": "text", "text": ""}})
+                yield _sse("content_block_delta", {"type": "content_block_delta",
+                    "index": open_index, "delta": {"type": "text_delta", "text": piece}})
+
+            # ---- tool-call deltas ----
+            for tc in (delta.get("tool_calls") or []):
+                saw_tool = True
+                oai_idx = tc.get("index", 0)
+                fn = tc.get("function") or {}
+                if oai_idx not in tool_blocks:            # first chunk for this tool call
+                    if open_kind is not None:
+                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": open_index})
+                    open_index, open_kind = next_index, "tool"
+                    next_index += 1
+                    tool_blocks[oai_idx] = open_index
+                    yield _sse("content_block_start", {"type": "content_block_start",
+                        "index": open_index, "content_block": {
+                            "type": "tool_use", "id": tc.get("id") or f"toolu_{msg_id}_{oai_idx}",
+                            "name": fn.get("name") or "", "input": {}}})
+                if fn.get("arguments"):
+                    yield _sse("content_block_delta", {"type": "content_block_delta",
+                        "index": tool_blocks[oai_idx],
+                        "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}})
+
+    if not started:
+        yield message_start()
+    if open_kind is None:        # no content at all — emit an empty text block
+        open_index = 0
+        yield _sse("content_block_start", {"type": "content_block_start",
+            "index": 0, "content_block": {"type": "text", "text": ""}})
+    yield _sse("content_block_stop", {"type": "content_block_stop", "index": open_index})
+    stop_reason = "tool_use" if saw_tool else _OPENAI_TO_ANTHROPIC_STOP.get(finish, "end_turn")
     yield _sse("message_delta", {"type": "message_delta",
-        "delta": {"stop_reason": _OPENAI_TO_ANTHROPIC_STOP.get(finish, "end_turn"),
-                  "stop_sequence": None}, "usage": {"output_tokens": 0}})
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 0}})
     yield _sse("message_stop", {"type": "message_stop"})
 
 
