@@ -34,6 +34,7 @@ Prometheus `/metrics` · one structured `auth.json` for all your keys.
 - **[Providers](documentation/providers.md)** — free & paid providers, sign-up links, capabilities
 - **[Usage](documentation/usage.md)** — OpenAI SDK, Anthropic SDK, tool use, embeddings
 - **[Configuration](documentation/configuration.md)** — `auth.json`, all `.env` settings, model overrides
+- **[Deployment](documentation/deployment.md)** — Windows/macOS/Linux support, Docker, Hugging Face Spaces
 - **[Monitoring](documentation/monitoring.md)** — `hr status`, Prometheus `/metrics`, `/v1/status`
 
 ---
@@ -86,6 +87,10 @@ system-wide — `install.sh` only symlinks the `hr` command onto your PATH.
 
 **Requirements:** Python 3.10+ and at least one free API key
 (see **[Providers](documentation/providers.md)**).
+
+> **Platform note:** the router runs on **Linux, macOS, and Windows**. The one-liner and
+> `hr` CLI below are for Linux/macOS (and WSL2). On **Windows** use Docker, WSL2, or run
+> `python router.py` directly — see **[Deployment](documentation/deployment.md)**.
 
 ### One-liner install
 
