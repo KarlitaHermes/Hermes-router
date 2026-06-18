@@ -114,7 +114,10 @@ for name in sorted(providers, key=lambda n: (rating_of(providers[n]), n)):
 # Footer: cache + breaker config, compactly.
 cache = d.get("cache", {})
 br_cfg = d.get("circuit_breaker", {})
+rotation = d.get("rotation", {})
 print()
+if rotation:
+    print(f"  {DIM}rotation: {rotation.get('mode','?')}{RST}")
 if cache:
     print(f"  {DIM}cache: {'on' if cache.get('enabled') else 'off'} · "
           f"hit-rate {cache.get('hit_rate',0)} · {cache.get('size',0)}/{cache.get('max_size','?')} entries{RST}")

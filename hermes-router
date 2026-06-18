@@ -9,6 +9,8 @@
 #   hr model list                     Show all providers and their active model
 #   hr model set <provider> <model>   Override a provider's model
 #   hr model reset <provider>         Revert a provider to its default model
+#   hr mode                           Show how keys are rotated within a provider
+#   hr mode <round-robin|sequential>  Set the key rotation mode
 #   hr start                          Run the router (same as: python router.py)
 #   hr status                         Live health dashboard for the running router
 #   hr restart                        Restart the router so key/config changes take effect
@@ -52,6 +54,9 @@ case "$cmd" in
     ;;
   model)
     exec "$REPO/scripts/model.sh" "$@"
+    ;;
+  mode)
+    exec "$REPO/scripts/mode.sh" "$@"
     ;;
   status)
     exec "$REPO/scripts/status.sh" "$@"

@@ -98,7 +98,8 @@ fi
 chmod +x "$REPO/hermes-router" "$REPO/install.sh" \
          "$REPO/scripts/auth.sh" "$REPO/scripts/status.sh" "$REPO/scripts/restart.sh" \
          "$REPO/scripts/setup.sh" "$REPO/scripts/doctor.sh" \
-         "$REPO/scripts/update.sh" "$REPO/scripts/model.sh" 2>/dev/null || true
+         "$REPO/scripts/update.sh" "$REPO/scripts/model.sh" \
+         "$REPO/scripts/mode.sh" 2>/dev/null || true
 
 # ── 5. Symlink `hr` and `hermes-router` on PATH ───────────────────────────────
 BINDIR=""

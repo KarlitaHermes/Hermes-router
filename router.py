@@ -67,6 +67,12 @@ ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+# How keys are picked within a provider:
+#   round-robin — spread requests evenly across all keys (keys deplete together)
+#   sequential  — drain one key until it rate-limits, then move on (keeps reserves fresh)
+ROTATION_MODE     = os.environ.get("ROTATION_MODE", "round-robin").strip().lower()
+if ROTATION_MODE not in ("round-robin", "sequential"):
+    ROTATION_MODE = "round-robin"   # unknown value → safe default
 STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
 STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 AUTH_FILE         = Path(os.environ.get("ROUTER_AUTH_FILE", "./auth.json"))  # router's own key store
@@ -716,10 +722,16 @@ def _initialize_ratings(providers: list, pool_ref):
 
 
 class CredentialPool:
-    """Thread-safe round-robin key pool with per-key cooldown tracking."""
+    """Thread-safe key pool with per-key cooldown tracking.
 
-    def __init__(self, providers: list[dict]):
+    Two selection modes (set once via ROTATION_MODE):
+      round-robin — advance every call so load spreads evenly across keys
+      sequential  — keep returning the same key until it cools, then advance;
+                    this drains one account at a time and keeps the rest fresh"""
+
+    def __init__(self, providers: list[dict], mode: str = None):
         self.lock  = threading.Lock()
+        self.mode  = mode or ROTATION_MODE
         self.pools: dict[str, deque] = {}
         for p in providers:
             self.pools[p["name"]] = deque(
@@ -728,10 +740,19 @@ class CredentialPool:
             log.info(f"  {p['name']}: {len(p['keys'])} key(s) loaded")
 
     def get_key(self, provider_name: str) -> str | None:
-        """Return the next ready key (round-robin), or None if all are cooling."""
+        """Return a ready key per the active mode, or None if all are cooling."""
         with self.lock:
             pool = self.pools.get(provider_name, deque())
             now  = time.time()
+            if self.mode == "sequential":
+                # Stay on the current key until it cools; only advance past cooling ones.
+                for _ in range(len(pool)):
+                    entry = pool[0]
+                    if entry["cool_until"] <= now:
+                        return entry["key"]      # do NOT rotate — keep draining this key
+                    pool.rotate(-1)
+                return None
+            # round-robin (default): advance every call so load spreads evenly
             for _ in range(len(pool)):
                 entry = pool[0]
                 pool.rotate(-1)
@@ -1872,6 +1893,9 @@ def status():
             "threshold_tokens": FAST_ROUTE_TOKENS,
             "fast_providers":  sorted(_FAST_PROVIDERS),
         },
+        "rotation": {
+            "mode": ROTATION_MODE,
+        },
         "circuit_breaker": {
             "window":      BREAKER_WINDOW,
             "min_samples": BREAKER_MIN_SAMPLES,
@@ -1933,6 +1957,7 @@ if __name__ == "__main__":
     log.info(f"Embeddings (/v1/embeddings): {_embed if _embed else 'no embed-capable providers'}")
     log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE})")
     log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
+    log.info(f"Key rotation: {ROTATION_MODE}")
     _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}
     if _skips:
         log.info(f"Large-payload skip ceilings: {_skips}")

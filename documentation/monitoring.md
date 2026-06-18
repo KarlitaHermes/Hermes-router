@@ -41,3 +41,7 @@ Point Prometheus/Grafana at it to track per-provider traffic and the cache over 
 `GET /v1/status` (proxy key required) returns the full picture as JSON: per-provider key
 cooldown state, rating, model, latency, `supports_tools`, `reasoning`, circuit-breaker
 status, plus cache and routing config. This is what `hr status` renders.
+
+The `rotation` block reports the active key-rotation mode
+(`{"rotation": {"mode": "round-robin"}}`); `hr status` shows it in the footer. See
+[configuration.md](configuration.md) for what the modes do.

@@ -33,6 +33,7 @@ the router. It's git-ignored, so real keys are never committed.
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 | `METRICS_REQUIRE_AUTH` | `0` | Require the proxy key on `/metrics` (`1` to enable) |
 | `REASONING_TOKEN_RESERVE` | `4096` | Extra output budget added for reasoning models so hidden chain-of-thought doesn't eat the answer (`0` disables) |
+| `ROTATION_MODE` | `round-robin` | How keys are picked within a provider (set via `hr mode`) — `round-robin` or `sequential` |
 
 ### Per-provider model
 
@@ -77,3 +78,26 @@ hr restart                                 # apply changes
 
 Overrides are stored as plain variables in `.env` (e.g. `ANTHROPIC_MODEL=claude-sonnet-4-6`)
 and active overrides are highlighted in `hr model list`.
+
+## Key rotation mode
+
+When a provider holds several keys (or several accounts), `ROTATION_MODE` decides how the
+router picks among them:
+
+```bash
+hr mode                # show the current mode
+hr mode round-robin    # default — spread requests evenly across all keys
+hr mode sequential     # drain one key fully before moving to the next
+hr restart             # apply the change
+```
+
+- **`round-robin`** (default) — every request goes to the next key in turn, so all keys
+  share the load and deplete together. Best for spreading latency and load.
+- **`sequential`** — one key is used until it hits its rate limit, then the router moves to
+  the next, and so on. Later keys stay **untouched in reserve** — useful when you want to
+  ration accounts after a quota reset instead of burning them all at once. Keys are drained
+  in the order they appear in `auth.json`.
+
+Either way, failover, per-key cooldowns, and the circuit breaker keep working — the mode
+only changes *which ready key is preferred* next. The active mode shows in `hr status` and
+at `/v1/status`.
