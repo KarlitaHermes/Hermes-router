@@ -241,24 +241,49 @@ Want the router running in the cloud (free) instead of your own computer? A **Do
 works well. Follow these steps carefully — the **port** is the #1 thing people get wrong.
 
 **Step 1 — create the Space.** On [huggingface.co](https://huggingface.co) → your profile →
-**New Space**. Choose **Docker** as the SDK (⚠️ not Gradio or Streamlit — hermes-router is a
-web server, not a Gradio app). Give it a name.
+**New Space**, and fill the form like this:
 
-**Step 2 — add the code.** Put the project files in the Space repo (push them, or upload
-`router.py`, `requirements.txt`, and a `Dockerfile`). The repo already includes a working
-`Dockerfile`.
+| Field on the "Create a new Space" screen | Choose |
+|---|---|
+| **Owner / Space name** | your account / e.g. `hermes-router` (this becomes your URL) |
+| **Short description** | optional — e.g. "Free-tier AI load balancer" |
+| **License** | `mit` (matches the project) |
+| **Select the Space SDK** | **Docker** — ⚠️ *not* Gradio/Static; it's a web server, not a Gradio app |
+| **Choose a Docker template** | **Blank** — ⚠️ *not* Streamlit/Shiny/etc. We ship our own `Dockerfile`, so you want the empty starting point |
+| **Space hardware** | **CPU Basic (Free)** — the router is lightweight; no GPU needed |
+| **Storage Bucket** | leave **off** (keys go in Secrets, not files — see Step 4) |
+| **Space Dev Mode** | leave **off** (PRO-only, not needed) |
+| **Visibility** | **Public** — the app URL must be reachable; this is why Step 5 (a strong proxy key) matters |
+
+> **Why Public?** A Public Space's app URL is openly reachable, which is what lets your app
+> connect to it. *Private* Spaces require an HF token on every request (awkward for an agent),
+> so Public + a strong `PROXY_API_KEYS` is the practical combo. Your secrets are **not** in the
+> public repo (they live in Settings → Secrets), so they stay private either way.
+
+Then click **Create Space**.
+
+**Step 2 — add the code.** Put the project files in the Space repo (push them with git, or use
+the Space's "Files" tab → "Add file" to upload). You need three files: `router.py`,
+`requirements.txt`, and the `Dockerfile` (the repo already includes a working one).
 
 **Step 3 — fix the port.** This is the critical bit. Hugging Face serves your app on **one**
 port, set by `app_port` (default **7860**), but the router listens on **8319**. Make them
-match — edit the Space's `README.md` so the top looks like this:
+match — edit the **Space's own `README.md`** (Hugging Face created one when you made the
+Space) so the YAML block at the very top looks like this:
 
 ```yaml
 ---
 title: Hermes Router
+emoji: 🔀
+colorFrom: indigo
+colorTo: blue
 sdk: docker
 app_port: 8319
+pinned: false
 ---
 ```
+
+The `sdk: docker` and `app_port: 8319` lines are the ones that matter; the rest is cosmetic.
 
 (Alternatively, leave `app_port` alone and add a Space variable `PORT=7860` so the router
 listens where HF expects. Either works — just don't skip this step, or the page will show
