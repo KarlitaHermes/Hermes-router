@@ -145,6 +145,7 @@ The `./install.sh` step puts `hr` (and the full name `hermes-router`) on your PA
 |---|---|
 | `hr setup` | Interactive first-run wizard — add a key, start the router, verify it works |
 | `hr auth add <provider>` | Add one or more API keys for a provider (prompts you, input hidden) |
+| `hr auth import-codex` | Import a ChatGPT-subscription login from the Codex CLI (OAuth) |
 | `hr auth list` | Show every provider and how many keys it has |
 | `hr model list` | Show every provider and its active model (default or overridden) |
 | `hr model set <provider> <model>` | Override the model used for a specific provider |

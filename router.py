@@ -102,6 +102,107 @@ def _load_auth_json() -> dict[str, list[str]]:
 
 _AUTH_KEYS = _load_auth_json()
 
+
+# ── Codex (ChatGPT OAuth) credentials ──────────────────────────────────────────
+# Codex authenticates with ChatGPT-subscription OAuth tokens, not static API keys.
+# Access tokens are short-lived JWTs; we mint fresh ones from the long-lived refresh
+# token. Accounts live in auth.json under "codex_accounts" (written by
+# `hr auth import-codex`), separate from the plain-string provider keys so the
+# normal credential pool is untouched.
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+
+
+def _jwt_exp(token: str) -> int:
+    """Read the `exp` (unix seconds) claim from a JWT without verifying it."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)        # pad base64url
+        return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0))
+    except Exception:
+        return 0
+
+
+def _load_codex_accounts() -> list[dict]:
+    """Load Codex accounts from auth.json's "codex_accounts" list."""
+    if not AUTH_FILE.exists():
+        return []
+    try:
+        doc = json.loads(AUTH_FILE.read_text())
+        accts = doc.get("codex_accounts", [])
+        return [a for a in accts if isinstance(a, dict)
+                and a.get("refresh_token") and a.get("account_id")]
+    except Exception as e:
+        log.warning(f"Could not read codex accounts from {AUTH_FILE}: {e}")
+        return []
+
+
+class CodexCredentials:
+    """Holds Codex OAuth accounts and hands out fresh access tokens, refreshing
+    via the refresh token when a token is missing or near expiry. Refreshed
+    tokens are persisted back to auth.json so they survive restarts."""
+    REFRESH_SKEW = 300   # refresh this many seconds before the JWT expires
+
+    def __init__(self, accounts: list[dict]):
+        self.lock = threading.Lock()
+        self.accounts = {a["account_id"]: dict(a) for a in accounts}
+
+    def account_ids(self) -> list[str]:
+        return list(self.accounts.keys())
+
+    def get_access_token(self, account_id: str) -> str | None:
+        """Return a valid access token for the account, refreshing if needed."""
+        with self.lock:
+            acct = self.accounts.get(account_id)
+            if not acct:
+                return None
+            tok = acct.get("access_token", "")
+            if tok and _jwt_exp(tok) - self.REFRESH_SKEW > time.time():
+                return tok
+            return self._refresh(acct)
+
+    def _refresh(self, acct: dict) -> str | None:
+        try:
+            r = _HTTP.post(CODEX_TOKEN_URL, json={
+                "client_id":     CODEX_CLIENT_ID,
+                "grant_type":    "refresh_token",
+                "refresh_token": acct["refresh_token"],
+            }, timeout=30)
+        except requests.exceptions.RequestException as e:
+            log.error(f"  codex token refresh network error: {e}")
+            return None
+        if r.status_code != 200:
+            log.error(f"  codex token refresh failed: HTTP {r.status_code}")
+            return None
+        data = r.json()
+        acct["access_token"] = data.get("access_token", acct.get("access_token", ""))
+        if data.get("refresh_token"):           # refresh tokens can rotate
+            acct["refresh_token"] = data["refresh_token"]
+        acct["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._persist()
+        log.info(f"  codex token refreshed for account ...{acct['account_id'][-6:]}")
+        return acct["access_token"]
+
+    def _persist(self):
+        """Write current accounts back to auth.json (best-effort, 0600)."""
+        try:
+            doc = json.loads(AUTH_FILE.read_text()) if AUTH_FILE.exists() else {}
+        except Exception:
+            doc = {}
+        if not isinstance(doc, dict):
+            doc = {}
+        doc["codex_accounts"] = list(self.accounts.values())
+        try:
+            AUTH_FILE.write_text(json.dumps(doc, indent=2) + "\n")
+            os.chmod(AUTH_FILE, 0o600)
+        except Exception as e:
+            log.warning(f"  could not persist codex tokens: {e}")
+
+
+codex_creds = CodexCredentials(_load_codex_accounts())
+
+
 # Circuit-breaker knobs — a provider that fails health repeatedly is tripped out
 # of rotation for a cooldown, then probed again (half-open). Overridable via env.
 BREAKER_WINDOW      = int(os.environ.get("BREAKER_WINDOW", 8))          # recent outcomes to weigh
@@ -375,6 +476,19 @@ def _build_providers() -> list[dict]:
             "protocol": "anthropic",   # triggers format translation in forward()
         })
 
+    # Codex — ChatGPT-subscription OAuth (not API keys). Accounts come from
+    # `hr auth import-codex` and are keyed by account_id; forward() resolves each
+    # to a fresh access token. Speaks the Responses API, so it needs translation.
+    codex_ids = codex_creds.account_ids()
+    if codex_ids:
+        providers.append({
+            "name":     "codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "model":    os.environ.get("CODEX_MODEL", "gpt-5.5"),
+            "keys":     codex_ids,     # account_ids, resolved to tokens at send time
+            "protocol": "codex",
+        })
+
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
@@ -487,6 +601,12 @@ def _probe_provider(provider: dict, key: str) -> tuple:
     connection failure (host unreachable) counts as down."""
     if provider.get("protocol") == "anthropic":
         return _probe_anthropic(provider, key)
+    if provider.get("protocol") == "codex":
+        # Don't spend ChatGPT quota (or risk ToS) on a startup completion —
+        # "available" means we can mint a valid access token for the account.
+        t0 = time.time()
+        ok = bool(codex_creds.get_access_token(key))
+        return ok, (time.time() - t0) * 1000, provider["model"]
 
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
     hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
@@ -529,8 +649,8 @@ def _probe_tools(provider: dict, key: str, model: str) -> bool:
     request that forces a tool call (tool_choice=required, falling back to auto
     for providers that reject 'required') and checks whether the model actually
     emits one. Anthropic providers always support tools."""
-    if provider.get("protocol") == "anthropic":
-        return True
+    if provider.get("protocol") in ("anthropic", "codex"):
+        return True   # both support function calling
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
     hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
             **provider.get("headers", {})}
@@ -561,6 +681,8 @@ def _probe_reasoning(provider: dict, key: str, model: str) -> bool:
     model just answers. Anthropic's thinking is opt-in, so it's treated as normal."""
     if provider.get("protocol") == "anthropic":
         return False
+    if provider.get("protocol") == "codex":
+        return True   # Codex (GPT-5) is a reasoning model — reserve output headroom
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
     hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
             **provider.get("headers", {})}
@@ -1431,9 +1553,191 @@ def _ordered_providers(payload: dict) -> list[dict]:
              f"order={[p['name'] for p in ordered]}")
     return ordered
 
+# ── Codex (Responses API) format translation ──────────────────────────────────
+# Codex speaks OpenAI's Responses API (not Chat Completions). These helpers
+# translate transparently, like the Anthropic ones above.
+
+def _to_codex_body(payload: dict, model: str) -> dict:
+    """Convert an OpenAI chat-completions body to a Codex Responses-API request."""
+    instructions = []
+    input_items = []
+    for msg in payload.get("messages", []):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, list):       # flatten structured content to text
+            content = "".join(p.get("text", "") for p in content
+                              if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text"))
+        content = content or ""
+        if role == "system":
+            instructions.append(content)
+            continue
+        # assistant turns use output_text; user/tool use input_text
+        ctype = "output_text" if role == "assistant" else "input_text"
+        input_items.append({"type": "message", "role": role,
+                             "content": [{"type": ctype, "text": content}]})
+
+    body: dict = {
+        "model":        model,
+        "input":        input_items,
+        "store":        False,
+        "stream":       True,        # Codex backend always streams (SSE)
+        # Codex requires a non-empty `instructions`; use the client's system
+        # message(s) or a minimal default so requests without one still work.
+        "instructions": "\n".join(instructions) if instructions
+                        else "You are a helpful assistant.",
+    }
+
+    # tools: OpenAI nests under {"function": {...}}; Responses wants them flat.
+    tools = []
+    for t in payload.get("tools", []) or []:
+        if t.get("type") == "function" and isinstance(t.get("function"), dict):
+            fn = t["function"]
+            tools.append({"type": "function", "name": fn.get("name", ""),
+                          "description": fn.get("description", ""),
+                          "strict": False, "parameters": fn.get("parameters", {})})
+    if tools:
+        body["tools"] = tools
+        tc = payload.get("tool_choice")
+        body["tool_choice"] = tc if isinstance(tc, str) else "auto"
+        body["parallel_tool_calls"] = bool(payload.get("parallel_tool_calls", True))
+
+    # reasoning effort (OpenAI clients pass reasoning_effort; default medium)
+    effort = payload.get("reasoning_effort") or "medium"
+    body["reasoning"] = {"effort": effort}
+    body["include"] = ["reasoning.encrypted_content"]
+    return body
+
+
+def _codex_text_and_tools(data: dict):
+    """Pull assistant text and any tool calls out of a Responses `output` array."""
+    text_parts, tool_calls = [], []
+    for item in data.get("output", []) or []:
+        itype = item.get("type")
+        if itype == "message":
+            for c in item.get("content", []) or []:
+                if c.get("type") in ("output_text", "text"):
+                    text_parts.append(c.get("text", ""))
+        elif itype in ("function_call", "tool_call"):
+            tool_calls.append({
+                "id":   item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {"name": item.get("name", ""),
+                             "arguments": item.get("arguments", "") or "{}"},
+            })
+    return "".join(text_parts), tool_calls
+
+
+def _from_codex_response(events: list) -> dict:
+    """Aggregate a list of Responses SSE event objects into one OpenAI
+    chat-completion JSON (used for non-streaming clients)."""
+    final = {}
+    text_acc = []
+    for ev in events:
+        t = ev.get("type", "")
+        if t == "response.completed" and isinstance(ev.get("response"), dict):
+            final = ev["response"]
+        elif t == "response.output_text.delta":
+            text_acc.append(ev.get("delta", ""))
+    text, tool_calls = _codex_text_and_tools(final) if final else ("", [])
+    if not text and text_acc:
+        text = "".join(text_acc)
+    message = {"role": "assistant", "content": text or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    finish = "tool_calls" if tool_calls else "stop"
+    usage = (final.get("usage") or {}) if final else {}
+    return {
+        "id":      final.get("id", "chatcmpl-codex"),
+        "object":  "chat.completion",
+        "created": int(time.time()),
+        "model":   final.get("model", "codex"),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+        "usage": {
+            "prompt_tokens":     usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens":      usage.get("total_tokens", 0),
+        },
+    }
+
+
+def _codex_streaming_generator(resp: requests.Response):
+    """Translate a Codex Responses SSE stream into OpenAI chat.completion.chunk
+    SSE on the fly."""
+    cid = "chatcmpl-codex"
+    created = int(time.time())
+
+    def chunk(delta: dict, finish=None):
+        return "data: " + json.dumps({
+            "id": cid, "object": "chat.completion.chunk", "created": created,
+            "model": "codex",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }) + "\n\n"
+
+    yield chunk({"role": "assistant"})
+    event_type = None
+    finish = "stop"
+    for raw in resp.iter_lines():
+        if not raw:
+            continue
+        raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        if raw.startswith("event:"):
+            event_type = raw[6:].strip()
+            continue
+        if not raw.startswith("data:"):
+            continue
+        data_str = raw[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            ev = json.loads(data_str)
+        except Exception:
+            continue
+        etype = ev.get("type") or event_type
+        if etype == "response.output_text.delta":
+            d = ev.get("delta", "")
+            if d:
+                yield chunk({"content": d})
+        elif etype == "response.completed" and isinstance(ev.get("response"), dict):
+            _, tcs = _codex_text_and_tools(ev["response"])
+            if tcs:
+                finish = "tool_calls"
+                for i, tc in enumerate(tcs):
+                    yield chunk({"tool_calls": [{"index": i, **tc}]})
+    yield chunk({}, finish=finish)
+    yield "data: [DONE]\n\n"
+
+
 # ── Request forwarding ─────────────────────────────────────────────────────────
 
 def forward(provider: dict, key: str, payload: dict, streaming: bool) -> requests.Response | None:
+    # Codex (ChatGPT OAuth) speaks the Responses API — translate and send directly.
+    if provider.get("protocol") == "codex":
+        token = codex_creds.get_access_token(key)   # key is the account_id
+        if not token:
+            log.error(f"  codex: no valid token for account ...{key[-6:]}")
+            return None
+        model = payload.get("model", "")
+        if not model or model in ("", ROUTER_MODEL, "auto"):
+            model = provider["model"]
+        cleaned = []
+        for msg in payload.get("messages", []):
+            m = dict(msg); _strip_message(m); cleaned.append(m)
+        body = _to_codex_body({**payload, "messages": cleaned}, model)
+        hdrs = {
+            "Authorization":      f"Bearer {token}",
+            "chatgpt-account-id": key,
+            "Content-Type":       "application/json",
+            "Accept":             "text/event-stream",
+            "originator":         "codex_cli_rs",
+            "OpenAI-Beta":        "responses=experimental",
+        }
+        try:
+            return _HTTP.post(provider["base_url"].rstrip("/") + "/responses",
+                              headers=hdrs, json=body, stream=True, timeout=(10, 180))
+        except requests.exceptions.RequestException as e:
+            log.error(f"  Network error → codex: {e}")
+            return None
+
     # Anthropic uses a different wire format — translate and send directly.
     if provider.get("protocol") == "anthropic":
         model = payload.get("model", "")
@@ -1688,6 +1992,25 @@ def _route_completion(payload: dict, streaming: bool):
             stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
             log.info(f"  ✓ {name} {resp.status_code} ({elapsed*1000:.0f}ms)")
             is_anthropic = provider.get("protocol") == "anthropic"
+            is_codex     = provider.get("protocol") == "codex"
+            if is_codex:
+                # Codex backend always streams SSE. Stream it through, or
+                # aggregate it into one response for non-streaming clients.
+                if streaming:
+                    return ("stream", _codex_streaming_generator(resp), name)
+                events = []
+                for raw in resp.iter_lines():
+                    if not raw:
+                        continue
+                    raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                    if raw.startswith("data:"):
+                        ds = raw[5:].strip()
+                        if ds and ds != "[DONE]":
+                            try: events.append(json.loads(ds))
+                            except Exception: pass
+                data = _from_codex_response(events)
+                cache.set(payload, data)
+                return ("json", data)
             if streaming:
                 gen = (_anthropic_streaming_generator(resp) if is_anthropic
                        else _streaming_generator(resp))

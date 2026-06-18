@@ -4,12 +4,17 @@
 #
 # Usage:
 #   hr auth add <provider>   Add one or more API keys for a provider
+#   hr auth import-codex     Import a ChatGPT-subscription login from the Codex CLI
 #   hr auth list             Show all providers and how many keys are configured
 #   hr auth help             Show this help
 #
 # Supported providers:
 #   gemini  openrouter  sambanova  github_models  cerebras
-#   groq  mistral  cohere  zai  naga  nvidia
+#   groq  mistral  cohere  zai  naga  nvidia  huggingface  openai  anthropic
+#
+# Codex (ChatGPT subscription) uses OAuth, not an API key. Log in once with the
+# official Codex CLI (`codex login`), then run `hr auth import-codex` to copy the
+# tokens into auth.json. The router refreshes the access token automatically.
 #
 # Keys are stored in auth.json next to this script (override with ROUTER_AUTH_FILE).
 # This is the router's own credential store — self-contained, independent of any
@@ -184,8 +189,82 @@ cmd_list() {
     fi
   done
 
+  # Codex accounts (OAuth, stored separately from string keys)
+  local codex_count
+  codex_count=$("$PYTHON" - "$AUTH_FILE" <<'PY'
+import json, sys, os
+path = sys.argv[1]
+try:
+    doc = json.load(open(path))
+except Exception:
+    doc = {}
+print(len(doc.get("codex_accounts", [])))
+PY
+)
+  if [ "$codex_count" -eq 0 ]; then
+    printf '  %-16s  \033[1;31m%s\033[0m\n' "codex" "none"
+  else
+    printf '  %-16s  \033[1;32m%s\033[0m\n' "codex" "$codex_count account(s)"
+  fi
+
   echo ""
   log "$total_keys total key(s) across all providers — stored in: $AUTH_FILE"
+}
+
+# ── hr auth import-codex ──────────────────────────────────────────────────────
+
+cmd_import_codex() {
+  local src="${CODEX_HOME:-$HOME/.codex}/auth.json"
+  if [ ! -f "$src" ]; then
+    err "No Codex login found at: $src"
+    err "Log in first with the official Codex CLI:  codex login"
+    exit 1
+  fi
+  log "Importing Codex login from: $src"
+
+  local result
+  result=$("$PYTHON" - "$src" "$AUTH_FILE" <<'PY'
+import json, os, sys
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    s = json.load(open(src))
+except Exception as e:
+    print("ERR could not read codex auth.json: %s" % e); raise SystemExit
+toks = s.get("tokens") or {}
+acct = {
+    "account_id":    toks.get("account_id", ""),
+    "access_token":  toks.get("access_token", ""),
+    "refresh_token": toks.get("refresh_token", ""),
+    "last_refresh":  s.get("last_refresh", ""),
+}
+if not acct["account_id"] or not acct["refresh_token"]:
+    print("ERR codex auth.json missing account_id/refresh_token (is auth_mode 'chatgpt'?)")
+    raise SystemExit
+try:
+    doc = json.load(open(dst)) if os.path.exists(dst) else {}
+except Exception:
+    doc = {}
+if not isinstance(doc, dict):
+    doc = {}
+accts = doc.setdefault("codex_accounts", [])
+# de-dupe / update by account_id
+accts = [a for a in accts if a.get("account_id") != acct["account_id"]]
+accts.append(acct)
+doc["codex_accounts"] = accts
+with open(dst, "w") as f:
+    json.dump(doc, f, indent=2); f.write("\n")
+os.chmod(dst, 0o600)
+print("OK %s %d" % (acct["account_id"][-6:], len(accts)))
+PY
+)
+  case "$result" in
+    OK*)  local tail count
+          tail=$(echo "$result" | awk '{print $2}')
+          count=$(echo "$result" | awk '{print $3}')
+          ok "Imported Codex account (…${tail}) — total: ${count} account(s)."
+          log "Apply with:  hr restart" ;;
+    *)    err "${result#ERR }"; exit 1 ;;
+  esac
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -194,12 +273,13 @@ subcmd="${1:-help}"
 shift 2>/dev/null || true
 
 case "$subcmd" in
-  add)             cmd_add "$@" ;;
-  list)            cmd_list ;;
-  help|-h|--help)  awk 'NR>1 && /^#/ {sub(/^#[[:space:]]?/,""); print; next} NR>1 {exit}' "$0" ;;
+  add)                   cmd_add "$@" ;;
+  import-codex|codex)    cmd_import_codex ;;
+  list)                  cmd_list ;;
+  help|-h|--help)        awk 'NR>1 && /^#/ {sub(/^#[[:space:]]?/,""); print; next} NR>1 {exit}' "$0" ;;
   *)
     err "unknown auth subcommand: '$subcmd'"
-    err "Usage: hr auth add <provider>  |  hr auth list"
+    err "Usage: hr auth add <provider>  |  hr auth import-codex  |  hr auth list"
     exit 1
     ;;
 esac

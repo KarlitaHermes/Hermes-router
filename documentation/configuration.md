@@ -7,7 +7,9 @@ it has at least one key.
 ## Where your keys live
 
 `hr auth add` writes to **`auth.json`** — the router's own credential store, kept next to
-the router. It's git-ignored, so real keys are never committed.
+the router. It's git-ignored, so real keys are never committed. Codex (ChatGPT
+subscription) logins are stored separately under `codex_accounts` (via
+`hr auth import-codex`); the router refreshes their OAuth access tokens automatically.
 
 ```json
 {
@@ -40,6 +42,7 @@ the router. It's git-ignored, so real keys are never committed.
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Model override (set via `hr model set`) |
+| `CODEX_MODEL` | `gpt-5.5` | Codex (ChatGPT subscription) model — see [providers.md](providers.md) |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model override (set via `hr model set`) |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Model override (set via `hr model set`) |
 | `<PROVIDER>_MODEL` | *(varies)* | Same pattern applies to all providers |

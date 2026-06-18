@@ -42,13 +42,35 @@ Add your existing API key; the router handles everything else.
 > automatically — your app sends the same OpenAI-format request regardless of which
 > provider handles it.
 
+## Codex (ChatGPT subscription)
+
+Codex lets you use your **ChatGPT subscription** (Plus/Pro/Go) for completions instead of a
+pay-per-token API key. It doesn't use an API key — it authenticates with OAuth tokens, so
+setup is different:
+
+```bash
+codex login            # one-time, with the official Codex CLI (opens browser / device flow)
+hr auth import-codex    # copy the login into the router (reads ~/.codex/auth.json)
+hr restart
+```
+
+The router stores the account under `codex_accounts` in `auth.json`, **refreshes the access
+token automatically** before it expires, and translates your OpenAI-format requests to the
+Codex **Responses API** transparently. Add several accounts (run `hr auth import-codex` after
+logging into each) and pair with `hr mode sequential` to drain one account's quota before the
+next. Override the model with `CODEX_MODEL` (default `gpt-5.5`).
+
+> ⚠️ **Terms of service:** routing ChatGPT *subscription* quota through a proxy is a gray
+> area in OpenAI's terms and could risk your account. Use your own accounts, at your own
+> discretion.
+
 ## Valid provider names
 
 Use these names with `hr auth add`, `hr model set`, and the `<PROVIDER>_*` environment
 variables:
 
 `gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`, `groq`, `mistral`,
-`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `openai`, `anthropic`.
+`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `openai`, `anthropic`, `codex`.
 
 ## Per-provider capabilities
 

@@ -5,6 +5,7 @@
 # Usage:
 #   hr setup                          Interactive first-run wizard (start here)
 #   hr auth add <provider>            Add API key(s) for a provider
+#   hr auth import-codex              Import a ChatGPT-subscription login from the Codex CLI
 #   hr auth list                      Show all providers and how many keys are configured
 #   hr model list                     Show all providers and their active model
 #   hr model set <provider> <model>   Override a provider's model

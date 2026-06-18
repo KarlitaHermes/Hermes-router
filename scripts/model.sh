@@ -29,7 +29,7 @@ err()  { printf '\033[1;31m[model]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[model]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[model]\033[0m %s\n' "$*"; }
 
-PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface openai anthropic"
+PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface openai anthropic codex"
 
 canonical_provider() {
   case "${1,,}" in
@@ -46,6 +46,7 @@ canonical_provider() {
     nvidia|nim)            echo "nvidia" ;;
     openai|gpt)            echo "openai" ;;
     anthropic|claude)      echo "anthropic" ;;
+    codex|chatgpt)         echo "codex" ;;
     *)                     echo "" ;;
   esac
 }
@@ -67,6 +68,7 @@ env_var_for() {
     huggingface)   echo "HUGGINGFACE_MODEL" ;;
     openai)        echo "OPENAI_MODEL" ;;
     anthropic)     echo "ANTHROPIC_MODEL" ;;
+    codex)         echo "CODEX_MODEL" ;;
   esac
 }
 
@@ -87,6 +89,7 @@ default_for() {
     huggingface)   echo "openai/gpt-oss-120b:cheapest" ;;
     openai)        echo "gpt-4o-mini" ;;
     anthropic)     echo "claude-haiku-4-5-20251001" ;;
+    codex)         echo "gpt-5.5" ;;
   esac
 }
 
