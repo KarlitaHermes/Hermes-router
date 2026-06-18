@@ -336,6 +336,20 @@ def _build_providers() -> list[dict]:
             "keys":     nvidia_keys,
         })
 
+    # Hugging Face Inference Providers — one OpenAI-compatible endpoint fronting
+    # 45k+ models across many partners. Free accounts get a small monthly credit
+    # ($0.10; PRO $2), so it exhausts faster than the request-quota free tiers —
+    # the `:cheapest` suffix routes to the cheapest partner to stretch it. Use a
+    # token from huggingface.co/settings/tokens (with Inference Providers access).
+    huggingface_keys = _keys_for("huggingface", "HUGGINGFACE_API_KEYS")
+    if huggingface_keys:
+        providers.append({
+            "name":     "huggingface",
+            "base_url": "https://router.huggingface.co/v1",
+            "model":    os.environ.get("HUGGINGFACE_MODEL", "openai/gpt-oss-120b:cheapest"),
+            "keys":     huggingface_keys,
+        })
+
     openai_keys = _keys_for("openai", "OPENAI_API_KEYS")
     if openai_keys:
         providers.append({

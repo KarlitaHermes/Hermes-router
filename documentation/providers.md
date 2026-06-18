@@ -22,6 +22,12 @@ they're stored).
 | Z.ai (GLM) | ~1k requests/day | [z.ai](https://z.ai) |
 | Naga AI | 100 requests/day per key | [naga.ac](https://naga.ac) |
 | NVIDIA NIM | 40 requests/min per key | [build.nvidia.com](https://build.nvidia.com) |
+| Hugging Face | ~$0.10/mo credit (PRO: $2/mo) — 45k+ models | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) |
+
+> **Hugging Face note:** one token reaches 45,000+ models across many inference partners
+> via an OpenAI-compatible endpoint. The free credit is small, so it's best as an *extra* in
+> the pool (the router fails over to other providers when it runs out). The default model
+> uses the `:cheapest` suffix to stretch the credit; change it with `HUGGINGFACE_MODEL`.
 
 ## Paid providers
 
@@ -42,7 +48,7 @@ Use these names with `hr auth add`, `hr model set`, and the `<PROVIDER>_*` envir
 variables:
 
 `gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`, `groq`, `mistral`,
-`cohere`, `zai`, `naga`, `nvidia`, `openai`, `anthropic`.
+`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `openai`, `anthropic`.
 
 ## Per-provider capabilities
 
