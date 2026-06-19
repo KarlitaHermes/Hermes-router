@@ -1,0 +1,68 @@
+---
+title: hermes-router
+description: Keep your AI app online for free — one endpoint in front of a pool of free AI providers, with automatic key rotation and failover.
+template: splash
+hero:
+  tagline: Keep your AI app online for free. One OpenAI/Anthropic-compatible endpoint in front of a pool of free providers — with automatic key rotation, failover, and smart routing.
+  actions:
+    - text: Get Started
+      link: /getting-started/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/Shaf2665/Hermes-router
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## Why hermes-router?
+
+Free AI tiers are generous but rate-limited. hermes-router sits between your app and a pool
+of free providers (Gemini, OpenRouter, Groq, and more). When one hits its limit, it
+automatically falls back to the next — so your app keeps working instead of erroring out.
+Point any OpenAI **or** Anthropic client at it and nothing else changes.
+
+<CardGrid>
+  <Card title="Never hit a rate limit" icon="rocket">
+    Automatic key rotation and provider failover across 15 providers keep you online.
+  </Card>
+  <Card title="Drop-in compatible" icon="puzzle">
+    Speaks the OpenAI **and** Anthropic APIs. Tool calling, embeddings, and streaming all work.
+  </Card>
+  <Card title="Smart, cheap routing" icon="setting">
+    Each request goes to the cheapest model that can handle it; unhealthy providers are skipped.
+  </Card>
+  <Card title="Yours to run" icon="approve-check">
+    A single self-hosted Python file. Your keys live in your own auth.json — nothing hidden.
+  </Card>
+</CardGrid>
+
+## Start here
+
+<CardGrid>
+  <LinkCard title="Getting Started" href="/getting-started/" description="Zero-experience intro and your first message." />
+  <LinkCard title="How it works (Architecture)" href="/architecture/" description="The request pipeline and every moving part." />
+  <LinkCard title="Build an Agent" href="/build-an-agent/" description="Chatbot → memory → tools, copy-paste." />
+  <LinkCard title="Providers" href="/providers/" description="Free & paid providers, sign-up links, Codex." />
+</CardGrid>
+
+## Quick start
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Shaf2665/Hermes-router/main/get.sh | bash
+hr setup        # add a key, start the router
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8319/v1", api_key="sk-router-1")
+resp = client.chat.completions.create(
+    model="hermes-router",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(resp.choices[0].message.content)
+```
+
+On Windows or hosting in the cloud? See **[Deployment](/deployment/)**.
