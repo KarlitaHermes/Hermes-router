@@ -262,9 +262,38 @@ works well. Follow these steps carefully — the **port** is the #1 thing people
 
 Then click **Create Space**.
 
-**Step 2 — add the code.** Put the project files in the Space repo (push them with git, or use
-the Space's "Files" tab → "Add file" to upload). You need three files: `router.py`,
-`requirements.txt`, and the `Dockerfile` (the repo already includes a working one).
+**Step 2 — add hermes-router's files (replacing HF's placeholder).** When the Space is
+created, Hugging Face shows a "Get started with your Docker Space!" page with an example
+**FastAPI app on port 7860**. **Ignore that example** — you're bringing hermes-router
+instead. You need exactly three files, all from the
+[GitHub repo](https://github.com/Shaf2665/Hermes-router): `router.py`, `requirements.txt`,
+and `Dockerfile`.
+
+Pick whichever way you're comfortable with:
+
+*Easiest — upload in the browser (no git, no SSH key needed):*
+1. Download the three files from the GitHub repo (open each file → the **download/raw**
+   button).
+2. On your Space page, open the **Files** tab → **Add file → Upload files**.
+3. Drop in `router.py`, `requirements.txt`, and `Dockerfile`.
+4. Write a short commit message and click **Commit changes to main**.
+
+*Or with git (clone the Space, add the files, push):*
+```bash
+git clone https://<your-hf-username>@huggingface.co/spaces/<your-hf-username>/hermes-router
+cd hermes-router
+# copy router.py, requirements.txt and Dockerfile into this folder, then:
+git add router.py requirements.txt Dockerfile
+git commit -m "Add hermes-router"
+git push
+```
+When git asks for a password, paste a **write** access token from
+[huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) (not your account
+password). SSH works too, but only after you add an SSH key under
+**Settings → SSH and GPG Keys** — the token route above avoids that.
+
+> Both methods keep the Space's own `README.md` (the one HF created), which you'll edit in the
+> next step. Don't overwrite it with the GitHub repo's README — that one has no Space config.
 
 **Step 3 — fix the port.** This is the critical bit. Hugging Face serves your app on **one**
 port, set by `app_port` (default **7860**), but the router listens on **8319**. Make them
