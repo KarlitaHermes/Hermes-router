@@ -31,7 +31,7 @@ subscription) logins are stored separately under `codex_accounts` (via
 | `PORT` | `8319` | Port to listen on |
 | `PROXY_API_KEYS` | `sk-router-1` | Comma-separated keys your app uses to authenticate |
 | `ROUTER_AUTH_FILE` | `./auth.json` | Where keys are stored |
-| `CACHE_TTL_SECONDS` | `300` | Response cache lifetime (`0` disables) |
+| `CACHE_TTL_SECONDS` | `300` | Response cache lifetime (`0` disables). Entries are namespaced per API key, so different `PROXY_API_KEYS` never share a cached answer — safe for multi-tenant use |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 | `METRICS_REQUIRE_AUTH` | `0` | Require the proxy key on `/metrics` (`1` to enable) |
 | `REASONING_TOKEN_RESERVE` | `4096` | Extra output budget added for reasoning models so hidden chain-of-thought doesn't eat the answer (`0` disables) |

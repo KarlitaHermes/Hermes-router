@@ -1014,18 +1014,20 @@ class ResponseCache:
         self.hits     = 0
         self.misses   = 0
 
-    def _hash(self, payload: dict) -> str:
+    def _hash(self, payload: dict, ns: str = "") -> str:
         # Hash the entire request (minus "stream", which doesn't change the
         # answer) so requests differing only in temperature, max_tokens,
-        # tools, response_format, etc. never collide.
+        # tools, response_format, etc. never collide. `ns` namespaces the entry
+        # to the authenticated caller, so two different API keys never share a
+        # cached answer for an identical prompt (multi-tenant isolation).
         relevant = {k: v for k, v in payload.items() if k != "stream"}
-        content = json.dumps(relevant, sort_keys=True, default=str)
+        content = json.dumps({"ns": ns, "req": relevant}, sort_keys=True, default=str)
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
-    def get(self, payload: dict) -> dict | None:
+    def get(self, payload: dict, ns: str = "") -> dict | None:
         if self.ttl <= 0:
             return None
-        key = self._hash(payload)
+        key = self._hash(payload, ns)
         with self.lock:
             if key in self._store:
                 data, ts = self._store[key]
@@ -1037,10 +1039,10 @@ class ResponseCache:
             self.misses += 1
         return None
 
-    def set(self, payload: dict, data: dict):
+    def set(self, payload: dict, data: dict, ns: str = ""):
         if self.ttl <= 0:
             return
-        key = self._hash(payload)
+        key = self._hash(payload, ns)
         with self.lock:
             if len(self._store) >= self.max_size:
                 self._store.popitem(last=False)  # evict oldest
@@ -1867,15 +1869,27 @@ app.config["MAX_CONTENT_LENGTH"] = _int_env("MAX_REQUEST_BYTES", 10 * 1024 * 102
 START_TIME = time.time()   # for uptime in /metrics
 
 
-def _auth_check():
+def _caller_token() -> str:
+    """The API key the caller presented (Bearer, or Anthropic's x-api-key)."""
     header = request.headers.get("Authorization", "").strip()
     token  = header[7:].strip() if header[:7].lower() == "bearer " else header
     if not token:
         # The Anthropic SDK sends the key via x-api-key, not Authorization.
         token = request.headers.get("x-api-key", "").strip()
+    return token
+
+
+def _auth_check():
+    token = _caller_token()
     # compare_digest keeps the comparison constant-time per key
     if not any(hmac.compare_digest(token, k) for k in PROXY_API_KEYS):
         return jsonify({"error": "unauthorized"}), 401
+
+
+def _cache_ns() -> str:
+    """Cache namespace = the authenticated caller, so different API keys never
+    share a cached response for an identical request."""
+    return _caller_token()
 
 
 @app.route("/health")
@@ -1894,7 +1908,7 @@ def models():
     ]})
 
 
-def _route_completion(payload: dict, streaming: bool):
+def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     """Core routing + failover pipeline, shared by /v1/chat/completions and the
     Anthropic-compatible /v1/messages. Takes an OpenAI-format payload and returns
     one of:
@@ -1907,7 +1921,7 @@ def _route_completion(payload: dict, streaming: bool):
 
     # Cache check (non-streaming only)
     if not streaming:
-        cached = cache.get(payload)
+        cached = cache.get(payload, ns)
         if cached is not None:
             log.info("↩ cache hit")
             return ("json", cached)
@@ -2021,7 +2035,7 @@ def _route_completion(payload: dict, streaming: bool):
                             try: events.append(json.loads(ds))
                             except Exception: pass
                 data = _from_codex_response(events)
-                cache.set(payload, data)
+                cache.set(payload, data, ns)
                 return ("json", data)
             if streaming:
                 gen = (_anthropic_streaming_generator(resp) if is_anthropic
@@ -2032,7 +2046,7 @@ def _route_completion(payload: dict, streaming: bool):
                         else resp.json())
                 if not is_anthropic:
                     _strip_response(data)
-                cache.set(payload, data)
+                cache.set(payload, data, ns)
                 return ("json", data)
 
         log.warning(f"✗ {name} exhausted — cascading")
@@ -2051,7 +2065,7 @@ def chat():
         return jsonify({"error": {"message": "request body must be a JSON object",
                                   "type": "invalid_request_error"}}), 400
 
-    result = _route_completion(payload, payload.get("stream", False))
+    result = _route_completion(payload, payload.get("stream", False), _cache_ns())
     if result[0] == "json":
         return jsonify(result[1]), 200
     if result[0] == "stream":
@@ -2076,7 +2090,7 @@ def anthropic_messages():
 
     streaming = bool(body.get("stream", False))
     payload   = _anthropic_request_to_openai(body)
-    result    = _route_completion(payload, streaming)
+    result    = _route_completion(payload, streaming, _cache_ns())
 
     if result[0] == "json":
         return jsonify(_openai_response_to_anthropic(result[1])), 200
@@ -2105,7 +2119,8 @@ def embeddings():
                                   "type": "router_error"}}), 503
 
     # Embeddings are deterministic — identical input is a perfect cache hit.
-    cached = cache.get(payload)
+    ns = _cache_ns()
+    cached = cache.get(payload, ns)
     if cached is not None:
         log.info("↩ cache hit (embeddings)")
         return jsonify(cached)
@@ -2155,7 +2170,7 @@ def embeddings():
             stats.record_success(name, elapsed); stats.record_health(name, True)
             log.info(f"  ✓ {name} embeddings ({elapsed*1000:.0f}ms)")
             data = resp.json()
-            cache.set(payload, data)
+            cache.set(payload, data, ns)
             return jsonify(data), 200
 
         log.warning(f"✗ {name} embeddings exhausted — cascading")
