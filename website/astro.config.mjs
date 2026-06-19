@@ -9,6 +9,9 @@ export default defineConfig({
 		starlight({
 			title: 'hermes-router',
 			description: 'Keep your AI app online for free — a self-hosted load balancer across free AI providers (OpenAI & Anthropic compatible).',
+			logo: { src: './src/assets/logo.png', alt: 'hermes-router' },
+			favicon: '/favicon.png',
+			customCss: ['./src/styles/custom.css'],
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/Shaf2665/Hermes-router' },
 			],

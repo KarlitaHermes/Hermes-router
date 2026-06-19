@@ -1,0 +1,16 @@
+/* hermes-router — cyan accent palette to match the circuit-H logo */
+:root {
+	--sl-color-accent-low: #002b33;
+	--sl-color-accent: #0b93ad;
+	--sl-color-accent-high: #a5e4f0;
+}
+:root[data-theme='light'] {
+	--sl-color-accent-low: #bce8f0;
+	--sl-color-accent: #0a7d94;
+	--sl-color-accent-high: #00333d;
+}
+
+/* A subtle cyan glow behind the splash hero logo/title, on-theme with the logo */
+.hero {
+	--overlay-blurple: color-mix(in srgb, var(--sl-color-accent) 18%, transparent);
+}
