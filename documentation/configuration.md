@@ -37,6 +37,24 @@ subscription) logins are stored separately under `codex_accounts` (via
 | `REASONING_TOKEN_RESERVE` | `4096` | Extra output budget added for reasoning models so hidden chain-of-thought doesn't eat the answer (`0` disables) |
 | `ROTATION_MODE` | `round-robin` | How keys are picked within a provider (set via `hr mode`) — `round-robin` or `sequential` |
 
+### Advanced settings
+
+Sensible defaults — most users never touch these.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MAX_REQUEST_BYTES` | `10485760` (10 MB) | Max request body size; larger requests get `413` (guards against memory exhaustion) |
+| `WORKER_THREADS` | `16` | Waitress worker threads (concurrency). The HTTP connection pool scales with this |
+| `CACHE_MAX_SIZE` | `100` | Max entries in the response cache (LRU eviction) |
+| `FAST_ROUTE_THRESHOLD` | `0` | If >0, requests under this many tokens prefer low-latency providers first (`0` disables) |
+| `ROUTER_MODEL_ID` | `hermes-router` | The model name clients send (the router maps it to each provider's real model) |
+| `ROUTER_STATE_FILE` | `./router_state.json` | Where provider ratings/capabilities are cached between restarts (use `/tmp/...` on read-only hosts like HF Spaces) |
+| `ROUTER_STATE_TTL_HOURS` | `24` | How long the cached probe state is trusted before re-probing (`0` = re-probe every start) |
+| `BREAKER_WINDOW` | `8` | Recent outcomes the circuit breaker weighs per provider |
+| `BREAKER_MIN_SAMPLES` | `4` | Minimum samples before the breaker can trip |
+| `BREAKER_ERROR_RATE` | `0.5` | Health-failure fraction that trips the breaker |
+| `BREAKER_COOLDOWN` | `60` | Seconds the breaker stays open before re-probing |
+
 ### Per-provider model
 
 | Variable | Default | Purpose |

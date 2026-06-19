@@ -57,7 +57,7 @@ flows through it like this:
                                                            │ first one that succeeds
                                            ┌───────────────▼─────────────────────┐
                                            │ Gemini · OpenRouter · Groq · Mistral │
-                                           │ Cohere · NVIDIA · … (11 providers)   │
+                                           │ Cohere · NVIDIA · Codex · … (15)     │
                                            └──────────────────────────────────────┘
 ```
 

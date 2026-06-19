@@ -12,8 +12,9 @@ A lightweight OpenAI-compatible proxy that:
   - Tracks per-provider latency and error rates
 
 Supported providers (configure via .env or auth.json):
-  Free:  Gemini · OpenRouter · SambaNova · GitHub Models · Cerebras · Groq · Mistral · Cohere · Z.ai · Naga · NVIDIA NIM
+  Free:  Gemini · OpenRouter · SambaNova · GitHub Models · Cerebras · Groq · Mistral · Cohere · Z.ai · Naga · NVIDIA NIM · Hugging Face
   Paid:  OpenAI · Anthropic
+  Subscription (OAuth): Codex (ChatGPT) — via `hr auth import-codex`
 
 Quick start:
   pip install -r requirements.txt
@@ -1109,6 +1110,17 @@ def _streaming_generator(resp: requests.Response):
     if buf:
         yield buf
 
+
+def _with_cleanup(resp: requests.Response, gen):
+    """Drive a streaming generator and always release the upstream connection
+    when done — including when the client disconnects mid-stream (GeneratorExit).
+    Without this, an aborted stream could keep an upstream socket checked out of
+    the connection pool until garbage collection."""
+    try:
+        yield from gen
+    finally:
+        resp.close()
+
 # ── Anthropic format translation ──────────────────────────────────────────────
 # Anthropic's Messages API uses a different format from OpenAI. These helpers
 # translate transparently so the caller never has to know which provider they hit.
@@ -1997,7 +2009,7 @@ def _route_completion(payload: dict, streaming: bool):
                 # Codex backend always streams SSE. Stream it through, or
                 # aggregate it into one response for non-streaming clients.
                 if streaming:
-                    return ("stream", _codex_streaming_generator(resp), name)
+                    return ("stream", _with_cleanup(resp, _codex_streaming_generator(resp)), name)
                 events = []
                 for raw in resp.iter_lines():
                     if not raw:
@@ -2014,7 +2026,7 @@ def _route_completion(payload: dict, streaming: bool):
             if streaming:
                 gen = (_anthropic_streaming_generator(resp) if is_anthropic
                        else _streaming_generator(resp))
-                return ("stream", gen, name)
+                return ("stream", _with_cleanup(resp, gen), name)
             else:
                 data = (_from_anthropic_response(resp.json()) if is_anthropic
                         else resp.json())
