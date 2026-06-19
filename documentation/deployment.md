@@ -295,10 +295,11 @@ password). SSH works too, but only after you add an SSH key under
 > Both methods keep the Space's own `README.md` (the one HF created), which you'll edit in the
 > next step. Don't overwrite it with the GitHub repo's README — that one has no Space config.
 
-**Step 3 — fix the port.** This is the critical bit. Hugging Face serves your app on **one**
-port, set by `app_port` (default **7860**), but the router listens on **8319**. Make them
-match — edit the **Space's own `README.md`** (Hugging Face created one when you made the
-Space) so the YAML block at the very top looks like this:
+**Step 3 — fix the port (don't skip this!).** This is the critical bit. Hugging Face serves
+your app on **one** port, set by `app_port` (default **7860**), but the router listens on
+**8319**. The README that HF auto-generates has **no `app_port` line at all** — so you must
+add it, or the Space hangs on "Starting" forever. Edit the **Space's own `README.md`** and
+make the YAML block at the very top look like this (the new line is `app_port: 8319`):
 
 ```yaml
 ---
@@ -389,11 +390,24 @@ Expected: a JSON reply with the model's answer inside `choices[0].message.conten
 
 ## Troubleshooting
 
+**Hugging Face Space stuck on "Starting" forever**
+- This is the #1 issue, and it's the **port**. Open the **Logs → Container** tab: if you see
+  `Serving on http://0.0.0.0:8319`, the router is fine — HF just isn't looking there. The
+  auto-generated `README.md` does **not** include `app_port`, so HF probes its default 7860
+  and never sees the app. Fix: add `app_port: 8319` to the README metadata block (Step 3) and
+  commit. It'll rebuild and flip to "Running".
+
 **`Connection refused` / page won't load**
 - Is the router actually running? (Docker: `docker compose ps`; native: is the `python
   router.py` window still open?)
 - On a **Hugging Face Space**, this is almost always the **port** — re-check Step 3 above
   (`app_port: 8319` or `PORT=7860`).
+
+**Logs say `No providers configured` (Hugging Face Space)**
+- You haven't added any keys yet. Go to **Settings → Variables and secrets** and add your
+  provider keys + `PROXY_API_KEYS` as **Secrets** (Step 4). The only Space setting you need to
+  touch is "Variables and secrets" — leave hardware, sleep, visibility, etc. at their
+  defaults.
 
 **`401 Unauthorized`**
 - Your app's API key doesn't match `PROXY_API_KEYS`. Make them the same and try again.
