@@ -54,6 +54,13 @@ short cooldown and skipped until it recovers.
 - `sequential` — drain one key fully until it rate-limits, then move to the next, keeping later
   keys/accounts fresh in reserve. Ideal for rationing many accounts.
 
+**Multiple models per provider.** A provider's `<PROVIDER>_MODEL` can be a comma-separated
+list. Because free-tier rate limits are per-**model**, cooldowns are tracked per **(key,
+model)** pair: when one model hits a 429, the router fails over to the next model on the same
+key before cascading to the next provider. This multiplies free capacity along a third axis —
+**keys × models × providers** — with no extra signups. See
+[Configuration](/configuration/#multiple-models-per-provider).
+
 ### Smart routing
 
 Requests are scored for difficulty and models for capability (both 1–5, lower = more capable).

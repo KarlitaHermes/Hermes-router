@@ -100,6 +100,26 @@ hr restart                                 # apply changes
 Overrides are stored as plain variables in `.env` (e.g. `ANTHROPIC_MODEL=claude-sonnet-4-6`)
 and active overrides are highlighted in `hr model list`.
 
+### Multiple models per provider
+
+A provider can use **several models** — just give `<PROVIDER>_MODEL` a comma-separated list:
+
+```bash
+hr model set gemini gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash
+hr restart
+```
+
+Free-tier rate limits are almost always **per-model**, so each model is its own quota
+bucket. When the first model hits its limit (429), the router **fails over to the next model
+on the same key** before cascading to the next provider — multiplying free throughput along a
+new axis (keys × models × providers), with no extra signups. The first model in the list is
+the **primary** (used for routing, rating, and status); list them in preference order
+(cheapest/fastest first).
+
+> **Keep a provider's models the same class.** Tool-calling and reasoning are detected on the
+> primary model and applied to the whole provider, so list models that behave alike (e.g. the
+> Gemini `flash` family). Don't mix a tool-capable chat model with one that can't.
+
 ## Key rotation mode
 
 When a provider holds several keys (or several accounts), `ROTATION_MODE` decides how the

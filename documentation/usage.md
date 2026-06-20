@@ -23,6 +23,12 @@ print(resp.choices[0].message.content)
 
 Streaming (`stream=True`) and function calling (`tools=[...]`) both work.
 
+> **Tip — multiply your free quota:** give a provider several models with a comma-separated
+> `<PROVIDER>_MODEL` (e.g. `GEMINI_MODEL=gemini-2.5-flash-lite,gemini-2.5-flash`). Since
+> rate limits are per-model, the router fails over across a provider's models before moving
+> on — capacity scales with keys × **models** × providers. See
+> [Configuration](/configuration/#multiple-models-per-provider).
+
 ## Anthropic SDK
 
 Already built on the Anthropic SDK? Point its `base_url` at hermes-router — no code

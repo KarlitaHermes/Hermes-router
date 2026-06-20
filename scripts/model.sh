@@ -3,15 +3,19 @@
 # hr model — manage per-provider model overrides
 #
 # Usage:
-#   hr model list                    Show all providers and their active model
-#   hr model set <provider> <model>  Override a provider's model
+#   hr model list                    Show all providers and their active model(s)
+#   hr model set <provider> <model>  Override a provider's model(s)
 #   hr model reset <provider>        Revert a provider to its default model
 #   hr model help                    Show this help
+#
+# A provider can use MULTIPLE models — pass a comma-separated list. Rate limits
+# are per-model, so the router fails over across them (each its own quota) before
+# moving to the next provider. The first model is the primary (used for routing).
 #
 # Examples:
 #   hr model set anthropic claude-sonnet-4-6
 #   hr model set openai gpt-4o
-#   hr model set gemini gemini-2.5-pro
+#   hr model set gemini gemini-2.5-flash-lite,gemini-2.5-flash,gemini-2.0-flash
 #   hr model reset anthropic
 #
 # Overrides are written to .env and take effect after: hr restart

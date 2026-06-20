@@ -493,6 +493,16 @@ def _build_providers() -> list[dict]:
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
+    # Multi-model support: a provider's model string may be a comma-separated list
+    # (e.g. GEMINI_MODEL=gemini-2.5-flash-lite,gemini-2.5-flash). Free-tier rate
+    # limits are per-model, so the router fails over across a provider's models —
+    # each its own quota bucket — before cascading to the next provider. The first
+    # entry is the "primary" model used for probing, rating, and status display.
+    for p in providers:
+        models = [m.strip() for m in str(p.get("model", "")).split(",") if m.strip()]
+        p["models"] = models or [p.get("model", "")]
+        p["model"]  = p["models"][0]
+
     # Per-provider "skip when the request is too big" ceiling. Some free tiers
     # reject large payloads outright, so trying them with a big prompt just wastes
     # a round-trip before cascading. When the estimated request size exceeds a
@@ -785,8 +795,12 @@ def _initialize_ratings(providers: list, pool_ref):
                     and all(p["name"] in _provider_state for p in providers)):
                 for p in providers:
                     cached_model = _provider_state[p["name"]].get("model")
-                    if cached_model:
+                    if cached_model and cached_model != p["model"]:
+                        old = p["model"]
                         p["model"] = cached_model
+                        if p.get("models"):
+                            p["models"][0] = cached_model
+                        pool_ref.rename_model(p["name"], old, cached_model)
                 log.info(f"[ratings] State is {age/3600:.1f}h old (< {STATE_TTL_HOURS}h TTL) "
                          "— skipping startup probes")
                 return
@@ -797,18 +811,20 @@ def _initialize_ratings(providers: list, pool_ref):
     new_state = {}
     for p in providers:
         name  = p["name"]
-        probe = pool_ref.pools.get(name, [])
-        if not probe:
+        key   = pool_ref.first_key(name)
+        if not key:
             new_state[name] = {"rating": _rate_model(p["model"]), "model": p["model"],
                                 "available": False, "latency_ms": 0, "overridden": False}
             continue
-        key = probe[0]["key"]
         ok, latency, actual = _probe_provider(p, key)
         original   = p["model"]
         overridden = actual != original
         if overridden:
             log.info(f"[ratings]   {name}: model fixed {original} → {actual}")
             p["model"] = actual
+            if p.get("models"):
+                p["models"][0] = actual
+            pool_ref.rename_model(name, original, actual)
         rating = _rate_model(actual)
         # Tool-capability: an explicit env override wins; otherwise probe (only
         # when reachable — no point asking a down provider).
@@ -855,17 +871,24 @@ class CredentialPool:
     def __init__(self, providers: list[dict], mode: str = None):
         self.lock  = threading.Lock()
         self.mode  = mode or ROTATION_MODE
-        self.pools: dict[str, deque] = {}
+        # provider -> { model -> deque({key, cool_until}) }. Each model gets its own
+        # key deque so rate-limit cooldowns are tracked per (key, model): a 429 on
+        # one model never sidelines the provider's other models (separate quotas).
+        self.pools: dict[str, dict[str, deque]] = {}
         for p in providers:
-            self.pools[p["name"]] = deque(
-                {"key": k, "cool_until": 0.0} for k in p["keys"]
-            )
-            log.info(f"  {p['name']}: {len(p['keys'])} key(s) loaded")
+            models = list(p.get("models") or [p.get("model", "")])
+            if p.get("embed_model"):
+                models.append(p["embed_model"])   # embeddings get their own bucket
+            self.pools[p["name"]] = {
+                m: deque({"key": k, "cool_until": 0.0} for k in p["keys"])
+                for m in dict.fromkeys(models)     # de-dupe, preserve order
+            }
+            log.info(f"  {p['name']}: {len(p['keys'])} key(s) × {len(self.pools[p['name']])} model(s) loaded")
 
-    def get_key(self, provider_name: str) -> str | None:
-        """Return a ready key per the active mode, or None if all are cooling."""
+    def get_key(self, provider_name: str, model: str) -> str | None:
+        """Return a ready key for (provider, model) per the active mode, or None."""
         with self.lock:
-            pool = self.pools.get(provider_name, deque())
+            pool = self.pools.get(provider_name, {}).get(model, deque())
             now  = time.time()
             if self.mode == "sequential":
                 # Stay on the current key until it cools; only advance past cooling ones.
@@ -883,14 +906,45 @@ class CredentialPool:
                     return entry["key"]
             return None
 
-    def mark_rate_limited(self, provider_name: str, key: str, retry_after: int = 60):
-        """Put a specific key into cooldown."""
+    def key_count(self, provider_name: str, model: str) -> int:
+        """How many keys exist for (provider, model) — used to bound retry attempts."""
+        return len(self.pools.get(provider_name, {}).get(model, ()))
+
+    def first_key(self, provider_name: str) -> str | None:
+        """Any key for a provider (from its primary model's deque) — used for probing."""
+        for entries in self.pools.get(provider_name, {}).values():
+            if entries:
+                return entries[0]["key"]
+        return None
+
+    def mark_rate_limited(self, provider_name: str, key: str, model: str, retry_after: int = 60):
+        """Cool a specific (key, model) — leaves the provider's other models ready."""
         with self.lock:
-            for entry in self.pools.get(provider_name, []):
+            for entry in self.pools.get(provider_name, {}).get(model, ()):
                 if entry["key"] == key:
                     entry["cool_until"] = time.time() + retry_after
-                    log.warning(f"  {provider_name} key ...{key[-6:]} cooling for {retry_after}s")
+                    log.warning(f"  {provider_name} key ...{key[-6:]} model {model} cooling for {retry_after}s")
                     return
+
+    def mark_key_down(self, provider_name: str, key: str, retry_after: int = 30):
+        """Cool a key across ALL of the provider's models — for network/5xx (key/
+        provider-health) failures, which aren't specific to one model."""
+        with self.lock:
+            now = time.time()
+            for entries in self.pools.get(provider_name, {}).values():
+                for entry in entries:
+                    if entry["key"] == key:
+                        entry["cool_until"] = now + retry_after
+            log.warning(f"  {provider_name} key ...{key[-6:]} cooling {retry_after}s (all models)")
+
+    def rename_model(self, provider_name: str, old: str, new: str):
+        """Re-key a model's deque — used when the startup probe auto-discovers a
+        replacement for a deprecated/invalid primary model name, so the pool's
+        per-model bucket keeps matching the provider's model list."""
+        with self.lock:
+            prov = self.pools.get(provider_name)
+            if prov and old in prov and old != new:
+                prov[new] = prov.pop(old)
 
 
 pool = CredentialPool(PROVIDERS)
@@ -1723,16 +1777,26 @@ def _codex_streaming_generator(resp: requests.Response):
 
 # ── Request forwarding ─────────────────────────────────────────────────────────
 
-def forward(provider: dict, key: str, payload: dict, streaming: bool) -> requests.Response | None:
+def _resolve_model(provider: dict, payload: dict, model: str | None) -> str:
+    """Which model to actually send: the explicit one the failover loop chose,
+    else the client's (if it named a real model), else the provider's primary."""
+    if model:
+        return model
+    m = payload.get("model", "")
+    if not m or m in ("", ROUTER_MODEL, "auto"):
+        return provider["model"]
+    return m
+
+
+def forward(provider: dict, key: str, payload: dict, streaming: bool,
+            model: str | None = None) -> requests.Response | None:
     # Codex (ChatGPT OAuth) speaks the Responses API — translate and send directly.
     if provider.get("protocol") == "codex":
         token = codex_creds.get_access_token(key)   # key is the account_id
         if not token:
             log.error(f"  codex: no valid token for account ...{key[-6:]}")
             return None
-        model = payload.get("model", "")
-        if not model or model in ("", ROUTER_MODEL, "auto"):
-            model = provider["model"]
+        model = _resolve_model(provider, payload, model)
         cleaned = []
         for msg in payload.get("messages", []):
             m = dict(msg); _strip_message(m); cleaned.append(m)
@@ -1754,9 +1818,7 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
 
     # Anthropic uses a different wire format — translate and send directly.
     if provider.get("protocol") == "anthropic":
-        model = payload.get("model", "")
-        if not model or model in ("", ROUTER_MODEL, "auto"):
-            model = provider["model"]
+        model = _resolve_model(provider, payload, model)
         cleaned = []
         for msg in payload.get("messages", []):
             m = dict(msg)
@@ -1779,9 +1841,8 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool) -> request
 
     body = dict(payload)
 
-    # Remap any placeholder model name to the provider's real model
-    if body.get("model", "") in ("", ROUTER_MODEL, "auto"):
-        body["model"] = provider["model"]
+    # Use the model the failover loop chose (else placeholder → provider's primary)
+    body["model"] = _resolve_model(provider, payload, model)
 
     # Strip thinking fields from conversation history before forwarding
     if "messages" in body:
@@ -1962,92 +2023,107 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
             log.info(f"⤳ skipping {name} (~{est_tokens} tok > {cap} cap)")
             continue
 
-        attempts = len(pool.pools.get(name, [])) or 1
+        # Model-major failover: try each of the provider's models (separate
+        # per-model rate-limit buckets) in listed order, rotating keys within each,
+        # before cascading to the next provider.
+        stop_provider = False
+        for model in provider["models"]:
+            attempts = pool.key_count(name, model) or 1
+            for _ in range(attempts):
+                key = pool.get_key(name, model)
+                if not key:
+                    break   # all keys for this model are cooling → try next model
 
-        for _ in range(attempts):
-            key = pool.get_key(name)
-            if not key:
-                log.warning(f"All {name} keys cooling — skipping provider")
-                break
+                log.info(f"→ Trying {name}/{model} ...{key[-6:]}")
+                t0   = time.time()
+                resp = forward(provider, key, payload, streaming, model)
+                elapsed = time.time() - t0
 
-            log.info(f"→ Trying {name} ...{key[-6:]}")
-            t0   = time.time()
-            resp = forward(provider, key, payload, streaming)
-            elapsed = time.time() - t0
+                if resp is None:
+                    stats.record_error(name)
+                    stats.record_health(name, False)   # network/timeout = provider health failure
+                    pool.mark_key_down(name, key, retry_after=30)
+                    continue
 
-            if resp is None:
-                stats.record_error(name)
-                stats.record_health(name, False)   # network/timeout = provider health failure
-                pool.mark_rate_limited(name, key, retry_after=30)
-                continue
+                if resp.status_code == 429:
+                    stats.record_error(name)
+                    # 429 is NOT a health failure — per-(key,model) cooldown handles it.
+                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                    pool.mark_rate_limited(name, key, model, retry_after=retry_after)
+                    log.warning(f"  {name}/{model} 429 — cooldown {retry_after}s, trying next")
+                    continue
 
-            if resp.status_code == 429:
-                stats.record_error(name)
-                # 429 is NOT a health failure — key cooldown already handles it.
-                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                pool.mark_rate_limited(name, key, retry_after=retry_after)
-                log.warning(f"  {name} 429 — cooldown {retry_after}s, trying next key")
-                continue
+                if resp.status_code in (401, 403):
+                    stats.record_error(name)
+                    # auth/permission — won't work for any model on this provider.
+                    log.error(f"  {name} {resp.status_code} — auth, skipping provider: {resp.text[:200]}")
+                    stop_provider = True
+                    break
 
-            if resp.status_code in (400, 401, 403):
-                stats.record_error(name)
-                # request/auth-specific — NOT a provider health failure.
-                log.error(f"  {name} {resp.status_code} — skipping provider: {resp.text[:200]}")
-                break
+                if resp.status_code in (400, 404):
+                    stats.record_error(name)
+                    # model-specific (e.g. bad model name) — try the next model.
+                    log.warning(f"  {name}/{model} {resp.status_code} — skipping this model: {resp.text[:150]}")
+                    break
 
-            if resp.status_code == 413:
-                stats.record_error(name)
-                # payload-specific — NOT a provider health failure.
-                log.warning(f"  {name} 413 — payload too large, cascading")
-                break
+                if resp.status_code == 413:
+                    stats.record_error(name)
+                    # payload-specific — bigger model won't help; cascade providers.
+                    log.warning(f"  {name} 413 — payload too large, cascading")
+                    stop_provider = True
+                    break
 
-            if resp.status_code >= 500:
-                stats.record_error(name)
-                stats.record_health(name, False)   # 5xx = provider health failure
-                pool.mark_rate_limited(name, key, retry_after=15)
-                continue
+                if resp.status_code >= 500:
+                    stats.record_error(name)
+                    stats.record_health(name, False)   # 5xx = provider health failure
+                    pool.mark_key_down(name, key, retry_after=15)
+                    continue
 
-            if not (200 <= resp.status_code < 300):
-                stats.record_error(name)
-                stats.record_health(name, False)   # unexpected non-2xx = health failure
-                log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
-                break
+                if not (200 <= resp.status_code < 300):
+                    stats.record_error(name)
+                    stats.record_health(name, False)   # unexpected non-2xx = health failure
+                    log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
+                    stop_provider = True
+                    break
 
-            # Success
-            stats.record_success(name, elapsed)
-            stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
-            log.info(f"  ✓ {name} {resp.status_code} ({elapsed*1000:.0f}ms)")
-            is_anthropic = provider.get("protocol") == "anthropic"
-            is_codex     = provider.get("protocol") == "codex"
-            if is_codex:
-                # Codex backend always streams SSE. Stream it through, or
-                # aggregate it into one response for non-streaming clients.
+                # Success
+                stats.record_success(name, elapsed)
+                stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
+                log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+                is_anthropic = provider.get("protocol") == "anthropic"
+                is_codex     = provider.get("protocol") == "codex"
+                if is_codex:
+                    # Codex backend always streams SSE. Stream it through, or
+                    # aggregate it into one response for non-streaming clients.
+                    if streaming:
+                        return ("stream", _with_cleanup(resp, _codex_streaming_generator(resp)), name)
+                    events = []
+                    for raw in resp.iter_lines():
+                        if not raw:
+                            continue
+                        raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                        if raw.startswith("data:"):
+                            ds = raw[5:].strip()
+                            if ds and ds != "[DONE]":
+                                try: events.append(json.loads(ds))
+                                except Exception: pass
+                    data = _from_codex_response(events)
+                    cache.set(payload, data, ns)
+                    return ("json", data)
                 if streaming:
-                    return ("stream", _with_cleanup(resp, _codex_streaming_generator(resp)), name)
-                events = []
-                for raw in resp.iter_lines():
-                    if not raw:
-                        continue
-                    raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-                    if raw.startswith("data:"):
-                        ds = raw[5:].strip()
-                        if ds and ds != "[DONE]":
-                            try: events.append(json.loads(ds))
-                            except Exception: pass
-                data = _from_codex_response(events)
-                cache.set(payload, data, ns)
-                return ("json", data)
-            if streaming:
-                gen = (_anthropic_streaming_generator(resp) if is_anthropic
-                       else _streaming_generator(resp))
-                return ("stream", _with_cleanup(resp, gen), name)
-            else:
-                data = (_from_anthropic_response(resp.json()) if is_anthropic
-                        else resp.json())
-                if not is_anthropic:
-                    _strip_response(data)
-                cache.set(payload, data, ns)
-                return ("json", data)
+                    gen = (_anthropic_streaming_generator(resp) if is_anthropic
+                           else _streaming_generator(resp))
+                    return ("stream", _with_cleanup(resp, gen), name)
+                else:
+                    data = (_from_anthropic_response(resp.json()) if is_anthropic
+                            else resp.json())
+                    if not is_anthropic:
+                        _strip_response(data)
+                    cache.set(payload, data, ns)
+                    return ("json", data)
+
+            if stop_provider:
+                break
 
         log.warning(f"✗ {name} exhausted — cascading")
 
@@ -2133,25 +2209,26 @@ def embeddings():
             log.info(f"⨂ skipping {name} embeddings (circuit open)")
             continue
 
-        attempts = len(pool.pools.get(name, [])) or 1
+        em = provider["embed_model"]
+        attempts = pool.key_count(name, em) or 1
         for _ in range(attempts):
-            key = pool.get_key(name)
+            key = pool.get_key(name, em)
             if not key:
                 log.warning(f"All {name} keys cooling — skipping provider")
                 break
 
-            log.info(f"→ Trying {name} embeddings ({provider['embed_model']}) ...{key[-6:]}")
+            log.info(f"→ Trying {name} embeddings ({em}) ...{key[-6:]}")
             t0   = time.time()
             resp = forward_embeddings(provider, key, payload)
             elapsed = time.time() - t0
 
             if resp is None:
                 stats.record_error(name); stats.record_health(name, False)
-                pool.mark_rate_limited(name, key, retry_after=30)
+                pool.mark_key_down(name, key, retry_after=30)
                 continue
             if resp.status_code == 429:
                 stats.record_error(name)
-                pool.mark_rate_limited(name, key, retry_after=_parse_retry_after(resp.headers.get("Retry-After")))
+                pool.mark_rate_limited(name, key, em, retry_after=_parse_retry_after(resp.headers.get("Retry-After")))
                 log.warning(f"  {name} 429 — cooldown, trying next key")
                 continue
             if resp.status_code in (400, 401, 403, 404):
@@ -2160,7 +2237,7 @@ def embeddings():
                 break
             if resp.status_code >= 500:
                 stats.record_error(name); stats.record_health(name, False)
-                pool.mark_rate_limited(name, key, retry_after=15)
+                pool.mark_key_down(name, key, retry_after=15)
                 continue
             if not (200 <= resp.status_code < 300):
                 stats.record_error(name); stats.record_health(name, False)
@@ -2188,7 +2265,11 @@ def status():
     now  = time.time()
     keys = {}
     with pool.lock:
-        for name, entries in pool.pools.items():
+        for name, model_pools in pool.pools.items():
+            # Representative key status from the provider's primary model bucket
+            # (insertion order → models[0]); per-model buckets share the same keys.
+            primary = next(iter(model_pools), None)
+            entries = model_pools.get(primary, []) if primary else []
             keys[name] = [
                 {
                     "key_tail": e["key"][-6:],
@@ -2215,6 +2296,8 @@ def status():
             entry["latency_ms"] = st["latency_ms"]
         if st.get("model"):
             entry["model"] = st["model"]
+        if p.get("models"):
+            entry["models"] = p["models"]
         if "available" in st:
             entry["available"] = st["available"]
         if "supports_tools" in st:
