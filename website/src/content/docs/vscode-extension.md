@@ -147,9 +147,20 @@ sends tool-using requests only to providers whose models support function callin
 : You need **VS Code ≥ 1.104** *and* the **GitHub Copilot Chat** extension. Reload the window
   after installing both.
 
-**The "Add Key / Restart / …" commands are greyed out or do nothing**
-: Those use the local `hr` CLI, so they only work when `baseUrl` is localhost and `hr` is on your
-  PATH. Manage a remote router where it's hosted.
+**"Add Key / Restart / …" says `hr` isn't on your PATH (or you saw `spawn hr ENOENT`)**
+: Those commands use the `hr` CLI, which is the **Linux/macOS/WSL** helper — it doesn't exist on
+  a plain **Windows** host, and you don't use it when the **router runs in Docker**. So manage the
+  router the way that matches how you run it:
+  - **Docker:** set provider keys as container env vars (`-e GEMINI_API_KEYS=…`, `-e PROXY_API_KEYS=…`)
+    or mount an `auth.json`, and apply changes with `docker restart <container>` (not the extension's
+    "Restart"). See [Deployment → Docker](/deployment/#path-1-docker-easiest-any-os).
+  - **Windows without Docker:** run the router under **WSL2**, where `hr` works — see
+    [Deployment → Windows](/deployment/#path-3-windows).
+  - The dashboard and "use as a model" features work regardless; only the `hr`-based controls need it.
+
+**The "Add Key / Restart / …" commands are greyed out for a remote router**
+: They use the local `hr` CLI, so they only work when `baseUrl` is localhost. Manage a remote
+  router where it's hosted.
 
 ---
 

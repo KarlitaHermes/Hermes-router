@@ -134,8 +134,16 @@ sends tool-using requests only to providers whose models support function callin
   `PROXY_API_KEYS`. Make them match.
 - **hermes-router doesn't appear in the Copilot model picker** — you need **VS Code ≥ 1.104**
   *and* the **GitHub Copilot Chat** extension. Reload the window after installing both.
-- **The manage commands are greyed out** — they use the local `hr` CLI, so they only work when
-  `baseUrl` is localhost and `hr` is on your PATH.
+- **"Add Key / Restart / …" says `hr` isn't on your PATH (or `spawn hr ENOENT`)** — those commands
+  use the `hr` CLI, the **Linux/macOS/WSL** helper. It doesn't exist on a plain **Windows** host,
+  and you don't use it when the **router runs in Docker**. Manage it to match how you run it:
+  - **Docker:** set keys as container env vars (`-e GEMINI_API_KEYS=…`, `-e PROXY_API_KEYS=…`) or a
+    mounted `auth.json`, and apply changes with `docker restart <container>`. See
+    [deployment.md](deployment.md).
+  - **Windows without Docker:** run the router under **WSL2**, where `hr` works.
+  - The dashboard and "use as a model" features work regardless.
+- **The manage commands are greyed out for a remote router** — they use the local `hr` CLI, so they
+  only work when `baseUrl` is localhost.
 
 ---
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- **Friendlier control errors when `hr` isn't installed.** The Restart / Add Key / Model /
+  Rotation commands shell out to the `hr` CLI, which only exists on Linux/macOS/WSL — not on a
+  Windows host or when the router runs in Docker. Previously these failed with a cryptic
+  `spawn hr ENOENT` / "term 'hr' is not recognized". The extension now detects a missing `hr`
+  and shows clear, Docker-aware guidance (set keys via `-e <PROVIDER>_API_KEYS=…`, use
+  `docker restart`) with a link to the docs. Monitoring is unaffected and keeps working.
+
 ## 0.3.0
 
 - **Agent-mode tool calling.** The hermes-router model now supports tool/function calling, so it
