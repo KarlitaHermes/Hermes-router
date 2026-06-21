@@ -1,0 +1,94 @@
+{
+  "name": "hermes-router",
+  "displayName": "hermes-router",
+  "description": "Control panel for hermes-router — monitor provider health and manage your free-tier AI load balancer from VS Code.",
+  "version": "0.1.0",
+  "publisher": "hermes-router",
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Shaf2665/Hermes-router.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "keywords": ["hermes-router", "llm", "openai", "proxy", "load balancer", "ai"],
+  "main": "./dist/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hermesRouter",
+          "title": "hermes-router",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "hermesRouter": [
+        {
+          "id": "hermesRouter.dashboard",
+          "name": "Dashboard",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "hermesRouter.openDashboard", "title": "hermes-router: Open Dashboard" },
+      { "command": "hermesRouter.refresh", "title": "hermes-router: Refresh Status", "icon": "$(refresh)" },
+      { "command": "hermesRouter.restart", "title": "hermes-router: Restart Router" },
+      { "command": "hermesRouter.doctor", "title": "hermes-router: Run Doctor (diagnose)" },
+      { "command": "hermesRouter.update", "title": "hermes-router: Update to Latest" },
+      { "command": "hermesRouter.authAdd", "title": "hermes-router: Add Provider Key" },
+      { "command": "hermesRouter.importCodex", "title": "hermes-router: Import Codex (ChatGPT) Login" },
+      { "command": "hermesRouter.setModel", "title": "hermes-router: Set Provider Model(s)" },
+      { "command": "hermesRouter.setMode", "title": "hermes-router: Set Key Rotation Mode" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "hermesRouter.refresh", "when": "view == hermesRouter.dashboard", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "hermes-router",
+      "properties": {
+        "hermesRouter.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8319",
+          "description": "Base URL of the running hermes-router (use your Space URL for a remote router; CLI controls are disabled when remote)."
+        },
+        "hermesRouter.apiKey": {
+          "type": "string",
+          "default": "sk-router-1",
+          "description": "A value from the router's PROXY_API_KEYS — used to read /v1/status."
+        },
+        "hermesRouter.hrPath": {
+          "type": "string",
+          "default": "hr",
+          "description": "Path to the `hr` CLI (used for local control actions)."
+        },
+        "hermesRouter.refreshSeconds": {
+          "type": "number",
+          "default": 10,
+          "minimum": 3,
+          "description": "How often to refresh the dashboard and status bar (seconds)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npx --yes @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}
