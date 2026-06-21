@@ -50,8 +50,13 @@ commands — the `hr` CLI on your PATH. See the
 
 ## Install
 
-Grab the `.vsix` and run **Extensions → … → Install from VSIX**, or:
+[![Visual Studio Marketplace](https://img.shields.io/visual-studio-marketplace/v/MohammedShafiq.hermes-router?label=VS%20Marketplace)](https://marketplace.visualstudio.com/items?itemName=MohammedShafiq.hermes-router)
+
+**One-click:** search **hermes-router** in the VS Code Extensions view and click Install, or:
 
 ```bash
-code --install-extension hermes-router-0.1.0.vsix
+code --install-extension MohammedShafiq.hermes-router
 ```
+
+Or grab a `.vsix` from the [releases](https://github.com/Shaf2665/Hermes-router/releases) and
+run **Extensions → … → Install from VSIX**.
