@@ -70,6 +70,24 @@ a good first one: free and quick to create.
 
 Works the same on Windows, macOS, and Linux. Nothing to install but Docker.
 
+### Fastest: the prebuilt image (no clone, no build)
+
+A multi-arch image (amd64 + arm64) is published on Docker Hub as
+[`shafiq735/hermes-router`](https://hub.docker.com/r/shafiq735/hermes-router):
+
+```bash
+docker run -d -p 8319:8319 \
+  -e GEMINI_API_KEYS=your-gemini-key \
+  -e PROXY_API_KEYS=choose-a-secret-password \
+  shafiq735/hermes-router
+```
+
+Add more `-e <PROVIDER>_API_KEYS=…` for other providers (see [providers.md](providers.md)).
+Then `curl http://localhost:8319/health`. To persist keys/state instead of passing env vars,
+mount a volume with an `auth.json` (and set `-e ROUTER_STATE_FILE=/tmp/router_state.json`).
+
+### Or build from source with Compose
+
 **Step 1 — get the code.**
 
 ```bash

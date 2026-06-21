@@ -2,6 +2,9 @@
 
 ![Hermes Router](hermes-router-banner.png)
 
+[![Docker Hub](https://img.shields.io/docker/v/shafiq735/hermes-router?label=Docker%20Hub&logo=docker&sort=semver)](https://hub.docker.com/r/shafiq735/hermes-router)
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/MohammedShafiq.hermes-router?label=VS%20Code&logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=MohammedShafiq.hermes-router)
+
 **Keep your AI app online for free.** hermes-router sits between your app and a pool of
 free AI providers (Gemini, OpenRouter, Groq, and more). When one provider hits its rate
 limit, it automatically falls back to the next — so your app keeps working instead of

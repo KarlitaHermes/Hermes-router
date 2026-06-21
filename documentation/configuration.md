@@ -29,6 +29,7 @@ subscription) logins are stored separately under `codex_accounts` (via
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8319` | Port to listen on |
+| `HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` to listen on localhost only (recommended on a shared/VPS host — reach it via localhost or an SSH tunnel). Keep `0.0.0.0` for Docker. |
 | `PROXY_API_KEYS` | `sk-router-1` | Comma-separated keys your app uses to authenticate |
 | `ROUTER_AUTH_FILE` | `./auth.json` | Where keys are stored |
 | `CACHE_TTL_SECONDS` | `300` | Response cache lifetime (`0` disables). Entries are namespaced per API key, so different `PROXY_API_KEYS` never share a cached answer — safe for multi-tenant use |

@@ -63,6 +63,10 @@ _HTTP.mount("https://", _http_adapter)
 _HTTP.mount("http://", _http_adapter)
 
 PORT              = int(os.environ.get("PORT", 8319))
+# Bind address. Default 0.0.0.0 (needed for Docker port mapping). Set HOST=127.0.0.1
+# to expose the router to localhost only — recommended on a shared/VPS host where
+# you reach it via localhost or an SSH tunnel rather than a public port.
+HOST              = os.environ.get("HOST", "0.0.0.0")
 PROXY_API_KEYS    = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-router-1").split(",") if k.strip()]
 ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
@@ -2397,7 +2401,7 @@ def metrics():
 
 
 if __name__ == "__main__":
-    log.info(f"hermes-router starting on :{PORT}")
+    log.info(f"hermes-router starting on {HOST}:{PORT}")
     log.info(f"Providers: {[p['name'] for p in PROVIDERS]}")
     _embed = {p["name"]: p["embed_model"] for p in PROVIDERS if p.get("embed_model")}
     log.info(f"Embeddings (/v1/embeddings): {_embed if _embed else 'no embed-capable providers'}")
@@ -2410,7 +2414,7 @@ if __name__ == "__main__":
     try:
         from waitress import serve
         log.info("Serving with waitress (production WSGI)")
-        serve(app, host="0.0.0.0", port=PORT, threads=int(os.environ.get("WORKER_THREADS", 16)))
+        serve(app, host=HOST, port=PORT, threads=int(os.environ.get("WORKER_THREADS", 16)))
     except ImportError:
         log.warning("waitress not installed — falling back to Flask dev server")
-        app.run(host="0.0.0.0", port=PORT, threaded=True)
+        app.run(host=HOST, port=PORT, threaded=True)
