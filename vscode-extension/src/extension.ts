@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { RouterClient } from "./client";
 import { StatusBar } from "./statusBar";
 import { DashboardProvider } from "./dashboard";
+import { HermesChatModelProvider } from "./lmProvider";
 import { runHr, runHrTerminal } from "./cli";
 
 const PROVIDERS = [
@@ -26,7 +27,13 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     out,
     statusBar,
-    vscode.window.registerWebviewViewProvider(DashboardProvider.viewType, dashboard)
+    vscode.window.registerWebviewViewProvider(DashboardProvider.viewType, dashboard),
+    // Register hermes-router as a Language Model provider so it shows up in
+    // Copilot Chat's model picker and any vscode.lm consumer can select it.
+    vscode.lm.registerLanguageModelChatProvider(
+      "hermes-router",
+      new HermesChatModelProvider(makeClient)
+    )
   );
 
   // ── Shared refresh: update the status bar (via /health + /v1/status) ─────────

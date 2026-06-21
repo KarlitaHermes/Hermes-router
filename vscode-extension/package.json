@@ -2,7 +2,7 @@
   "name": "hermes-router",
   "displayName": "hermes-router",
   "description": "Control panel for hermes-router — monitor provider health and manage your free-tier AI load balancer from VS Code.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "hermes-router",
   "license": "MIT",
   "icon": "icon.png",
@@ -12,13 +12,19 @@
     "directory": "vscode-extension"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.104.0"
   },
   "categories": ["Other"],
   "keywords": ["hermes-router", "llm", "openai", "proxy", "load balancer", "ai"],
   "main": "./dist/extension.js",
   "activationEvents": ["onStartupFinished"],
   "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "hermes-router",
+        "displayName": "hermes-router"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -87,7 +93,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.104.0",
     "esbuild": "^0.21.0",
     "typescript": "^5.4.0"
   }

@@ -18,6 +18,15 @@ A control panel for [hermes-router](https://github.com/Shaf2665/Hermes-router) i
   - **Set Provider Model(s)** — comma-separate for multi-model rate-limit failover
   - **Set Key Rotation Mode** — `round-robin` / `sequential`
 
+## Use it as an AI model (Copilot Chat)
+
+The extension registers **hermes-router** as a language model in VS Code. Open **Copilot Chat**,
+click the **model picker**, and choose **hermes-router** — your prompts now route through the
+router's free pool. It's also available to any extension via the `vscode.lm` API.
+
+> Requires **VS Code ≥ 1.104** and the **GitHub Copilot Chat** extension (for the chat UI +
+> model picker). v1 streams text replies; agent-mode tool-calling is planned for a later release.
+
 ## Requirements
 
 A running hermes-router (locally, or remote e.g. a Hugging Face Space) and — for the *manage*

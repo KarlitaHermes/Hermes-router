@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- **Use hermes-router as an AI model.** Registers a Language Model provider, so hermes-router
+  appears in **Copilot Chat's model picker** (and is usable by any `vscode.lm` consumer);
+  prompts route through the router's free pool with streamed replies.
+- Requires VS Code ≥ 1.104. v1 is text chat; agent-mode tool-calling is planned.
+
 ## 0.1.0
 
 Initial release — a control panel for hermes-router.
