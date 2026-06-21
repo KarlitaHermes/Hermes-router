@@ -25,7 +25,9 @@ click the **model picker**, and choose **hermes-router** — your prompts now ro
 router's free pool. It's also available to any extension via the `vscode.lm` API.
 
 > Requires **VS Code ≥ 1.104** and the **GitHub Copilot Chat** extension (for the chat UI +
-> model picker). v1 streams text replies; agent-mode tool-calling is planned for a later release.
+> model picker). Supports streamed text **and tool calling**, so it works in Copilot **agent
+> mode** (run commands, edit files, call MCP tools) — the router automatically routes
+> tool-using requests to tool-capable providers.
 
 ## Requirements
 

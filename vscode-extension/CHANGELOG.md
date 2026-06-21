@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- **Agent-mode tool calling.** The hermes-router model now supports tool/function calling, so it
+  works in **Copilot agent mode** (run commands, edit files, call MCP tools). Tool definitions and
+  results are translated both ways; the router routes tool requests only to tool-capable providers.
+
 ## 0.2.0
 
 - **Use hermes-router as an AI model.** Registers a Language Model provider, so hermes-router

@@ -80,13 +80,11 @@ export class RouterClient {
 
   /**
    * Stream a chat completion from the router. POSTs an OpenAI-format request with
-   * stream:true to /v1/chat/completions and invokes onText() for each content
-   * delta. Resolves when the stream ends; aborts when onAbort fires.
+   * stream:true to /v1/chat/completions, invoking onText() for each content delta
+   * and (once accumulated) onToolCall() for each tool call. Resolves when the
+   * stream ends; aborts cleanly when the caller's cancel fires.
    */
-  streamChat(
-    messages: ChatMessage[],
-    opts: { onText: (delta: string) => void; onAbort?: (cancel: () => void) => void }
-  ): Promise<void> {
+  streamChat(opts: StreamOpts): Promise<void> {
     return new Promise((resolve, reject) => {
       let url: URL;
       try {
@@ -95,7 +93,31 @@ export class RouterClient {
         return reject(new Error(`bad URL: ${this.base()}`));
       }
       const lib = url.protocol === "https:" ? https : http;
-      const payload = JSON.stringify({ model: "hermes-router", messages, stream: true });
+      const body: any = { model: "hermes-router", messages: opts.messages, stream: true };
+      if (opts.tools && opts.tools.length) {
+        body.tools = opts.tools;
+        body.tool_choice = opts.toolChoice || "auto";
+      }
+      const payload = JSON.stringify(body);
+
+      // Accumulate streamed tool-call fragments by index: id + name arrive once,
+      // arguments come in pieces across deltas.
+      const toolAcc: Record<number, { id: string; name: string; args: string }> = {};
+      const flushToolCalls = () => {
+        if (!opts.onToolCall) return;
+        for (const k of Object.keys(toolAcc)) {
+          const tc = toolAcc[+k];
+          if (!tc.name) continue;
+          let input: object = {};
+          try {
+            input = tc.args ? JSON.parse(tc.args) : {};
+          } catch {
+            input = {};
+          }
+          opts.onToolCall(tc.id || `call_${k}`, tc.name, input);
+        }
+      };
+
       const req = lib.request(
         url,
         {
@@ -131,23 +153,36 @@ export class RouterClient {
               if (!data || data === "[DONE]") continue;
               try {
                 const ev = JSON.parse(data);
-                const delta = ev?.choices?.[0]?.delta?.content;
-                if (typeof delta === "string" && delta) opts.onText(delta);
+                const delta = ev?.choices?.[0]?.delta;
+                if (!delta) continue;
+                if (typeof delta.content === "string" && delta.content) opts.onText(delta.content);
+                if (Array.isArray(delta.tool_calls)) {
+                  for (const tc of delta.tool_calls) {
+                    const i = typeof tc.index === "number" ? tc.index : 0;
+                    const acc = (toolAcc[i] = toolAcc[i] || { id: "", name: "", args: "" });
+                    if (tc.id) acc.id = tc.id;
+                    if (tc.function?.name) acc.name = tc.function.name;
+                    if (tc.function?.arguments) acc.args += tc.function.arguments;
+                  }
+                }
               } catch {
                 /* ignore keepalive / partial lines */
               }
             }
           });
-          res.on("end", () => resolve());
+          res.on("end", () => {
+            flushToolCalls();
+            resolve();
+          });
           res.on("error", reject);
         }
       );
       req.on("timeout", () => req.destroy(new Error("request timed out")));
+      let cancelled = false;
       req.on("error", (e: any) => {
-        if (e?.code === "ECONNRESET" && cancelled) resolve(); // aborted by user
+        if (cancelled) resolve(); // aborted by user
         else reject(e);
       });
-      let cancelled = false;
       opts.onAbort?.(() => {
         cancelled = true;
         req.destroy();
@@ -158,7 +193,29 @@ export class RouterClient {
   }
 }
 
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+}
+
+export interface ToolDef {
+  type: "function";
+  function: { name: string; description: string; parameters: object };
+}
+
+export interface StreamOpts {
+  messages: ChatMessage[];
+  tools?: ToolDef[];
+  toolChoice?: "auto" | "required";
+  onText: (delta: string) => void;
+  onToolCall?: (callId: string, name: string, input: object) => void;
+  onAbort?: (cancel: () => void) => void;
 }

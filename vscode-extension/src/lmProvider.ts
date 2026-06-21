@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
-import { RouterClient, ChatMessage } from "./client";
+import { RouterClient, ChatMessage, ToolDef } from "./client";
 
 /**
  * Registers hermes-router as a VS Code Language Model provider, so it appears in
  * Copilot Chat's model picker (and is usable by any vscode.lm consumer). The one
- * logical model "hermes-router" fans out across the router's free pool.
+ * logical model "hermes-router" fans out across the router's free pool, including
+ * tool calling for agent mode.
  */
 export class HermesChatModelProvider implements vscode.LanguageModelChatProvider {
   constructor(private getClient: () => RouterClient) {}
@@ -21,7 +22,7 @@ export class HermesChatModelProvider implements vscode.LanguageModelChatProvider
         version: "1.0.0",
         maxInputTokens: 32000,
         maxOutputTokens: 8192,
-        capabilities: { toolCalling: false, imageInput: false },
+        capabilities: { toolCalling: true, imageInput: false },
       },
     ];
   }
@@ -29,13 +30,33 @@ export class HermesChatModelProvider implements vscode.LanguageModelChatProvider
   async provideLanguageModelChatResponse(
     _model: vscode.LanguageModelChatInformation,
     messages: readonly vscode.LanguageModelChatRequestMessage[],
-    _options: vscode.ProvideLanguageModelChatResponseOptions,
+    options: vscode.ProvideLanguageModelChatResponseOptions,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken
   ): Promise<void> {
-    const oai = messages.map(toOpenAI);
-    await this.getClient().streamChat(oai, {
+    const oai: ChatMessage[] = messages.flatMap(toOpenAIMessages);
+
+    let tools: ToolDef[] | undefined;
+    let toolChoice: "auto" | "required" | undefined;
+    if (options.tools && options.tools.length) {
+      tools = options.tools.map((t) => ({
+        type: "function" as const,
+        function: {
+          name: t.name,
+          description: t.description || "",
+          parameters: (t.inputSchema as object) || { type: "object", properties: {} },
+        },
+      }));
+      toolChoice = options.toolMode === vscode.LanguageModelChatToolMode.Required ? "required" : "auto";
+    }
+
+    await this.getClient().streamChat({
+      messages: oai,
+      tools,
+      toolChoice,
       onText: (delta) => progress.report(new vscode.LanguageModelTextPart(delta)),
+      onToolCall: (callId, name, input) =>
+        progress.report(new vscode.LanguageModelToolCallPart(callId, name, input)),
       onAbort: (cancel) => token.onCancellationRequested(() => cancel()),
     });
   }
@@ -57,8 +78,65 @@ function messageText(msg: vscode.LanguageModelChatRequestMessage): string {
     .join("");
 }
 
-/** Translate a VS Code chat message to an OpenAI chat-completions message (v1: text only). */
-function toOpenAI(msg: vscode.LanguageModelChatRequestMessage): ChatMessage {
-  const role = msg.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" : "user";
-  return { role, content: messageText(msg) };
+/** Extract plain text from a tool result's content parts. */
+function toolResultText(part: vscode.LanguageModelToolResultPart): string {
+  const out: string[] = [];
+  for (const c of (part.content as any[]) || []) {
+    if (c instanceof vscode.LanguageModelTextPart) out.push(c.value);
+    else if (typeof c === "string") out.push(c);
+    else {
+      try {
+        out.push(JSON.stringify(c));
+      } catch {
+        /* skip non-serializable parts */
+      }
+    }
+  }
+  return out.join("");
+}
+
+/**
+ * Translate one VS Code chat message into one OR MORE OpenAI messages:
+ * - Assistant + tool-call parts → assistant message with `tool_calls`
+ * - User + tool-result parts → one `tool` message per result (+ any user text)
+ * - otherwise → a plain user/assistant text message
+ */
+function toOpenAIMessages(msg: vscode.LanguageModelChatRequestMessage): ChatMessage[] {
+  const isAssistant = msg.role === vscode.LanguageModelChatMessageRole.Assistant;
+  const parts = (msg.content as any[]) || [];
+  const text = parts
+    .filter((p) => p instanceof vscode.LanguageModelTextPart)
+    .map((p: any) => p.value)
+    .join("");
+  const toolCalls = parts.filter((p) => p instanceof vscode.LanguageModelToolCallPart) as vscode.LanguageModelToolCallPart[];
+  const toolResults = parts.filter((p) => p instanceof vscode.LanguageModelToolResultPart) as vscode.LanguageModelToolResultPart[];
+
+  const out: ChatMessage[] = [];
+
+  if (isAssistant) {
+    if (toolCalls.length) {
+      out.push({
+        role: "assistant",
+        content: text || null,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.callId,
+          type: "function",
+          function: { name: tc.name, arguments: JSON.stringify(tc.input ?? {}) },
+        })),
+      });
+    } else {
+      out.push({ role: "assistant", content: text });
+    }
+    return out;
+  }
+
+  // User message: tool results become `tool` messages (must precede any user text
+  // so they immediately follow the assistant tool-call message).
+  for (const tr of toolResults) {
+    out.push({ role: "tool", tool_call_id: tr.callId, content: toolResultText(tr) });
+  }
+  if (text || out.length === 0) {
+    out.push({ role: "user", content: text });
+  }
+  return out;
 }
