@@ -458,6 +458,19 @@ def _build_providers() -> list[dict]:
             "keys":     huggingface_keys,
         })
 
+    # Kimi (Moonshot) — the "Kimi coding plan" subscription exposes an
+    # OpenAI-compatible endpoint and authenticates with a normal API key (sk-...),
+    # so it drops in like any other provider. Model id `kimi-for-coding`. Get a key
+    # from platform.kimi.ai / platform.moonshot.ai.
+    kimi_keys = _keys_for("kimi", "KIMI_API_KEYS")
+    if kimi_keys:
+        providers.append({
+            "name":     "kimi",
+            "base_url": os.environ.get("KIMI_BASE_URL", "https://api.kimi.com/coding/v1"),
+            "model":    os.environ.get("KIMI_MODEL", "kimi-for-coding"),
+            "keys":     kimi_keys,
+        })
+
     openai_keys = _keys_for("openai", "OPENAI_API_KEYS")
     if openai_keys:
         providers.append({

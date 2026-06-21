@@ -64,13 +64,29 @@ next. Override the model with `CODEX_MODEL` (default `gpt-5.5`).
 > area in OpenAI's terms and could risk your account. Use your own accounts, at your own
 > discretion.
 
+## Kimi (Moonshot coding plan)
+
+The **Kimi coding plan** (Moonshot) is a subscription, but — unlike Codex — it authenticates
+with a normal **API key** (`sk-...`), not OAuth. Its endpoint is OpenAI-compatible, so it adds
+like any other provider:
+
+```bash
+hr auth add kimi        # paste your Kimi/Moonshot key
+hr restart
+```
+
+Defaults to `https://api.kimi.com/coding/v1` with model `kimi-for-coding`. Using the standard
+Moonshot API instead of the coding plan? Point it elsewhere with `KIMI_BASE_URL`
+(e.g. `https://api.moonshot.ai/v1`) and set `KIMI_MODEL` to a model like `kimi-k2-0905-preview`.
+Get a key at [platform.kimi.ai](https://platform.kimi.ai) / [platform.moonshot.ai](https://platform.moonshot.ai).
+
 ## Valid provider names
 
 Use these names with `hr auth add`, `hr model set`, and the `<PROVIDER>_*` environment
 variables:
 
 `gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`, `groq`, `mistral`,
-`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `openai`, `anthropic`, `codex`.
+`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `kimi`, `openai`, `anthropic`, `codex`.
 
 ## Per-provider capabilities
 
