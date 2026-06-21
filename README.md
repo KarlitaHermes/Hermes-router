@@ -39,6 +39,7 @@ Prometheus `/metrics` · one structured `auth.json` for all your keys.
 - **[Configuration](documentation/configuration.md)** — `auth.json`, all `.env` settings, model overrides
 - **[Deployment](documentation/deployment.md)** — Windows/macOS/Linux support, Docker, Hugging Face Spaces
 - **[Monitoring](documentation/monitoring.md)** — `hr status`, Prometheus `/metrics`, `/v1/status`
+- **[VS Code Extension](documentation/vscode-extension.md)** — monitor & manage the router, and use it as a model in Copilot Chat
 
 ---
 
@@ -60,7 +61,7 @@ flows through it like this:
                                                            │ first one that succeeds
                                            ┌───────────────▼─────────────────────┐
                                            │ Gemini · OpenRouter · Groq · Mistral │
-                                           │ Cohere · NVIDIA · Codex · … (15)     │
+                                           │ Cohere · NVIDIA · Codex · Kimi (16)  │
                                            └──────────────────────────────────────┘
 ```
 

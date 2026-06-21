@@ -24,7 +24,7 @@ Every request flows through the same pipeline:
                                                                   │ first one that succeeds
                                                   ┌───────────────▼─────────────────────┐
                                                   │ Gemini · OpenRouter · Groq · Mistral │
-                                                  │ Cohere · NVIDIA · Codex · … (15)     │
+                                                  │ Cohere · NVIDIA · Codex · Kimi (16)  │
                                                   └──────────────────────────────────────┘
 ```
 
@@ -97,6 +97,26 @@ can override any result with `<PROVIDER>_SUPPORTS_TOOLS` / `<PROVIDER>_REASONING
 Reasoning models spend output tokens on hidden chain-of-thought, so the router reserves extra
 output budget (`REASONING_TOKEN_RESERVE`) to stop a small `max_tokens` from yielding an empty reply.
 
+### Request guardrails
+
+The router defends itself and avoids wasted upstream calls:
+
+- **Body-size limit** — requests larger than `MAX_REQUEST_BYTES` (default 10 MB) are rejected
+  with `413` before any provider is contacted, so a buggy client can't exhaust memory.
+- **Large-payload skip** — some free tiers reject big requests outright (e.g. Groq ~6K
+  tokens/min → `413`). When a request is estimated to exceed a provider's ceiling
+  (`<PROVIDER>_SKIP_TOKENS_OVER`), that provider is skipped and the router cascades on instead of
+  burning a guaranteed-failed attempt.
+- **Output clamp** — providers that `400` when `max_tokens` exceeds their output cap have the
+  requested output transparently clamped down to their ceiling (`<PROVIDER>_MAX_OUTPUT_TOKENS`),
+  so the call still succeeds.
+
+### Concurrency
+
+The server runs on Waitress with a configurable thread pool (`WORKER_THREADS`, default 16). The
+upstream HTTP connection pool scales with that automatically, and streaming responses close their
+upstream connection cleanly when the stream ends or the client disconnects.
+
 ## Protocol translation
 
 Your app always speaks one format; the router adapts to whatever the chosen provider needs.
@@ -133,6 +153,24 @@ Your app always speaks one format; the router adapts to whatever the chosen prov
 `hr status` renders a live dashboard (provider health, latency, key cooldowns, cache, rotation
 mode) from `/v1/status`. `/metrics` exposes Prometheus counters and gauges for Grafana — counts
 and timings only, never request content. See [Monitoring](/monitoring/).
+
+## Ways to run and connect
+
+The same `router.py` engine runs everywhere; you choose how to launch it and how to drive it.
+
+**Run it:**
+
+- **`hr` CLI** *(Linux/macOS/WSL)* — `hr setup`, `hr auth add`, `hr status`, `hr restart`. The
+  friendly day-to-day way to manage a local router. See [Deployment](/deployment/#path-2-linux--macos-the-hr-way).
+- **Docker image** — the prebuilt multi-arch [`shafiq735/hermes-router`](https://hub.docker.com/r/shafiq735/hermes-router)
+  runs the same on Windows, macOS, and Linux: `docker run -p 8319:8319 …`. See [Deployment](/deployment/#path-1-docker-easiest-any-os).
+- **Hugging Face Space** — host it in the cloud for free. See [Deployment](/deployment/#path-4-hugging-face-space-host-it-online).
+
+**Connect to it:**
+
+- **Any OpenAI or Anthropic SDK** — point `base_url` at the router and you're done. See [Usage](/usage/).
+- **VS Code extension** — monitor the provider pool, manage the router, *and* use hermes-router
+  as a model inside Copilot Chat (including agent mode). See [VS Code Extension](/vscode-extension/).
 
 ## Design principles
 

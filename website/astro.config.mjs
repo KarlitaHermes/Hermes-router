@@ -41,6 +41,12 @@ export default defineConfig({
 						{ label: 'Monitoring', slug: 'monitoring' },
 					],
 				},
+				{
+					label: 'Tools',
+					items: [
+						{ label: 'VS Code Extension', slug: 'vscode-extension' },
+					],
+				},
 			],
 		}),
 	],
