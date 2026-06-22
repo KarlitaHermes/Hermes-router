@@ -89,6 +89,19 @@ Add more `-e <PROVIDER>_API_KEYS=…` for other providers (see [providers.md](/p
 Then `curl http://localhost:8319/health`. To persist keys/state instead of passing env vars,
 mount a volume with an `auth.json` (and set `-e ROUTER_STATE_FILE=/tmp/router_state.json`).
 
+> **Windows (PowerShell / Command Prompt): put it on one line.** The `\` line-continuation
+> above is Linux/macOS shell syntax — on Windows it errors with `docker: invalid reference
+> format` and `'-e' is not recognized`. Use a single line instead:
+>
+> ```powershell
+> docker run -d --name hermes-router -p 8319:8319 -e GEMINI_API_KEYS=your-gemini-key -e PROXY_API_KEYS=sk-router-1 shafiq735/hermes-router
+> ```
+>
+> (PowerShell's line-continuation character is a backtick `` ` ``, not `\`, if you want to split
+> it across lines.) `PROXY_API_KEYS=sk-router-1` here matches the VS Code extension's default
+> `apiKey`, so the extension connects with no extra config — pick your own secret only if you
+> also set `hermesRouter.apiKey` to the same value.
+
 ### Or build from source with Compose
 
 **Step 1 — get the code.**
@@ -184,10 +197,39 @@ three options, easiest first.
 
 1. Install **Docker Desktop** from [docker.com](https://www.docker.com/products/docker-desktop/)
    and start it (wait until the whale icon says "running").
-2. Open **PowerShell** and follow [Path 1 — Docker](#path-1-docker-easiest-any-os) above. The
-   commands are identical.
+2. Open **PowerShell** and run the prebuilt image **as a single line** (the `\` multi-line form
+   in [Path 1](#path-1-docker-easiest-any-os) is Linux syntax and PowerShell rejects it):
+
+   ```powershell
+   docker run -d --name hermes-router -p 8319:8319 -e GEMINI_API_KEYS=your-gemini-key -e PROXY_API_KEYS=sk-router-1 shafiq735/hermes-router
+   ```
+3. In Docker Desktop → **Containers**, check that the row shows **Port(s) = `8319:8319`**. If
+   that column is **blank**, the container has no published port (the `-p` was dropped) and
+   nothing on your PC can reach it — remove it and re-run the command above (you can't add a port
+   to an existing container):
+
+   ```powershell
+   docker rm -f hermes-router
+   ```
+4. Browse to <http://localhost:8319/health> — you should see `{"status":"ok",...}`.
 
 This is the smoothest Windows experience — no Python, no bash, nothing to configure.
+
+#### Connecting the VS Code extension to this container
+
+The [VS Code extension](/vscode-extension/) talks to the router over HTTP, so it works against
+your Docker container. In the extension settings:
+
+- **`hermesRouter.baseUrl`** → `http://localhost:8319`
+- **`hermesRouter.apiKey`** → the **same value as the container's `PROXY_API_KEYS`** (`sk-router-1`
+  in the command above).
+
+> A red **`401 unauthorized — check hermesRouter.apiKey`** in the dashboard means those two
+> values don't match — fix `apiKey` to equal `PROXY_API_KEYS` and click **Refresh**.
+
+The extension's **Add key / Restart** buttons stay disabled with a Docker note — there's no `hr`
+CLI inside a container. To add a provider, re-run the container with another
+`-e <PROVIDER>_API_KEYS=…`; to "restart", use `docker restart hermes-router`.
 
 ### 3b. WSL2 (full `hr` experience)
 
