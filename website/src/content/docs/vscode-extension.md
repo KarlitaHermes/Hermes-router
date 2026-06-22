@@ -49,6 +49,7 @@ After installing, tell the extension where your router is and how to authenticat
 | `hermesRouter.baseUrl` | `http://localhost:8319` | Your router's URL. For a remote router, use its full URL (e.g. your Space `https://you-hermes.hf.space`). |
 | `hermesRouter.apiKey` | `sk-router-1` | Any value from your router's `PROXY_API_KEYS`. Used to read status and to chat. |
 | `hermesRouter.hrPath` | `hr` | Path to the `hr` CLI, for the local *manage* actions. Usually leave as-is. |
+| `hermesRouter.dockerContainer` | *(empty)* | Set to your container's name to manage a router running in **Docker** (see [below](#managing-a-router-running-in-docker)). |
 | `hermesRouter.refreshSeconds` | `10` | How often the dashboard and status bar refresh. |
 
 If you run the router on your own machine with the defaults, you don't need to change
@@ -109,6 +110,44 @@ dashboard has buttons for them too):
 
 ---
 
+## Managing a router running in Docker
+
+If your router runs in a **Docker container** (common on Windows), there's no `hr` on your host —
+so by default the manage buttons can't do anything. Instead, point the extension at the container
+and it will manage it *through Docker*.
+
+**1. Run the `:cli` image with a volume.** The standard image is just the router; the **`:cli`**
+variant also bundles the `hr` CLI, and the volume keeps your keys/settings across restarts:
+
+```bash
+docker run -d --name hermes-router -p 8319:8319 \
+  -v hermes-data:/app/data -e PROXY_API_KEYS=sk-router-1 \
+  shafiq735/hermes-router:cli
+```
+
+(On Windows PowerShell, put that on one line — see [Deployment](/deployment/#path-1-docker-easiest-any-os).)
+
+**2. Tell the extension the container name.** In settings, set **`hermesRouter.dockerContainer`**
+to `hermes-router` (and keep `baseUrl` = `http://localhost:8319`, `apiKey` = your `PROXY_API_KEYS`).
+
+Now the manage buttons run against the container:
+
+| Button | Runs |
+|---|---|
+| **Add Key** / **Import Codex** | a terminal with `docker exec -it <container> hr auth add …` — you type the key **inside the container** (the extension never sees it), then it `docker restart`s to apply |
+| **Set Model** / **Rotation** | `docker exec <container> hr …` then `docker restart <container>` |
+| **Restart** | `docker restart <container>` — *not* `hr restart` (that would stop the container) |
+
+Requires the **`docker` CLI** on your PATH (Docker Desktop provides it). Because keys/settings
+live on the `/app/data` volume, they survive `docker restart` and even recreating the container
+(as long as you reuse the same volume).
+
+> **Why a volume?** Without `-v …:/app/data`, anything you add with the buttons lives only inside
+> that container and is lost the moment it's recreated. The volume is what makes in-place
+> management stick.
+
+---
+
 ## Use hermes-router as an AI model (Copilot Chat)
 
 This is the headline feature. The extension registers **hermes-router** as a language model in
@@ -151,9 +190,10 @@ sends tool-using requests only to providers whose models support function callin
 : Those commands use the `hr` CLI, which is the **Linux/macOS/WSL** helper — it doesn't exist on
   a plain **Windows** host, and you don't use it when the **router runs in Docker**. So manage the
   router the way that matches how you run it:
-  - **Docker:** set provider keys as container env vars (`-e GEMINI_API_KEYS=…`, `-e PROXY_API_KEYS=…`)
-    or mount an `auth.json`, and apply changes with `docker restart <container>` (not the extension's
-    "Restart"). See [Deployment → Docker](/deployment/#path-1-docker-easiest-any-os).
+  - **Docker:** either set `hermesRouter.dockerContainer` to your container name to manage it
+    in-place (see [Managing a router running in Docker](#managing-a-router-running-in-docker)), or
+    set provider keys as container env vars (`-e GEMINI_API_KEYS=…`) and apply with
+    `docker restart <container>`. See [Deployment → Docker](/deployment/#path-1-docker-easiest-any-os).
   - **Windows without Docker:** run the router under **WSL2**, where `hr` works — see
     [Deployment → Windows](/deployment/#path-3-windows).
   - The dashboard and "use as a model" features work regardless; only the `hr`-based controls need it.

@@ -42,11 +42,34 @@ commands — the `hr` CLI on your PATH. See the
 | `hermesRouter.baseUrl` | `http://localhost:8319` | Router URL. Use your Space URL for a remote router. |
 | `hermesRouter.apiKey` | `sk-router-1` | A value from `PROXY_API_KEYS` — used to read `/v1/status`. |
 | `hermesRouter.hrPath` | `hr` | Path to the `hr` CLI (for local control actions). |
+| `hermesRouter.dockerContainer` | `` | Container name to manage the router via Docker (see below). |
 | `hermesRouter.refreshSeconds` | `10` | Dashboard / status-bar refresh interval. |
 
 > **Remote routers:** Monitoring works over HTTP against any `baseUrl`. The control commands
 > use the local `hr` CLI, so they're disabled (with a notice) when `baseUrl` is not localhost —
 > manage a remote router where it's hosted.
+
+## Managing a router running in Docker
+
+On Windows (or anywhere the router runs in a container) there's no `hr` on your host. Set
+**`hermesRouter.dockerContainer`** to your container's name and the control buttons run against
+the container instead:
+
+- **Add Key / Import Codex** → open a terminal running `docker exec -it <container> hr …` (you
+  type the key into the container, the extension never sees it), then `docker restart` to apply.
+- **Set Model / Rotation** → `docker exec <container> hr …` then `docker restart`.
+- **Restart** → `docker restart <container>` (not `hr restart`, which would stop the container).
+
+This needs the **`:cli`** image variant run with a volume so changes persist:
+
+```bash
+docker run -d --name hermes-router -p 8319:8319 \
+  -v hermes-data:/app/data -e PROXY_API_KEYS=sk-router-1 \
+  shafiq735/hermes-router:cli
+```
+
+Then set `hermesRouter.dockerContainer` to `hermes-router`. Requires the `docker` CLI on your
+PATH (Docker Desktop provides it).
 
 ## Install
 

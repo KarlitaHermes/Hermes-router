@@ -3,7 +3,7 @@ import { RouterClient } from "./client";
 import { StatusBar } from "./statusBar";
 import { DashboardProvider } from "./dashboard";
 import { HermesChatModelProvider } from "./lmProvider";
-import { runHr, runHrTerminal } from "./cli";
+import { runHr, runHrTerminal, isDocker } from "./cli";
 
 const PROVIDERS = [
   "gemini", "openrouter", "sambanova", "github_models", "cerebras", "groq",
@@ -65,6 +65,14 @@ export function activate(context: vscode.ExtensionContext) {
   });
   reg("hermesRouter.doctor", () => runHr(out, ["doctor"]));
   reg("hermesRouter.update", async () => {
+    if (isDocker()) {
+      vscode.window.showInformationMessage(
+        "To update a Docker router, pull a newer image and recreate the container — " +
+          "e.g. `docker pull shafiq735/hermes-router:cli` then re-run it. `hr update` " +
+          "doesn't apply inside a container."
+      );
+      return;
+    }
     await runHr(out, ["update"]);
     await refresh();
   });
@@ -75,7 +83,17 @@ export function activate(context: vscode.ExtensionContext) {
     });
     if (provider) runHrTerminal(["auth", "add", provider]);
   });
-  reg("hermesRouter.importCodex", () => runHrTerminal(["auth", "import-codex"]));
+  reg("hermesRouter.importCodex", () => {
+    if (isDocker()) {
+      vscode.window.showInformationMessage(
+        "Codex import reads your ChatGPT login (~/.codex) from this machine — it isn't inside " +
+          "the container. Mount it when you run the container (`-v ~/.codex:/root/.codex`) and " +
+          "then import, or import on the host."
+      );
+      return;
+    }
+    runHrTerminal(["auth", "import-codex"]);
+  });
 
   reg("hermesRouter.setModel", async () => {
     const provider = await vscode.window.showQuickPick(PROVIDERS, {

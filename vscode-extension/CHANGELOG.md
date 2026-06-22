@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- **Manage a router running in Docker.** New `hermesRouter.dockerContainer` setting — set it to
+  your container's name and the control actions run against the container instead of the host:
+  **Add Key / Import Codex** open a terminal running `docker exec -it <container> hr …` (you type
+  the key inside the container, then it `docker restart`s to apply); **Set Model / Rotation** run
+  `docker exec <container> hr …` then restart; **Restart** runs `docker restart <container>`
+  (never `hr restart`, which would kill the container's main process).
+- Requires the new **`:cli`** image variant (e.g. `shafiq735/hermes-router:cli`) run with a
+  mounted volume (`-v hermes-data:/app/data`) so keys/model/rotation persist across restarts.
+- **Update** and **Import Codex** show Docker-specific guidance instead of running (you update a
+  container by pulling a new image; the Codex login lives on your machine, not the container).
+
 ## 0.3.1
 
 - **Friendlier control errors when `hr` isn't installed.** The Restart / Add Key / Model /

@@ -227,9 +227,19 @@ your Docker container. In the extension settings:
 > A red **`401 unauthorized — check hermesRouter.apiKey`** in the dashboard means those two
 > values don't match — fix `apiKey` to equal `PROXY_API_KEYS` and click **Refresh**.
 
-The extension's **Add key / Restart** buttons stay disabled with a Docker note — there's no `hr`
-CLI inside a container. To add a provider, re-run the container with another
-`-e <PROVIDER>_API_KEYS=…`; to "restart", use `docker restart hermes-router`.
+**Want the Add key / Restart / Model buttons to work too?** The plain image has no `hr` inside it,
+so use the **`:cli`** image variant with a volume, and tell the extension the container name:
+
+```powershell
+docker run -d --name hermes-router -p 8319:8319 -v hermes-data:/app/data -e PROXY_API_KEYS=sk-router-1 shafiq735/hermes-router:cli
+```
+
+Then set **`hermesRouter.dockerContainer`** to `hermes-router`. Now the buttons run via
+`docker exec`/`docker restart` against the container, and the `/app/data` volume keeps your keys
+and settings across restarts. Full details: [VS Code Extension → Docker](/vscode-extension/#managing-a-router-running-in-docker).
+
+(Sticking with the plain image? Add providers by re-running with another `-e <PROVIDER>_API_KEYS=…`
+and "restart" with `docker restart hermes-router`.)
 
 ### 3b. WSL2 (full `hr` experience)
 

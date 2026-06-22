@@ -2,7 +2,7 @@
   "name": "hermes-router",
   "displayName": "hermes-router",
   "description": "Control panel for hermes-router — monitor provider health and manage your free-tier AI load balancer from VS Code.",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "publisher": "MohammedShafiq",
   "license": "MIT",
   "icon": "icon.png",
@@ -76,6 +76,11 @@
           "type": "string",
           "default": "hr",
           "description": "Path to the `hr` CLI (used for local control actions)."
+        },
+        "hermesRouter.dockerContainer": {
+          "type": "string",
+          "default": "",
+          "description": "Name (or ID) of the Docker container running hermes-router. When set, control actions run via `docker exec <container> hr …` and Restart runs `docker restart <container>`. Requires the `:cli` image (e.g. shafiq735/hermes-router:cli) with a mounted volume so changes persist. Leave blank for a non-Docker local install."
         },
         "hermesRouter.refreshSeconds": {
           "type": "number",

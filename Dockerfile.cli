@@ -1,0 +1,41 @@
+# hermes-router :cli — same router, plus the `hr` CLI bundled inside the image.
+#
+# This variant exists so the VS Code extension's "Docker mode" can manage the
+# router with `docker exec <container> hr …` (add keys, set model/rotation) and
+# `docker restart <container>` to apply. Mutable config lives on a volume at
+# /app/data, so keys/model/rotation survive container recreation.
+#
+# Run it with a volume:
+#   docker run -d --name hermes-router -p 8319:8319 \
+#     -v hermes-data:/app/data -e PROXY_API_KEYS=sk-router-1 \
+#     shafiq735/hermes-router:cli
+FROM python:3.12-slim
+
+# bash (the hr scripts) + curl (hr status/doctor health checks).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bash curl \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY router.py hermes-router ./
+COPY scripts ./scripts
+
+# Put `hr` (and the full name) on PATH.
+RUN chmod +x hermes-router scripts/*.sh \
+ && ln -s /app/hermes-router /usr/local/bin/hr \
+ && ln -s /app/hermes-router /usr/local/bin/hermes-router
+
+# Persist mutable config on a volume. auth.json + runtime state are redirected
+# there via env vars; .env is a symlink so `hr mode` / `hr model set` (which
+# write $REPO/.env) land on the volume too, and the router reads it back.
+RUN mkdir -p /app/data && ln -s /app/data/.env /app/.env
+ENV ROUTER_AUTH_FILE=/app/data/auth.json \
+    ROUTER_STATE_FILE=/app/data/router_state.json
+VOLUME ["/app/data"]
+
+EXPOSE 8319
+CMD ["python", "router.py"]
