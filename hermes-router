@@ -12,6 +12,9 @@
 #   hr model reset <provider>         Revert a provider to its default model
 #   hr mode                           Show how keys are rotated within a provider
 #   hr mode <round-robin|sequential>  Set the key rotation mode
+#   hr limit list                     Show per-proxy-key rate/budget limits
+#   hr limit set <key> [opts]         Set a key's rpm / req-per-day / tokens-per-day
+#   hr limit clear <key>              Remove a key's limits
 #   hr start                          Run the router (same as: python router.py)
 #   hr status                         Live health dashboard for the running router
 #   hr restart                        Restart the router so key/config changes take effect
@@ -58,6 +61,9 @@ case "$cmd" in
     ;;
   mode)
     exec "$REPO/scripts/mode.sh" "$@"
+    ;;
+  limit)
+    exec "$REPO/scripts/limit.sh" "$@"
     ;;
   status)
     exec "$REPO/scripts/status.sh" "$@"

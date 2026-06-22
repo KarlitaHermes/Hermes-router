@@ -68,6 +68,13 @@ The router picks the cheapest model that can handle the request. Tool requests a
 providers whose model supports function calling (detected at startup). Optional **fast routing**
 (`FAST_ROUTE_THRESHOLD`) sends short requests to low-latency providers first.
 
+**Local models & conversation mode.** A model running on your own machine (Ollama / LM Studio /
+llama.cpp) can join the pool as the `local` provider — free, private, fast (see
+[Providers](/providers/#local-models-ollama--lm-studio--llamacpp)). Sending the model id
+`hermes-router:fast` (or header `X-Hermes-Profile: fast`) makes the router prefer that local
+model for short/casual turns, with the cloud providers as automatic fallback for heavier
+requests.
+
 ### Failover & circuit breaker
 
 If a provider errors or times out, the router cascades to the next automatically. A provider
@@ -81,6 +88,21 @@ Identical requests can be served from an in-memory TTL+LRU cache, saving free-ti
 entries are **namespaced by the caller's API key**, so two different `PROXY_API_KEYS` never share
 a cached answer for the same prompt — safe to expose to multiple users. Disable with
 `CACHE_TTL_SECONDS=0`.
+
+**Semantic cache** (opt-in, `SEMANTIC_CACHE=1`) goes a step further: on an exact-match miss it
+embeds the prompt (reusing the router's own embeddings pipeline) and returns a cached answer
+whose stored prompt is *similar* above `SEMANTIC_CACHE_THRESHOLD` (cosine). It's a bounded linear
+scan over the LRU within the caller's namespace, and degrades gracefully to exact-match when no
+embedding provider is available — so it adds savings without changing behavior when off.
+
+### Per-key budgets & rate limits
+
+Each `PROXY_API_KEYS` entry can carry a requests-per-minute ceiling and per-UTC-day request and
+token budgets (set globally via `PROXY_LIMIT_*` or per key in `auth.json` with `hr limit`). A
+caller over its limit gets a `429` with `Retry-After` *before* any provider is contacted; live
+counters appear in `/v1/status`. Unset = unlimited, so single-user setups are unaffected. This
+makes the router safe to share with a team. See
+[Configuration](/configuration/#per-key-budgets--rate-limits).
 
 ### Accurate token counting
 

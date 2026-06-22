@@ -11,6 +11,10 @@ const PROVIDERS = [
   "openai", "anthropic",
 ];
 
+// Providers whose model can be set via `hr model set`. Includes `local` (Ollama /
+// LM Studio / llama.cpp), which is keyless so it isn't in the key-add list above.
+const MODEL_PROVIDERS = [...PROVIDERS, "local"];
+
 function makeClient(): RouterClient {
   const cfg = vscode.workspace.getConfiguration("hermesRouter");
   return new RouterClient(
@@ -96,7 +100,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   reg("hermesRouter.setModel", async () => {
-    const provider = await vscode.window.showQuickPick(PROVIDERS, {
+    const provider = await vscode.window.showQuickPick(MODEL_PROVIDERS, {
       placeHolder: "Provider to set model(s) for",
     });
     if (!provider) return;

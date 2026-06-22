@@ -86,9 +86,12 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
     const names = Object.keys(provs).sort();
     const cache = s.cache || {};
     const mode = (s.rotation && s.rotation.mode) || '—';
+    const limits = s.limits || {};
+    let totalTokens = 0;
 
     let rows = names.map(n => {
       const p = provs[n] || {};
+      totalTokens += (p.tokens || 0);
       const avail = p.available === false ? '<span class="down">● down</span>'
                   : p.available === true ? '<span class="ok">● up</span>'
                   : '<span class="muted">● ?</span>';
@@ -103,14 +106,32 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       return '<tr><td><b>'+esc(n)+'</b> '+avail+'<div class="models">'+esc(p.model||'')+'</div>'+models+'</td>'+
              '<td>'+(p.rating??'—')+'</td>'+
              '<td>'+esc(lat)+'</td>'+
-             '<td>'+esc(keyStr)+(caps?'<div class="models">'+esc(caps)+'</div>':'')+'</td></tr>';
+             '<td>'+esc(keyStr)+(caps?'<div class="models">'+esc(caps)+'</div>':'')+'</td>'+
+             '<td>'+(p.tokens?p.tokens.toLocaleString():'—')+'</td></tr>';
     }).join('');
+
+    const sem = cache.semantic || {};
+    const cacheStr = cache.enabled
+      ? ('hit-rate '+(cache.hit_rate??0)+' · '+(cache.size??0)+'/'+(cache.max_size??'?')
+         + (sem.enabled ? (' · semantic '+(sem.hits??0)) : ''))
+      : 'off';
+    let limitStr = '';
+    if (limits.enabled && (limits.keys||[]).length) {
+      limitStr = '<div class="meta">limits: ' + limits.keys.map(k => {
+        const L=k.limits||{}, U=k.usage||{}, parts=[];
+        if (L.rpm) parts.push((U.rpm_window||0)+'/'+L.rpm+' rpm');
+        if (L.req_per_day) parts.push((U.req_today||0)+'/'+L.req_per_day+' req');
+        if (L.tokens_per_day) parts.push((U.tokens_today||0)+'/'+L.tokens_per_day+' tok');
+        return '…'+esc(k.key_tail||'?')+' '+(parts.join(' · ')||'unlimited');
+      }).join(' &nbsp; ') + '</div>';
+    }
 
     el.innerHTML =
       '<div class="meta">rotation: <span class="pill">'+esc(mode)+'</span> &nbsp; ' +
-      'cache: '+(cache.enabled?('hit-rate '+(cache.hit_rate??0)+' · '+(cache.size??0)+'/'+(cache.max_size??'?')):'off')+'</div>' +
-      '<table><thead><tr><th>Provider</th><th>Rating</th><th>Latency</th><th>Keys</th></tr></thead><tbody>'+
-      (rows || '<tr><td colspan="4" class="muted">No providers configured.</td></tr>')+
+      'cache: '+cacheStr+(totalTokens?(' &nbsp; tokens: '+totalTokens.toLocaleString()):'')+'</div>' +
+      limitStr +
+      '<table><thead><tr><th>Provider</th><th>Rating</th><th>Latency</th><th>Keys</th><th>Tokens</th></tr></thead><tbody>'+
+      (rows || '<tr><td colspan="5" class="muted">No providers configured.</td></tr>')+
       '</tbody></table>';
   });
 </script>

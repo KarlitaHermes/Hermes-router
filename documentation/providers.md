@@ -80,13 +80,42 @@ Moonshot API instead of the coding plan? Point it elsewhere with `KIMI_BASE_URL`
 (e.g. `https://api.moonshot.ai/v1`) and set `KIMI_MODEL` to a model like `kimi-k2-0905-preview`.
 Get a key at [platform.kimi.ai](https://platform.kimi.ai) / [platform.moonshot.ai](https://platform.moonshot.ai).
 
+## Local models (Ollama / LM Studio / llama.cpp)
+
+Run a model on your **own machine** and route to it — free, private, and fast, with the cloud
+providers as automatic fallback. Any OpenAI-compatible local server works (Ollama, LM Studio,
+llama.cpp's server, vLLM…). It's **keyless**, so there's nothing to add with `hr auth add` —
+just point the router at it:
+
+```bash
+# e.g. with Ollama:  ollama serve  &&  ollama pull llama3.1
+hr model set local llama3.1     # writes LOCAL_MODEL; enables the local provider
+hr restart
+```
+
+Or set it directly in `.env`:
+
+```
+LOCAL_BASE_URL=http://localhost:11434/v1     # Ollama default (LM Studio: http://localhost:1234/v1)
+LOCAL_MODEL=llama3.1                          # comma-separate for multi-model failover
+# LOCAL_EMBED_MODEL=nomic-embed-text          # optional: also serve /v1/embeddings locally
+```
+
+The provider turns on as soon as `LOCAL_BASE_URL` or `LOCAL_MODEL` is set.
+
+**Conversation mode** — send the model id **`hermes-router:fast`** (or the header
+`X-Hermes-Profile: fast`) and the router prefers your local model for short/casual turns,
+falling back to the cloud pool for heavier requests. Plain `hermes-router` keeps the normal
+smart routing across every provider.
+
 ## Valid provider names
 
 Use these names with `hr auth add`, `hr model set`, and the `<PROVIDER>_*` environment
 variables:
 
 `gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`, `groq`, `mistral`,
-`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `kimi`, `openai`, `anthropic`, `codex`.
+`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `kimi`, `openai`, `anthropic`, `codex`,
+`local`.
 
 ## Per-provider capabilities
 

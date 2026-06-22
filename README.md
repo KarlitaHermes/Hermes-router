@@ -21,7 +21,9 @@ already talks to either works unchanged — just point it at hermes-router inste
 
 **Highlights:** OpenAI **and** Anthropic API compatible · automatic key rotation &
 failover · smart routing (sends each request to the cheapest model that can handle it) ·
-tool calling · embeddings · response caching · circuit breaker for unhealthy providers ·
+**local models** (Ollama / LM Studio) with cloud fallback · tool calling · embeddings ·
+response caching (incl. optional **semantic** cache) · **per-key budgets & rate limits** ·
+**usage analytics** (`/v1/usage`) · circuit breaker for unhealthy providers ·
 Prometheus `/metrics` · one structured `auth.json` for all your keys.
 
 ## Documentation

@@ -24,7 +24,7 @@ Quick start:
 
 import json, os, time, threading, logging, hashlib, hmac, itertools
 from pathlib import Path
-from collections import deque, OrderedDict
+from collections import deque, OrderedDict, defaultdict
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 
@@ -72,6 +72,11 @@ ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+# Semantic cache: serve a cached answer for a *similar* (not just identical) prompt,
+# by embedding prompts and comparing cosine similarity. Opt-in (needs an embedding
+# provider); falls back to exact match when off or unavailable.
+SEMANTIC_CACHE     = os.environ.get("SEMANTIC_CACHE", "0").strip().lower() not in ("0", "", "false", "no", "off")
+SEMANTIC_THRESHOLD = float(os.environ.get("SEMANTIC_CACHE_THRESHOLD", "0.95"))
 # How keys are picked within a provider:
 #   round-robin — spread requests evenly across all keys (keys deplete together)
 #   sequential  — drain one key until it rate-limits, then move on (keeps reserves fresh)
@@ -507,6 +512,19 @@ def _build_providers() -> list[dict]:
             "protocol": "codex",
         })
 
+    # Local model — Ollama / LM Studio / llama.cpp / any OpenAI-compatible server
+    # running on your own machine. Free, private, and fast. Local servers are
+    # keyless, but the rotation pool needs ≥1 entry, so we use a sentinel key
+    # (LOCAL_API_KEY, default "local") that forward() sends as a harmless Bearer
+    # header the server ignores. Enabled by setting LOCAL_BASE_URL or LOCAL_MODEL.
+    if os.environ.get("LOCAL_BASE_URL") or os.environ.get("LOCAL_MODEL"):
+        providers.append({
+            "name":     "local",
+            "base_url": os.environ.get("LOCAL_BASE_URL", "http://localhost:11434/v1"),
+            "model":    os.environ.get("LOCAL_MODEL", "llama3.1"),
+            "keys":     [os.environ.get("LOCAL_API_KEY", "local")],
+        })
+
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
@@ -756,13 +774,19 @@ def classify_complexity(messages: list) -> int:
     return 5
 
 
-def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) -> list:
+def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
+                       prefer_local: bool = False) -> list:
     """
     Sort providers for this complexity: cheapest capable model first, then
     overkill models, then too-weak as last resort. Never blocks.
 
     When FAST_ROUTE_THRESHOLD is set and the request is shorter than it,
     low-latency providers win ties between otherwise equally-ranked options.
+
+    With prefer_local (the `:fast` / conversation profile), a configured `local`
+    provider is moved to the very front for short/casual turns (complexity ≥ 3),
+    with the cloud providers as automatic fallback. Heavier turns ignore it so
+    they still go to a capable cloud model.
 
     Round-robin: providers that tie on every criterion (same rating, same
     availability) are rotated each request so load spreads across them instead
@@ -777,6 +801,8 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         rating = state.get("rating", _rate_model(p["model"]))
         avail  = state.get("available", True)
         fast   = 0 if (fast_first and p["name"] in _FAST_PROVIDERS) else 1
+        # `:fast` profile: a short/casual turn prefers the local model first.
+        local_first = 0 if (prefer_local and p["name"] == "local" and complexity >= 3) else 1
         # Health-aware terms — tier/sort_within stay FIRST so capability matching
         # is never overridden by health (a healthy weak model must not outrank the
         # correct-capability one). When every candidate is healthy these two terms
@@ -789,7 +815,9 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         else:
             tier        = 1
             sort_within = rating - complexity   # too weak — closest first
-        return (tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
+        # local_first leads the key so a preferred local model sorts ahead of all
+        # others on easy turns; it's a constant 1 otherwise, leaving order unchanged.
+        return (local_first, tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
 
     n = len(providers)
     offset = next(_rr_counter) % n if n else 0
@@ -1069,6 +1097,17 @@ stats = ProviderStats()
 
 # ── Response cache ─────────────────────────────────────────────────────────────
 
+def _cosine(a: list, b: list) -> float:
+    """Cosine similarity of two equal-length vectors. Pure Python (vectors are
+    short and the cache is bounded, so this is plenty fast); numpy not required."""
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y; na += x * x; nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
 class ResponseCache:
     """
     In-memory LRU cache for non-streaming responses.
@@ -1081,9 +1120,10 @@ class ResponseCache:
         self.ttl      = ttl
         self.max_size = max_size
         self.lock     = threading.Lock()
-        self._store: OrderedDict = OrderedDict()  # hash -> (data, timestamp)
-        self.hits     = 0
-        self.misses   = 0
+        self._store: OrderedDict = OrderedDict()  # hash -> (data, ts, ns, embedding|None)
+        self.hits          = 0
+        self.misses        = 0
+        self.semantic_hits = 0
 
     def _hash(self, payload: dict, ns: str = "") -> str:
         # Hash the entire request (minus "stream", which doesn't change the
@@ -1101,7 +1141,7 @@ class ResponseCache:
         key = self._hash(payload, ns)
         with self.lock:
             if key in self._store:
-                data, ts = self._store[key]
+                data, ts, *_ = self._store[key]
                 if time.time() - ts < self.ttl:
                     self._store.move_to_end(key)
                     self.hits += 1
@@ -1110,14 +1150,39 @@ class ResponseCache:
             self.misses += 1
         return None
 
-    def set(self, payload: dict, data: dict, ns: str = ""):
+    def set(self, payload: dict, data: dict, ns: str = "", embedding: list | None = None):
         if self.ttl <= 0:
             return
         key = self._hash(payload, ns)
         with self.lock:
             if len(self._store) >= self.max_size:
                 self._store.popitem(last=False)  # evict oldest
-            self._store[key] = (data, time.time())
+            self._store[key] = (data, time.time(), ns, embedding)
+
+    def semantic_lookup(self, query_emb: list, ns: str = "") -> dict | None:
+        """Return the cached response whose stored prompt embedding is most similar
+        to query_emb (same namespace, same vector dimension), if it clears
+        SEMANTIC_THRESHOLD. Bounded linear scan over the LRU (max_size)."""
+        if self.ttl <= 0 or not query_emb:
+            return None
+        now = time.time()
+        qlen = len(query_emb)
+        best_key, best_data, best_sim = None, None, 0.0
+        with self.lock:
+            for key, (data, ts, ens, emb) in self._store.items():
+                if emb is None or ens != ns or len(emb) != qlen:
+                    continue
+                if now - ts >= self.ttl:
+                    continue
+                sim = _cosine(query_emb, emb)
+                if sim > best_sim:
+                    best_key, best_data, best_sim = key, data, sim
+            if best_key is not None and best_sim >= SEMANTIC_THRESHOLD:
+                self._store.move_to_end(best_key)
+                self.semantic_hits += 1
+                log.info(f"  semantic match sim={best_sim:.3f}")
+                return best_data
+        return None
 
     @property
     def size(self) -> int:
@@ -1131,6 +1196,126 @@ class ResponseCache:
 
 
 cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE)
+
+# ── Per-key budgets & rate limits ("virtual keys" lite) ─────────────────────────
+# Each PROXY_API_KEYS entry can carry a requests-per-minute ceiling and per-UTC-day
+# request/token budgets, so the router is safe to share with a team. Limits come
+# from auth.json under "proxy_keys" ({ "<key>": {"rpm","req_per_day","tokens_per_day"} }),
+# with env-var globals (PROXY_LIMIT_RPM / PROXY_LIMIT_REQ_DAY / PROXY_LIMIT_TOKENS_DAY)
+# as defaults. 0/absent everywhere = unlimited → identical to the prior behavior.
+
+def _load_key_limits() -> dict:
+    g_rpm    = _int_env("PROXY_LIMIT_RPM", 0)
+    g_req    = _int_env("PROXY_LIMIT_REQ_DAY", 0)
+    g_tokens = _int_env("PROXY_LIMIT_TOKENS_DAY", 0)
+    per_key = {}
+    if AUTH_FILE.exists():
+        try:
+            doc = json.loads(AUTH_FILE.read_text())
+            pk = doc.get("proxy_keys", {})
+            if isinstance(pk, dict):
+                per_key = pk
+        except Exception as e:
+            log.warning(f"Could not read proxy_keys from {AUTH_FILE}: {e}")
+    limits = {}
+    for k in PROXY_API_KEYS:
+        spec = per_key.get(k) or {}
+        limits[k] = {
+            "rpm":            int(spec.get("rpm", g_rpm) or 0),
+            "req_per_day":    int(spec.get("req_per_day", g_req) or 0),
+            "tokens_per_day": int(spec.get("tokens_per_day", g_tokens) or 0),
+        }
+    return limits
+
+KEY_LIMITS    = _load_key_limits()
+KEY_LIMITS_ON = any(any(v.values()) for v in KEY_LIMITS.values())
+
+
+def _utc_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+def _secs_to_utc_midnight() -> int:
+    t = time.gmtime()
+    return max(1, 86400 - (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec))
+
+
+class KeyUsage:
+    """Thread-safe per-key counters: a rolling 60s window for RPM, plus per-UTC-day
+    request and token tallies. In-memory (resets on restart)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._win  = defaultdict(deque)   # key -> deque[timestamps] within the last 60s
+        self._day  = defaultdict(lambda: {"day": "", "req": 0, "tokens": 0})
+        self._life = defaultdict(lambda: {"req": 0, "tokens": 0})  # cumulative since start
+
+    def _roll(self, key, now):
+        w = self._win[key]
+        cutoff = now - 60
+        while w and w[0] < cutoff:
+            w.popleft()
+
+    def _day_bucket(self, key):
+        d = self._day[key]
+        today = _utc_day()
+        if d["day"] != today:
+            d.update(day=today, req=0, tokens=0)
+        return d
+
+    def check_and_record(self, key, limits):
+        """Atomically enforce this key's limits and, if allowed, count the request
+        (RPM window + per-day + lifetime). `limits` may be all-zero, in which case
+        nothing is gated and the request is simply recorded — so usage analytics
+        work whether or not limits are configured. Returns (ok, retry, reason)."""
+        rpm     = limits.get("rpm", 0)
+        req_day = limits.get("req_per_day", 0)
+        tpd     = limits.get("tokens_per_day", 0)
+        now = time.time()
+        with self.lock:
+            d = self._day_bucket(key)
+            self._roll(key, now)
+            if tpd and d["tokens"] >= tpd:
+                return (False, _secs_to_utc_midnight(), f"{tpd} tokens/day")
+            if rpm and len(self._win[key]) >= rpm:
+                return (False, max(1, int(60 - (now - self._win[key][0]))), f"{rpm} requests/min")
+            if req_day and d["req"] >= req_day:
+                return (False, _secs_to_utc_midnight(), f"{req_day} requests/day")
+            self._win[key].append(now)
+            d["req"] += 1
+            self._life[key]["req"] += 1
+            return (True, 0, "")
+
+    def add_tokens(self, key, n):
+        n = int(n or 0)
+        if not n:
+            return
+        with self.lock:
+            self._day_bucket(key)["tokens"] += n
+            self._life[key]["tokens"] += n
+
+    def snapshot(self, key):
+        with self.lock:
+            d = self._day_bucket(key)
+            self._roll(key, time.time())
+            l = self._life[key]
+            return {"req_today": d["req"], "tokens_today": d["tokens"],
+                    "rpm_window": len(self._win[key]),
+                    "req_total": l["req"], "tokens_total": l["tokens"]}
+
+
+key_usage = KeyUsage()
+
+# Cumulative tokens served per provider (from provider-reported usage on
+# non-streaming responses), for /v1/usage and /metrics. Streaming omits usage,
+# so those requests count toward request totals but not token totals.
+_provider_tokens = defaultdict(int)
+_ptok_lock = threading.Lock()
+
+def _add_provider_tokens(name: str, data: dict):
+    n = ((data.get("usage") or {}).get("total_tokens")) or 0
+    if n:
+        with _ptok_lock:
+            _provider_tokens[name] += n
 
 # ── Thinking field stripping ───────────────────────────────────────────────────
 # Some providers (e.g. Gemini 2.5) emit reasoning/thinking fields in responses.
@@ -1625,15 +1810,16 @@ def _supports_tools(provider: dict) -> bool:
     return True if val is None else bool(val)
 
 
-def _ordered_providers(payload: dict) -> list[dict]:
+def _ordered_providers(payload: dict, prefer_local: bool = False) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
     tasks, best model for complex ones. With FAST_ROUTE_THRESHOLD set,
-    short requests break ties in favour of low-latency providers.
+    short requests break ties in favour of low-latency providers. With
+    prefer_local (the `:fast` profile), a local model leads on easy turns.
     """
     messages   = payload.get("messages", [])
     complexity = classify_complexity(messages)
-    ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages))
+    ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages), prefer_local)
     log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
              f"order={[p['name'] for p in ordered]}")
     return ordered
@@ -1922,6 +2108,34 @@ def _embed_ordered() -> list[dict]:
                                                   stats.health_bucket(p["name"])))
 
 
+def _prompt_text(messages: list) -> str:
+    """Flatten a chat request's message text for semantic-cache embedding."""
+    return " ".join(_message_text(m) for m in messages if m.get("content")).strip()[:8000]
+
+
+def _embed_text(text: str) -> list | None:
+    """Embed text via the internal embeddings pipeline (used by the semantic cache).
+    Returns a vector, or None if no embed provider is available / all are cooling."""
+    if not text:
+        return None
+    body = {"input": text}
+    for provider in _embed_ordered():
+        em  = provider["embed_model"]
+        key = pool.get_key(provider["name"], em)
+        if not key:
+            continue
+        try:
+            resp = forward_embeddings(provider, key, body)
+        except Exception:
+            resp = None
+        if resp is not None and 200 <= resp.status_code < 300:
+            try:
+                return resp.json()["data"][0]["embedding"]
+            except Exception:
+                pass
+    return None
+
+
 def forward_embeddings(provider: dict, key: str, payload: dict) -> requests.Response | None:
     """POST an OpenAI-format embeddings request to a provider, substituting the
     provider's configured embed model. No streaming, no format translation."""
@@ -1970,6 +2184,31 @@ def _cache_ns() -> str:
     return _caller_token()
 
 
+def _admit_request(token: str):
+    """Enforce this caller's rate/budget limits AND record the request for usage
+    analytics (recording happens whether or not limits are set). Returns a Flask
+    (response, 429) tuple to short-circuit when over limit, or None to proceed."""
+    limits = KEY_LIMITS.get(token) or {}
+    ok, retry, reason = key_usage.check_and_record(token, limits)
+    if ok:
+        return None
+    resp = jsonify({"error": {"message": f"quota exceeded ({reason})",
+                              "type": "rate_limit_error"}})
+    resp.headers["Retry-After"] = str(retry)
+    return resp, 429
+
+
+def _record_request_tokens(token: str, payload: dict, result):
+    """Post-flight: add this request's tokens to the caller's tally (daily + lifetime).
+    Uses provider-reported usage when present, else an estimate (e.g. streaming)."""
+    n = 0
+    if result and result[0] == "json":
+        n = ((result[1].get("usage") or {}).get("total_tokens")) or 0
+    if not n:
+        n = _estimated_tokens(payload.get("messages", []))
+    key_usage.add_tokens(token, n)
+
+
 @app.route("/health")
 def health():
     """Unauthenticated health check for uptime monitoring."""
@@ -1981,9 +2220,12 @@ def models():
     err = _auth_check()
     if err:
         return err
-    return jsonify({"object": "list", "data": [
-        {"id": ROUTER_MODEL, "object": "model", "owned_by": "hermes-router"}
-    ]})
+    data = [{"id": ROUTER_MODEL, "object": "model", "owned_by": "hermes-router"}]
+    # Advertise the fast/conversation profile only when a local model is configured,
+    # since that's what it routes short turns to.
+    if any(p["name"] == "local" for p in PROVIDERS):
+        data.append({"id": f"{ROUTER_MODEL}:fast", "object": "model", "owned_by": "hermes-router"})
+    return jsonify({"object": "list", "data": data})
 
 
 def _route_completion(payload: dict, streaming: bool, ns: str = ""):
@@ -1995,17 +2237,42 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                                          OpenAI-format SSE regardless of upstream
         ("error",  error_dict, status)   every provider exhausted
     """
+    # Routing profile: `hermes-router:fast` (or header X-Hermes-Profile: fast)
+    # prefers a local model for short/casual turns, with cloud as fallback. We
+    # normalize the model back to the router id so the cache and upstream model
+    # selection behave exactly like a default request.
+    prefer_local = False
+    if str(payload.get("model") or "").endswith(":fast"):
+        prefer_local = True
+        payload = {**payload, "model": ROUTER_MODEL}
+    else:
+        try:
+            if request.headers.get("X-Hermes-Profile", "").strip().lower() == "fast":
+                prefer_local = True
+        except RuntimeError:
+            pass  # called outside a request context (e.g. tests)
+
     messages = payload.get("messages", [])
 
-    # Cache check (non-streaming only)
+    # Cache check (non-streaming only): exact match first (cheap), then optional
+    # semantic match. query_emb is reused to store the response so future similar
+    # prompts can match it.
+    query_emb = None
     if not streaming:
         cached = cache.get(payload, ns)
         if cached is not None:
             log.info("↩ cache hit")
             return ("json", cached)
+        if SEMANTIC_CACHE and _embed_ordered():
+            query_emb = _embed_text(_prompt_text(messages))
+            if query_emb:
+                hit = cache.semantic_lookup(query_emb, ns)
+                if hit is not None:
+                    log.info("↩ semantic cache hit")
+                    return ("json", hit)
 
     est_tokens = _estimated_tokens(messages)
-    ordered    = _ordered_providers(payload)
+    ordered    = _ordered_providers(payload, prefer_local)
 
     # Tool-aware routing: when the request carries tools, prefer providers whose
     # model actually supports function calling — otherwise a provider that
@@ -2125,7 +2392,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                                 try: events.append(json.loads(ds))
                                 except Exception: pass
                     data = _from_codex_response(events)
-                    cache.set(payload, data, ns)
+                    _add_provider_tokens(name, data)
+                    cache.set(payload, data, ns, query_emb)
                     return ("json", data)
                 if streaming:
                     gen = (_anthropic_streaming_generator(resp) if is_anthropic
@@ -2136,7 +2404,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                             else resp.json())
                     if not is_anthropic:
                         _strip_response(data)
-                    cache.set(payload, data, ns)
+                    _add_provider_tokens(name, data)
+                    cache.set(payload, data, ns, query_emb)
                     return ("json", data)
 
             if stop_provider:
@@ -2158,7 +2427,13 @@ def chat():
         return jsonify({"error": {"message": "request body must be a JSON object",
                                   "type": "invalid_request_error"}}), 400
 
+    token  = _caller_token()
+    gate   = _admit_request(token)
+    if gate:
+        return gate
+
     result = _route_completion(payload, payload.get("stream", False), _cache_ns())
+    _record_request_tokens(token, payload, result)
     if result[0] == "json":
         return jsonify(result[1]), 200
     if result[0] == "stream":
@@ -2181,9 +2456,16 @@ def anthropic_messages():
     if not isinstance(body, dict) or "messages" not in body:
         return jsonify(_anthropic_error("request body must be a JSON object with a 'messages' field")), 400
 
+    token  = _caller_token()
+    gate   = _admit_request(token)
+    if gate:
+        # Translate the 429 to Anthropic's error shape for SDK callers.
+        return jsonify(_anthropic_error("quota exceeded")), 429
+
     streaming = bool(body.get("stream", False))
     payload   = _anthropic_request_to_openai(body)
     result    = _route_completion(payload, streaming, _cache_ns())
+    _record_request_tokens(token, payload, result)
 
     if result[0] == "json":
         return jsonify(_openai_response_to_anthropic(result[1])), 200
@@ -2204,6 +2486,11 @@ def embeddings():
     if not isinstance(payload, dict) or "input" not in payload:
         return jsonify({"error": {"message": "request body must be a JSON object with an 'input' field",
                                   "type": "invalid_request_error"}}), 400
+
+    token  = _caller_token()
+    gate   = _admit_request(token)
+    if gate:
+        return gate
 
     ordered = _embed_ordered()
     if not ordered:
@@ -2264,6 +2551,8 @@ def embeddings():
             stats.record_success(name, elapsed); stats.record_health(name, True)
             log.info(f"  ✓ {name} embeddings ({elapsed*1000:.0f}ms)")
             data = resp.json()
+            key_usage.add_tokens(token, (data.get("usage") or {}).get("total_tokens") or 0)
+            _add_provider_tokens(name, data)
             cache.set(payload, data, ns)
             return jsonify(data), 200
 
@@ -2302,6 +2591,7 @@ def status():
             "keys":  keys.get(p["name"], []),
             "stats": stats.summary(p["name"]),
             "breaker": stats.breaker_status(p["name"]),
+            "tokens": _provider_tokens.get(p["name"], 0),
         }
         # Surface the internal routing signals (rating + probe latency + model)
         # so dashboards can show them. Added only when known, so un-probed
@@ -2337,6 +2627,11 @@ def status():
             "hits":     cache.hits,
             "misses":   cache.misses,
             "hit_rate": cache.hit_rate,
+            "semantic": {
+                "enabled":   SEMANTIC_CACHE,
+                "threshold": SEMANTIC_THRESHOLD,
+                "hits":      cache.semantic_hits,
+            },
         },
         "fast_routing": {
             "enabled":         FAST_ROUTE_TOKENS > 0,
@@ -2346,11 +2641,50 @@ def status():
         "rotation": {
             "mode": ROTATION_MODE,
         },
+        "limits": {
+            "enabled": KEY_LIMITS_ON,
+            "keys": ([
+                {"key_tail": k[-6:], "limits": KEY_LIMITS[k], "usage": key_usage.snapshot(k)}
+                for k in PROXY_API_KEYS
+            ] if KEY_LIMITS_ON else []),
+        },
         "circuit_breaker": {
             "window":      BREAKER_WINDOW,
             "min_samples": BREAKER_MIN_SAMPLES,
             "error_rate":  BREAKER_ERROR_RATE,
             "cooldown_s":  BREAKER_COOLDOWN,
+        },
+    })
+
+
+@app.route("/v1/usage")
+def usage():
+    """Usage analytics: per-provider request/error/token counts, per-key request
+    and token totals (key tails only — never full keys), and cache stats."""
+    err = _auth_check()
+    if err:
+        return err
+
+    providers = {}
+    for p in PROVIDERS:
+        s = stats.summary(p["name"])
+        providers[p["name"]] = {
+            "requests": s["total_requests"],
+            "errors":   s["errors"],
+            "tokens":   _provider_tokens.get(p["name"], 0),
+        }
+    keys = [{"key_tail": k[-6:], **key_usage.snapshot(k)} for k in PROXY_API_KEYS]
+
+    return jsonify({
+        "uptime_s":  round(time.time() - START_TIME),
+        "totals":    {"tokens": sum(_provider_tokens.values())},
+        "providers": providers,
+        "keys":      keys,
+        "cache": {
+            "hits":          cache.hits,
+            "misses":        cache.misses,
+            "hit_rate":      cache.hit_rate,
+            "semantic_hits": cache.semantic_hits,
         },
     })
 
@@ -2396,6 +2730,12 @@ def metrics():
     emit("hermes_router_cache_hits_total", "counter", "Response-cache hits", [({}, cache.hits)])
     emit("hermes_router_cache_misses_total", "counter", "Response-cache misses", [({}, cache.misses)])
     emit("hermes_router_cache_size", "gauge", "Entries currently in the response cache", [({}, cache.size)])
+    emit("hermes_router_semantic_cache_hits_total", "counter", "Semantic-cache hits", [({}, cache.semantic_hits)])
+
+    emit("hermes_router_tokens_total", "counter", "Total tokens served per provider (non-streaming)",
+         [({"provider": n}, v) for n, v in _provider_tokens.items()])
+    emit("hermes_router_key_requests_total", "counter", "Total requests per proxy key (by key tail)",
+         [({"key": k[-6:]}, key_usage.snapshot(k)["req_total"]) for k in PROXY_API_KEYS])
 
     return Response("\n".join(out) + "\n", content_type="text/plain; version=0.0.4")
 

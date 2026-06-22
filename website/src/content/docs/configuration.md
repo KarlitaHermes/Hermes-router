@@ -50,6 +50,8 @@ Sensible defaults — most users never touch these.
 | `MAX_REQUEST_BYTES` | `10485760` (10 MB) | Max request body size; larger requests get `413` (guards against memory exhaustion) |
 | `WORKER_THREADS` | `16` | Waitress worker threads (concurrency). The HTTP connection pool scales with this |
 | `CACHE_MAX_SIZE` | `100` | Max entries in the response cache (LRU eviction) |
+| `SEMANTIC_CACHE` | `0` | If `1`, also serve cached answers for *similar* prompts (needs an embedding provider; falls back to exact match otherwise) |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Cosine-similarity cutoff for a semantic hit (`1.0` = identical; lower = looser matching) |
 | `FAST_ROUTE_THRESHOLD` | `0` | If >0, requests under this many tokens prefer low-latency providers first (`0` disables) |
 | `ROUTER_MODEL_ID` | `hermes-router` | The model name clients send (the router maps it to each provider's real model) |
 | `ROUTER_STATE_FILE` | `./router_state.json` | Where provider ratings/capabilities are cached between restarts (use `/tmp/...` on read-only hosts like HF Spaces) |
@@ -58,6 +60,47 @@ Sensible defaults — most users never touch these.
 | `BREAKER_MIN_SAMPLES` | `4` | Minimum samples before the breaker can trip |
 | `BREAKER_ERROR_RATE` | `0.5` | Health-failure fraction that trips the breaker |
 | `BREAKER_COOLDOWN` | `60` | Seconds the breaker stays open before re-probing |
+
+### Per-key budgets & rate limits
+
+Give each `PROXY_API_KEYS` entry a ceiling so the router is safe to share with a team. These
+env vars are **global defaults**; set per-key overrides in `auth.json` with `hr limit set`.
+`0` = unlimited (the default — no enforcement). Live usage shows in `/v1/status` and `hr status`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROXY_LIMIT_RPM` | `0` | Requests/minute per key (rolling 60s window) |
+| `PROXY_LIMIT_REQ_DAY` | `0` | Requests per UTC day, per key |
+| `PROXY_LIMIT_TOKENS_DAY` | `0` | Tokens per UTC day, per key |
+
+```bash
+hr limit set sk-team-1 --rpm 60 --req-day 500 --tokens-day 100000   # per-key, written to auth.json
+hr limit list                                                       # show all
+hr restart                                                          # apply
+```
+
+Exceeding a limit returns `429` with a clear message and a `Retry-After` header. Per-key limits
+in `auth.json` look like:
+
+```json
+{ "proxy_keys": { "sk-team-1": { "rpm": 60, "req_per_day": 500, "tokens_per_day": 100000 } } }
+```
+
+### Local model (Ollama / LM Studio / llama.cpp)
+
+Set either of the first two to enable a `local` provider pointing at a model on your own
+machine. It's keyless (cloud providers remain the fallback). See
+[Providers → Local models](/providers/#local-models-ollama--lm-studio--llamacpp).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOCAL_BASE_URL` | `http://localhost:11434/v1` | Your local server's OpenAI-compatible endpoint (LM Studio: `:1234/v1`) |
+| `LOCAL_MODEL` | `llama3.1` | Local model id (comma-separate for multi-model failover) |
+| `LOCAL_API_KEY` | `local` | Only if your local server actually requires a key |
+| `LOCAL_EMBED_MODEL` | *(unset)* | Optional — also serve `/v1/embeddings` from the local server |
+
+> Send model `hermes-router:fast` (or header `X-Hermes-Profile: fast`) to prefer the local model
+> for short/casual turns, with cloud fallback for heavier requests.
 
 ### Per-provider model
 
