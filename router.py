@@ -507,6 +507,19 @@ def _build_providers() -> list[dict]:
             "protocol": "codex",
         })
 
+    # Local model — Ollama / LM Studio / llama.cpp / any OpenAI-compatible server
+    # running on your own machine. Free, private, and fast. Local servers are
+    # keyless, but the rotation pool needs ≥1 entry, so we use a sentinel key
+    # (LOCAL_API_KEY, default "local") that forward() sends as a harmless Bearer
+    # header the server ignores. Enabled by setting LOCAL_BASE_URL or LOCAL_MODEL.
+    if os.environ.get("LOCAL_BASE_URL") or os.environ.get("LOCAL_MODEL"):
+        providers.append({
+            "name":     "local",
+            "base_url": os.environ.get("LOCAL_BASE_URL", "http://localhost:11434/v1"),
+            "model":    os.environ.get("LOCAL_MODEL", "llama3.1"),
+            "keys":     [os.environ.get("LOCAL_API_KEY", "local")],
+        })
+
     if not providers:
         log.warning("No providers configured — set GEMINI_API_KEYS, OPENROUTER_API_KEYS, etc. in .env")
 
@@ -756,13 +769,19 @@ def classify_complexity(messages: list) -> int:
     return 5
 
 
-def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) -> list:
+def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
+                       prefer_local: bool = False) -> list:
     """
     Sort providers for this complexity: cheapest capable model first, then
     overkill models, then too-weak as last resort. Never blocks.
 
     When FAST_ROUTE_THRESHOLD is set and the request is shorter than it,
     low-latency providers win ties between otherwise equally-ranked options.
+
+    With prefer_local (the `:fast` / conversation profile), a configured `local`
+    provider is moved to the very front for short/casual turns (complexity ≥ 3),
+    with the cloud providers as automatic fallback. Heavier turns ignore it so
+    they still go to a capable cloud model.
 
     Round-robin: providers that tie on every criterion (same rating, same
     availability) are rotated each request so load spreads across them instead
@@ -777,6 +796,8 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         rating = state.get("rating", _rate_model(p["model"]))
         avail  = state.get("available", True)
         fast   = 0 if (fast_first and p["name"] in _FAST_PROVIDERS) else 1
+        # `:fast` profile: a short/casual turn prefers the local model first.
+        local_first = 0 if (prefer_local and p["name"] == "local" and complexity >= 3) else 1
         # Health-aware terms — tier/sort_within stay FIRST so capability matching
         # is never overridden by health (a healthy weak model must not outrank the
         # correct-capability one). When every candidate is healthy these two terms
@@ -789,7 +810,9 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0) ->
         else:
             tier        = 1
             sort_within = rating - complexity   # too weak — closest first
-        return (tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
+        # local_first leads the key so a preferred local model sorts ahead of all
+        # others on easy turns; it's a constant 1 otherwise, leaving order unchanged.
+        return (local_first, tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
 
     n = len(providers)
     offset = next(_rr_counter) % n if n else 0
@@ -1625,15 +1648,16 @@ def _supports_tools(provider: dict) -> bool:
     return True if val is None else bool(val)
 
 
-def _ordered_providers(payload: dict) -> list[dict]:
+def _ordered_providers(payload: dict, prefer_local: bool = False) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
     tasks, best model for complex ones. With FAST_ROUTE_THRESHOLD set,
-    short requests break ties in favour of low-latency providers.
+    short requests break ties in favour of low-latency providers. With
+    prefer_local (the `:fast` profile), a local model leads on easy turns.
     """
     messages   = payload.get("messages", [])
     complexity = classify_complexity(messages)
-    ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages))
+    ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages), prefer_local)
     log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
              f"order={[p['name'] for p in ordered]}")
     return ordered
@@ -1981,9 +2005,12 @@ def models():
     err = _auth_check()
     if err:
         return err
-    return jsonify({"object": "list", "data": [
-        {"id": ROUTER_MODEL, "object": "model", "owned_by": "hermes-router"}
-    ]})
+    data = [{"id": ROUTER_MODEL, "object": "model", "owned_by": "hermes-router"}]
+    # Advertise the fast/conversation profile only when a local model is configured,
+    # since that's what it routes short turns to.
+    if any(p["name"] == "local" for p in PROVIDERS):
+        data.append({"id": f"{ROUTER_MODEL}:fast", "object": "model", "owned_by": "hermes-router"})
+    return jsonify({"object": "list", "data": data})
 
 
 def _route_completion(payload: dict, streaming: bool, ns: str = ""):
@@ -1995,6 +2022,21 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                                          OpenAI-format SSE regardless of upstream
         ("error",  error_dict, status)   every provider exhausted
     """
+    # Routing profile: `hermes-router:fast` (or header X-Hermes-Profile: fast)
+    # prefers a local model for short/casual turns, with cloud as fallback. We
+    # normalize the model back to the router id so the cache and upstream model
+    # selection behave exactly like a default request.
+    prefer_local = False
+    if str(payload.get("model") or "").endswith(":fast"):
+        prefer_local = True
+        payload = {**payload, "model": ROUTER_MODEL}
+    else:
+        try:
+            if request.headers.get("X-Hermes-Profile", "").strip().lower() == "fast":
+                prefer_local = True
+        except RuntimeError:
+            pass  # called outside a request context (e.g. tests)
+
     messages = payload.get("messages", [])
 
     # Cache check (non-streaming only)
@@ -2005,7 +2047,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
             return ("json", cached)
 
     est_tokens = _estimated_tokens(messages)
-    ordered    = _ordered_providers(payload)
+    ordered    = _ordered_providers(payload, prefer_local)
 
     # Tool-aware routing: when the request carries tools, prefer providers whose
     # model actually supports function calling — otherwise a provider that

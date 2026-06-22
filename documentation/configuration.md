@@ -56,6 +56,22 @@ Sensible defaults — most users never touch these.
 | `BREAKER_ERROR_RATE` | `0.5` | Health-failure fraction that trips the breaker |
 | `BREAKER_COOLDOWN` | `60` | Seconds the breaker stays open before re-probing |
 
+### Local model (Ollama / LM Studio / llama.cpp)
+
+Set either of the first two to enable a `local` provider pointing at a model on your own
+machine. It's keyless (cloud providers remain the fallback). See
+[providers.md → Local models](providers.md).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOCAL_BASE_URL` | `http://localhost:11434/v1` | Your local server's OpenAI-compatible endpoint (LM Studio: `:1234/v1`) |
+| `LOCAL_MODEL` | `llama3.1` | Local model id (comma-separate for multi-model failover) |
+| `LOCAL_API_KEY` | `local` | Only if your local server actually requires a key |
+| `LOCAL_EMBED_MODEL` | *(unset)* | Optional — also serve `/v1/embeddings` from the local server |
+
+> Send model `hermes-router:fast` (or header `X-Hermes-Profile: fast`) to prefer the local model
+> for short/casual turns, with cloud fallback for heavier requests.
+
 ### Per-provider model
 
 | Variable | Default | Purpose |

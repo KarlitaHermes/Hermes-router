@@ -68,6 +68,13 @@ The router picks the cheapest model that can handle the request. Tool requests a
 providers whose model supports function calling (detected at startup). Optional **fast routing**
 (`FAST_ROUTE_THRESHOLD`) sends short requests to low-latency providers first.
 
+**Local models & conversation mode.** A model running on your own machine (Ollama / LM Studio /
+llama.cpp) can join the pool as the `local` provider — free, private, fast (see
+[Providers](/providers/#local-models-ollama--lm-studio--llamacpp)). Sending the model id
+`hermes-router:fast` (or header `X-Hermes-Profile: fast`) makes the router prefer that local
+model for short/casual turns, with the cloud providers as automatic fallback for heavier
+requests.
+
 ### Failover & circuit breaker
 
 If a provider errors or times out, the router cascades to the next automatically. A provider
