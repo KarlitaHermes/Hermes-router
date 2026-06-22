@@ -72,6 +72,11 @@ ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+# Semantic cache: serve a cached answer for a *similar* (not just identical) prompt,
+# by embedding prompts and comparing cosine similarity. Opt-in (needs an embedding
+# provider); falls back to exact match when off or unavailable.
+SEMANTIC_CACHE     = os.environ.get("SEMANTIC_CACHE", "0").strip().lower() not in ("0", "", "false", "no", "off")
+SEMANTIC_THRESHOLD = float(os.environ.get("SEMANTIC_CACHE_THRESHOLD", "0.95"))
 # How keys are picked within a provider:
 #   round-robin — spread requests evenly across all keys (keys deplete together)
 #   sequential  — drain one key until it rate-limits, then move on (keeps reserves fresh)
@@ -1092,6 +1097,17 @@ stats = ProviderStats()
 
 # ── Response cache ─────────────────────────────────────────────────────────────
 
+def _cosine(a: list, b: list) -> float:
+    """Cosine similarity of two equal-length vectors. Pure Python (vectors are
+    short and the cache is bounded, so this is plenty fast); numpy not required."""
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y; na += x * x; nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
 class ResponseCache:
     """
     In-memory LRU cache for non-streaming responses.
@@ -1104,9 +1120,10 @@ class ResponseCache:
         self.ttl      = ttl
         self.max_size = max_size
         self.lock     = threading.Lock()
-        self._store: OrderedDict = OrderedDict()  # hash -> (data, timestamp)
-        self.hits     = 0
-        self.misses   = 0
+        self._store: OrderedDict = OrderedDict()  # hash -> (data, ts, ns, embedding|None)
+        self.hits          = 0
+        self.misses        = 0
+        self.semantic_hits = 0
 
     def _hash(self, payload: dict, ns: str = "") -> str:
         # Hash the entire request (minus "stream", which doesn't change the
@@ -1124,7 +1141,7 @@ class ResponseCache:
         key = self._hash(payload, ns)
         with self.lock:
             if key in self._store:
-                data, ts = self._store[key]
+                data, ts, *_ = self._store[key]
                 if time.time() - ts < self.ttl:
                     self._store.move_to_end(key)
                     self.hits += 1
@@ -1133,14 +1150,39 @@ class ResponseCache:
             self.misses += 1
         return None
 
-    def set(self, payload: dict, data: dict, ns: str = ""):
+    def set(self, payload: dict, data: dict, ns: str = "", embedding: list | None = None):
         if self.ttl <= 0:
             return
         key = self._hash(payload, ns)
         with self.lock:
             if len(self._store) >= self.max_size:
                 self._store.popitem(last=False)  # evict oldest
-            self._store[key] = (data, time.time())
+            self._store[key] = (data, time.time(), ns, embedding)
+
+    def semantic_lookup(self, query_emb: list, ns: str = "") -> dict | None:
+        """Return the cached response whose stored prompt embedding is most similar
+        to query_emb (same namespace, same vector dimension), if it clears
+        SEMANTIC_THRESHOLD. Bounded linear scan over the LRU (max_size)."""
+        if self.ttl <= 0 or not query_emb:
+            return None
+        now = time.time()
+        qlen = len(query_emb)
+        best_key, best_data, best_sim = None, None, 0.0
+        with self.lock:
+            for key, (data, ts, ens, emb) in self._store.items():
+                if emb is None or ens != ns or len(emb) != qlen:
+                    continue
+                if now - ts >= self.ttl:
+                    continue
+                sim = _cosine(query_emb, emb)
+                if sim > best_sim:
+                    best_key, best_data, best_sim = key, data, sim
+            if best_key is not None and best_sim >= SEMANTIC_THRESHOLD:
+                self._store.move_to_end(best_key)
+                self.semantic_hits += 1
+                log.info(f"  semantic match sim={best_sim:.3f}")
+                return best_data
+        return None
 
     @property
     def size(self) -> int:
@@ -2049,6 +2091,34 @@ def _embed_ordered() -> list[dict]:
                                                   stats.health_bucket(p["name"])))
 
 
+def _prompt_text(messages: list) -> str:
+    """Flatten a chat request's message text for semantic-cache embedding."""
+    return " ".join(_message_text(m) for m in messages if m.get("content")).strip()[:8000]
+
+
+def _embed_text(text: str) -> list | None:
+    """Embed text via the internal embeddings pipeline (used by the semantic cache).
+    Returns a vector, or None if no embed provider is available / all are cooling."""
+    if not text:
+        return None
+    body = {"input": text}
+    for provider in _embed_ordered():
+        em  = provider["embed_model"]
+        key = pool.get_key(provider["name"], em)
+        if not key:
+            continue
+        try:
+            resp = forward_embeddings(provider, key, body)
+        except Exception:
+            resp = None
+        if resp is not None and 200 <= resp.status_code < 300:
+            try:
+                return resp.json()["data"][0]["embedding"]
+            except Exception:
+                pass
+    return None
+
+
 def forward_embeddings(provider: dict, key: str, payload: dict) -> requests.Response | None:
     """POST an OpenAI-format embeddings request to a provider, substituting the
     provider's configured embed model. No streaming, no format translation."""
@@ -2176,12 +2246,22 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
 
     messages = payload.get("messages", [])
 
-    # Cache check (non-streaming only)
+    # Cache check (non-streaming only): exact match first (cheap), then optional
+    # semantic match. query_emb is reused to store the response so future similar
+    # prompts can match it.
+    query_emb = None
     if not streaming:
         cached = cache.get(payload, ns)
         if cached is not None:
             log.info("↩ cache hit")
             return ("json", cached)
+        if SEMANTIC_CACHE and _embed_ordered():
+            query_emb = _embed_text(_prompt_text(messages))
+            if query_emb:
+                hit = cache.semantic_lookup(query_emb, ns)
+                if hit is not None:
+                    log.info("↩ semantic cache hit")
+                    return ("json", hit)
 
     est_tokens = _estimated_tokens(messages)
     ordered    = _ordered_providers(payload, prefer_local)
@@ -2304,7 +2384,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                                 try: events.append(json.loads(ds))
                                 except Exception: pass
                     data = _from_codex_response(events)
-                    cache.set(payload, data, ns)
+                    cache.set(payload, data, ns, query_emb)
                     return ("json", data)
                 if streaming:
                     gen = (_anthropic_streaming_generator(resp) if is_anthropic
@@ -2315,7 +2395,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                             else resp.json())
                     if not is_anthropic:
                         _strip_response(data)
-                    cache.set(payload, data, ns)
+                    cache.set(payload, data, ns, query_emb)
                     return ("json", data)
 
             if stop_provider:
@@ -2536,6 +2616,11 @@ def status():
             "hits":     cache.hits,
             "misses":   cache.misses,
             "hit_rate": cache.hit_rate,
+            "semantic": {
+                "enabled":   SEMANTIC_CACHE,
+                "threshold": SEMANTIC_THRESHOLD,
+                "hits":      cache.semantic_hits,
+            },
         },
         "fast_routing": {
             "enabled":         FAST_ROUTE_TOKENS > 0,
@@ -2602,6 +2687,7 @@ def metrics():
     emit("hermes_router_cache_hits_total", "counter", "Response-cache hits", [({}, cache.hits)])
     emit("hermes_router_cache_misses_total", "counter", "Response-cache misses", [({}, cache.misses)])
     emit("hermes_router_cache_size", "gauge", "Entries currently in the response cache", [({}, cache.size)])
+    emit("hermes_router_semantic_cache_hits_total", "counter", "Semantic-cache hits", [({}, cache.semantic_hits)])
 
     return Response("\n".join(out) + "\n", content_type="text/plain; version=0.0.4")
 
