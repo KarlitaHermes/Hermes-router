@@ -1379,6 +1379,27 @@ def _with_cleanup(resp: requests.Response, gen):
     finally:
         resp.close()
 
+
+def _streaming_with_usage(gen, name: str):
+    """Wrap a streaming generator to capture the usage block from the final SSE
+    chunk (present when stream_options.include_usage=true is sent upstream) and
+    record tokens in _provider_tokens. Yields every chunk unchanged."""
+    usage: dict = {}
+    for chunk in gen:
+        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
+        for line in text.split("\n"):
+            if line.startswith("data: ") and line != "data: [DONE]":
+                try:
+                    event = json.loads(line[6:])
+                    u = event.get("usage") or {}
+                    if u.get("total_tokens"):
+                        usage = u
+                except Exception:
+                    pass
+        yield chunk
+    if usage:
+        _add_provider_tokens(name, {"usage": usage})
+
 # ── Anthropic format translation ──────────────────────────────────────────────
 # Anthropic's Messages API uses a different format from OpenAI. These helpers
 # translate transparently so the caller never has to know which provider they hit.
@@ -2084,6 +2105,13 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
                 log.info(f"  clamping {field} {body[field]}→{out_cap} for {provider['name']}")
                 body[field] = out_cap
 
+    # Ask the provider to include usage in the final SSE chunk so _streaming_with_usage
+    # can record actual tokens. Non-destructive: merges with any stream_options the
+    # client already sent. Most OpenAI-compatible providers support this.
+    if streaming:
+        body.setdefault("stream_options", {})
+        body["stream_options"]["include_usage"] = True
+
     url = provider["base_url"].rstrip("/") + "/chat/completions"
     try:
         return _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, 120))
@@ -2398,7 +2426,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 if streaming:
                     gen = (_anthropic_streaming_generator(resp) if is_anthropic
                            else _streaming_generator(resp))
-                    return ("stream", _with_cleanup(resp, gen), name)
+                    wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name)
+                    return ("stream", wrapped, name)
                 else:
                     data = (_from_anthropic_response(resp.json()) if is_anthropic
                             else resp.json())
