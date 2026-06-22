@@ -115,12 +115,27 @@ for name in sorted(providers, key=lambda n: (rating_of(providers[n]), n)):
 cache = d.get("cache", {})
 br_cfg = d.get("circuit_breaker", {})
 rotation = d.get("rotation", {})
+limits = d.get("limits", {})
+total_tokens = sum(p.get("tokens", 0) for p in providers.values())
 print()
 if rotation:
     print(f"  {DIM}rotation: {rotation.get('mode','?')}{RST}")
 if cache:
+    sem = cache.get("semantic", {})
+    sem_str = (f" · semantic ≥{sem.get('threshold')} ({sem.get('hits',0)} hits)"
+               if sem.get("enabled") else "")
     print(f"  {DIM}cache: {'on' if cache.get('enabled') else 'off'} · "
-          f"hit-rate {cache.get('hit_rate',0)} · {cache.get('size',0)}/{cache.get('max_size','?')} entries{RST}")
+          f"hit-rate {cache.get('hit_rate',0)} · {cache.get('size',0)}/{cache.get('max_size','?')} entries{sem_str}{RST}")
+if total_tokens:
+    print(f"  {DIM}tokens served: {total_tokens}{RST}")
+if limits.get("enabled"):
+    for k in limits.get("keys", []):
+        lim, use = k.get("limits", {}), k.get("usage", {})
+        parts = []
+        if lim.get("rpm"):            parts.append(f"{use.get('rpm_window',0)}/{lim['rpm']} rpm")
+        if lim.get("req_per_day"):    parts.append(f"{use.get('req_today',0)}/{lim['req_per_day']} req/day")
+        if lim.get("tokens_per_day"): parts.append(f"{use.get('tokens_today',0)}/{lim['tokens_per_day']} tok/day")
+        print(f"  {DIM}limit …{k.get('key_tail','?')}: {' · '.join(parts) if parts else 'unlimited'}{RST}")
 if br_cfg:
     print(f"  {DIM}breaker: trips at {int(br_cfg.get('error_rate',0)*100)}% fails over last "
           f"{br_cfg.get('window','?')} · opens {br_cfg.get('cooldown_s','?')}s{RST}")

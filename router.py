@@ -1245,8 +1245,9 @@ class KeyUsage:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self._win = defaultdict(deque)   # key -> deque[timestamps] within the last 60s
-        self._day = defaultdict(lambda: {"day": "", "req": 0, "tokens": 0})
+        self._win  = defaultdict(deque)   # key -> deque[timestamps] within the last 60s
+        self._day  = defaultdict(lambda: {"day": "", "req": 0, "tokens": 0})
+        self._life = defaultdict(lambda: {"req": 0, "tokens": 0})  # cumulative since start
 
     def _roll(self, key, now):
         w = self._win[key]
@@ -1261,44 +1262,60 @@ class KeyUsage:
             d.update(day=today, req=0, tokens=0)
         return d
 
-    def tokens_ok(self, key, limits):
-        """Read-only gate: reject if the day's token budget is already spent."""
-        tpd = limits.get("tokens_per_day", 0)
-        if not tpd:
-            return (True, 0, "")
-        with self.lock:
-            if self._day_bucket(key)["tokens"] >= tpd:
-                return (False, _secs_to_utc_midnight(), f"{tpd} tokens/day")
-        return (True, 0, "")
-
-    def reserve_request(self, key, limits):
-        """Enforce RPM + requests/day and count this request. Returns (ok, retry, reason)."""
-        rpm = limits.get("rpm", 0)
+    def check_and_record(self, key, limits):
+        """Atomically enforce this key's limits and, if allowed, count the request
+        (RPM window + per-day + lifetime). `limits` may be all-zero, in which case
+        nothing is gated and the request is simply recorded — so usage analytics
+        work whether or not limits are configured. Returns (ok, retry, reason)."""
+        rpm     = limits.get("rpm", 0)
         req_day = limits.get("req_per_day", 0)
+        tpd     = limits.get("tokens_per_day", 0)
         now = time.time()
         with self.lock:
             d = self._day_bucket(key)
             self._roll(key, now)
+            if tpd and d["tokens"] >= tpd:
+                return (False, _secs_to_utc_midnight(), f"{tpd} tokens/day")
             if rpm and len(self._win[key]) >= rpm:
                 return (False, max(1, int(60 - (now - self._win[key][0]))), f"{rpm} requests/min")
             if req_day and d["req"] >= req_day:
                 return (False, _secs_to_utc_midnight(), f"{req_day} requests/day")
             self._win[key].append(now)
             d["req"] += 1
+            self._life[key]["req"] += 1
             return (True, 0, "")
 
     def add_tokens(self, key, n):
+        n = int(n or 0)
+        if not n:
+            return
         with self.lock:
-            self._day_bucket(key)["tokens"] += int(n or 0)
+            self._day_bucket(key)["tokens"] += n
+            self._life[key]["tokens"] += n
 
     def snapshot(self, key):
         with self.lock:
             d = self._day_bucket(key)
             self._roll(key, time.time())
-            return {"req_today": d["req"], "tokens_today": d["tokens"], "rpm_window": len(self._win[key])}
+            l = self._life[key]
+            return {"req_today": d["req"], "tokens_today": d["tokens"],
+                    "rpm_window": len(self._win[key]),
+                    "req_total": l["req"], "tokens_total": l["tokens"]}
 
 
 key_usage = KeyUsage()
+
+# Cumulative tokens served per provider (from provider-reported usage on
+# non-streaming responses), for /v1/usage and /metrics. Streaming omits usage,
+# so those requests count toward request totals but not token totals.
+_provider_tokens = defaultdict(int)
+_ptok_lock = threading.Lock()
+
+def _add_provider_tokens(name: str, data: dict):
+    n = ((data.get("usage") or {}).get("total_tokens")) or 0
+    if n:
+        with _ptok_lock:
+            _provider_tokens[name] += n
 
 # ── Thinking field stripping ───────────────────────────────────────────────────
 # Some providers (e.g. Gemini 2.5) emit reasoning/thinking fields in responses.
@@ -2167,19 +2184,12 @@ def _cache_ns() -> str:
     return _caller_token()
 
 
-def _check_budget(token: str):
-    """Enforce this caller's rate/budget limits. Returns a Flask (response, 429)
-    tuple to short-circuit, or None to proceed. No-op unless limits are configured."""
-    if not KEY_LIMITS_ON:
-        return None
-    limits = KEY_LIMITS.get(token)
-    if not limits or not any(limits.values()):
-        return None
-    # Token budget is a read-only gate (checked first so a token-exhausted key
-    # doesn't burn its request counter); RPM + requests/day enforce-and-count.
-    ok, retry, reason = key_usage.tokens_ok(token, limits)
-    if ok:
-        ok, retry, reason = key_usage.reserve_request(token, limits)
+def _admit_request(token: str):
+    """Enforce this caller's rate/budget limits AND record the request for usage
+    analytics (recording happens whether or not limits are set). Returns a Flask
+    (response, 429) tuple to short-circuit when over limit, or None to proceed."""
+    limits = KEY_LIMITS.get(token) or {}
+    ok, retry, reason = key_usage.check_and_record(token, limits)
     if ok:
         return None
     resp = jsonify({"error": {"message": f"quota exceeded ({reason})",
@@ -2189,10 +2199,8 @@ def _check_budget(token: str):
 
 
 def _record_request_tokens(token: str, payload: dict, result):
-    """Post-flight: add this request's tokens to the caller's daily tally. Uses the
-    provider-reported usage when present, else an estimate (e.g. streaming)."""
-    if not KEY_LIMITS_ON:
-        return
+    """Post-flight: add this request's tokens to the caller's tally (daily + lifetime).
+    Uses provider-reported usage when present, else an estimate (e.g. streaming)."""
     n = 0
     if result and result[0] == "json":
         n = ((result[1].get("usage") or {}).get("total_tokens")) or 0
@@ -2384,6 +2392,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                                 try: events.append(json.loads(ds))
                                 except Exception: pass
                     data = _from_codex_response(events)
+                    _add_provider_tokens(name, data)
                     cache.set(payload, data, ns, query_emb)
                     return ("json", data)
                 if streaming:
@@ -2395,6 +2404,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                             else resp.json())
                     if not is_anthropic:
                         _strip_response(data)
+                    _add_provider_tokens(name, data)
                     cache.set(payload, data, ns, query_emb)
                     return ("json", data)
 
@@ -2418,9 +2428,9 @@ def chat():
                                   "type": "invalid_request_error"}}), 400
 
     token  = _caller_token()
-    budget = _check_budget(token)
-    if budget:
-        return budget
+    gate   = _admit_request(token)
+    if gate:
+        return gate
 
     result = _route_completion(payload, payload.get("stream", False), _cache_ns())
     _record_request_tokens(token, payload, result)
@@ -2447,8 +2457,8 @@ def anthropic_messages():
         return jsonify(_anthropic_error("request body must be a JSON object with a 'messages' field")), 400
 
     token  = _caller_token()
-    budget = _check_budget(token)
-    if budget:
+    gate   = _admit_request(token)
+    if gate:
         # Translate the 429 to Anthropic's error shape for SDK callers.
         return jsonify(_anthropic_error("quota exceeded")), 429
 
@@ -2478,9 +2488,9 @@ def embeddings():
                                   "type": "invalid_request_error"}}), 400
 
     token  = _caller_token()
-    budget = _check_budget(token)
-    if budget:
-        return budget
+    gate   = _admit_request(token)
+    if gate:
+        return gate
 
     ordered = _embed_ordered()
     if not ordered:
@@ -2541,8 +2551,8 @@ def embeddings():
             stats.record_success(name, elapsed); stats.record_health(name, True)
             log.info(f"  ✓ {name} embeddings ({elapsed*1000:.0f}ms)")
             data = resp.json()
-            if KEY_LIMITS_ON:
-                key_usage.add_tokens(token, (data.get("usage") or {}).get("total_tokens") or 0)
+            key_usage.add_tokens(token, (data.get("usage") or {}).get("total_tokens") or 0)
+            _add_provider_tokens(name, data)
             cache.set(payload, data, ns)
             return jsonify(data), 200
 
@@ -2581,6 +2591,7 @@ def status():
             "keys":  keys.get(p["name"], []),
             "stats": stats.summary(p["name"]),
             "breaker": stats.breaker_status(p["name"]),
+            "tokens": _provider_tokens.get(p["name"], 0),
         }
         # Surface the internal routing signals (rating + probe latency + model)
         # so dashboards can show them. Added only when known, so un-probed
@@ -2646,6 +2657,38 @@ def status():
     })
 
 
+@app.route("/v1/usage")
+def usage():
+    """Usage analytics: per-provider request/error/token counts, per-key request
+    and token totals (key tails only — never full keys), and cache stats."""
+    err = _auth_check()
+    if err:
+        return err
+
+    providers = {}
+    for p in PROVIDERS:
+        s = stats.summary(p["name"])
+        providers[p["name"]] = {
+            "requests": s["total_requests"],
+            "errors":   s["errors"],
+            "tokens":   _provider_tokens.get(p["name"], 0),
+        }
+    keys = [{"key_tail": k[-6:], **key_usage.snapshot(k)} for k in PROXY_API_KEYS]
+
+    return jsonify({
+        "uptime_s":  round(time.time() - START_TIME),
+        "totals":    {"tokens": sum(_provider_tokens.values())},
+        "providers": providers,
+        "keys":      keys,
+        "cache": {
+            "hits":          cache.hits,
+            "misses":        cache.misses,
+            "hit_rate":      cache.hit_rate,
+            "semantic_hits": cache.semantic_hits,
+        },
+    })
+
+
 @app.route("/metrics")
 def metrics():
     """Prometheus text-format metrics for scraping (Grafana, etc.). Exposes only
@@ -2688,6 +2731,11 @@ def metrics():
     emit("hermes_router_cache_misses_total", "counter", "Response-cache misses", [({}, cache.misses)])
     emit("hermes_router_cache_size", "gauge", "Entries currently in the response cache", [({}, cache.size)])
     emit("hermes_router_semantic_cache_hits_total", "counter", "Semantic-cache hits", [({}, cache.semantic_hits)])
+
+    emit("hermes_router_tokens_total", "counter", "Total tokens served per provider (non-streaming)",
+         [({"provider": n}, v) for n, v in _provider_tokens.items()])
+    emit("hermes_router_key_requests_total", "counter", "Total requests per proxy key (by key tail)",
+         [({"key": k[-6:]}, key_usage.snapshot(k)["req_total"]) for k in PROXY_API_KEYS])
 
     return Response("\n".join(out) + "\n", content_type="text/plain; version=0.0.4")
 

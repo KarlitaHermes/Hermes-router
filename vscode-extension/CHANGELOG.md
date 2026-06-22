@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- **Usage in the dashboard.** The dashboard now shows a **Tokens** column per provider, total
+  tokens served, semantic-cache hits, and (when configured) per-key rate-limit/budget usage —
+  all read from the router's `/v1/status`. Pairs with the router's new local-model provider,
+  per-key budgets, semantic caching, and `/v1/usage` endpoint.
+
 ## 0.4.0
 
 - **Manage a router running in Docker.** New `hermesRouter.dockerContainer` setting — set it to
