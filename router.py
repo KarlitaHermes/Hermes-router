@@ -24,7 +24,7 @@ Quick start:
 
 import json, os, time, threading, logging, hashlib, hmac, itertools
 from pathlib import Path
-from collections import deque, OrderedDict
+from collections import deque, OrderedDict, defaultdict
 from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 
@@ -1155,6 +1155,109 @@ class ResponseCache:
 
 cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE)
 
+# ── Per-key budgets & rate limits ("virtual keys" lite) ─────────────────────────
+# Each PROXY_API_KEYS entry can carry a requests-per-minute ceiling and per-UTC-day
+# request/token budgets, so the router is safe to share with a team. Limits come
+# from auth.json under "proxy_keys" ({ "<key>": {"rpm","req_per_day","tokens_per_day"} }),
+# with env-var globals (PROXY_LIMIT_RPM / PROXY_LIMIT_REQ_DAY / PROXY_LIMIT_TOKENS_DAY)
+# as defaults. 0/absent everywhere = unlimited → identical to the prior behavior.
+
+def _load_key_limits() -> dict:
+    g_rpm    = _int_env("PROXY_LIMIT_RPM", 0)
+    g_req    = _int_env("PROXY_LIMIT_REQ_DAY", 0)
+    g_tokens = _int_env("PROXY_LIMIT_TOKENS_DAY", 0)
+    per_key = {}
+    if AUTH_FILE.exists():
+        try:
+            doc = json.loads(AUTH_FILE.read_text())
+            pk = doc.get("proxy_keys", {})
+            if isinstance(pk, dict):
+                per_key = pk
+        except Exception as e:
+            log.warning(f"Could not read proxy_keys from {AUTH_FILE}: {e}")
+    limits = {}
+    for k in PROXY_API_KEYS:
+        spec = per_key.get(k) or {}
+        limits[k] = {
+            "rpm":            int(spec.get("rpm", g_rpm) or 0),
+            "req_per_day":    int(spec.get("req_per_day", g_req) or 0),
+            "tokens_per_day": int(spec.get("tokens_per_day", g_tokens) or 0),
+        }
+    return limits
+
+KEY_LIMITS    = _load_key_limits()
+KEY_LIMITS_ON = any(any(v.values()) for v in KEY_LIMITS.values())
+
+
+def _utc_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+def _secs_to_utc_midnight() -> int:
+    t = time.gmtime()
+    return max(1, 86400 - (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec))
+
+
+class KeyUsage:
+    """Thread-safe per-key counters: a rolling 60s window for RPM, plus per-UTC-day
+    request and token tallies. In-memory (resets on restart)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._win = defaultdict(deque)   # key -> deque[timestamps] within the last 60s
+        self._day = defaultdict(lambda: {"day": "", "req": 0, "tokens": 0})
+
+    def _roll(self, key, now):
+        w = self._win[key]
+        cutoff = now - 60
+        while w and w[0] < cutoff:
+            w.popleft()
+
+    def _day_bucket(self, key):
+        d = self._day[key]
+        today = _utc_day()
+        if d["day"] != today:
+            d.update(day=today, req=0, tokens=0)
+        return d
+
+    def tokens_ok(self, key, limits):
+        """Read-only gate: reject if the day's token budget is already spent."""
+        tpd = limits.get("tokens_per_day", 0)
+        if not tpd:
+            return (True, 0, "")
+        with self.lock:
+            if self._day_bucket(key)["tokens"] >= tpd:
+                return (False, _secs_to_utc_midnight(), f"{tpd} tokens/day")
+        return (True, 0, "")
+
+    def reserve_request(self, key, limits):
+        """Enforce RPM + requests/day and count this request. Returns (ok, retry, reason)."""
+        rpm = limits.get("rpm", 0)
+        req_day = limits.get("req_per_day", 0)
+        now = time.time()
+        with self.lock:
+            d = self._day_bucket(key)
+            self._roll(key, now)
+            if rpm and len(self._win[key]) >= rpm:
+                return (False, max(1, int(60 - (now - self._win[key][0]))), f"{rpm} requests/min")
+            if req_day and d["req"] >= req_day:
+                return (False, _secs_to_utc_midnight(), f"{req_day} requests/day")
+            self._win[key].append(now)
+            d["req"] += 1
+            return (True, 0, "")
+
+    def add_tokens(self, key, n):
+        with self.lock:
+            self._day_bucket(key)["tokens"] += int(n or 0)
+
+    def snapshot(self, key):
+        with self.lock:
+            d = self._day_bucket(key)
+            self._roll(key, time.time())
+            return {"req_today": d["req"], "tokens_today": d["tokens"], "rpm_window": len(self._win[key])}
+
+
+key_usage = KeyUsage()
+
 # ── Thinking field stripping ───────────────────────────────────────────────────
 # Some providers (e.g. Gemini 2.5) emit reasoning/thinking fields in responses.
 # These fields cause 400 errors on other providers (Groq, Cerebras, OpenRouter).
@@ -1994,6 +2097,40 @@ def _cache_ns() -> str:
     return _caller_token()
 
 
+def _check_budget(token: str):
+    """Enforce this caller's rate/budget limits. Returns a Flask (response, 429)
+    tuple to short-circuit, or None to proceed. No-op unless limits are configured."""
+    if not KEY_LIMITS_ON:
+        return None
+    limits = KEY_LIMITS.get(token)
+    if not limits or not any(limits.values()):
+        return None
+    # Token budget is a read-only gate (checked first so a token-exhausted key
+    # doesn't burn its request counter); RPM + requests/day enforce-and-count.
+    ok, retry, reason = key_usage.tokens_ok(token, limits)
+    if ok:
+        ok, retry, reason = key_usage.reserve_request(token, limits)
+    if ok:
+        return None
+    resp = jsonify({"error": {"message": f"quota exceeded ({reason})",
+                              "type": "rate_limit_error"}})
+    resp.headers["Retry-After"] = str(retry)
+    return resp, 429
+
+
+def _record_request_tokens(token: str, payload: dict, result):
+    """Post-flight: add this request's tokens to the caller's daily tally. Uses the
+    provider-reported usage when present, else an estimate (e.g. streaming)."""
+    if not KEY_LIMITS_ON:
+        return
+    n = 0
+    if result and result[0] == "json":
+        n = ((result[1].get("usage") or {}).get("total_tokens")) or 0
+    if not n:
+        n = _estimated_tokens(payload.get("messages", []))
+    key_usage.add_tokens(token, n)
+
+
 @app.route("/health")
 def health():
     """Unauthenticated health check for uptime monitoring."""
@@ -2200,7 +2337,13 @@ def chat():
         return jsonify({"error": {"message": "request body must be a JSON object",
                                   "type": "invalid_request_error"}}), 400
 
+    token  = _caller_token()
+    budget = _check_budget(token)
+    if budget:
+        return budget
+
     result = _route_completion(payload, payload.get("stream", False), _cache_ns())
+    _record_request_tokens(token, payload, result)
     if result[0] == "json":
         return jsonify(result[1]), 200
     if result[0] == "stream":
@@ -2223,9 +2366,16 @@ def anthropic_messages():
     if not isinstance(body, dict) or "messages" not in body:
         return jsonify(_anthropic_error("request body must be a JSON object with a 'messages' field")), 400
 
+    token  = _caller_token()
+    budget = _check_budget(token)
+    if budget:
+        # Translate the 429 to Anthropic's error shape for SDK callers.
+        return jsonify(_anthropic_error("quota exceeded")), 429
+
     streaming = bool(body.get("stream", False))
     payload   = _anthropic_request_to_openai(body)
     result    = _route_completion(payload, streaming, _cache_ns())
+    _record_request_tokens(token, payload, result)
 
     if result[0] == "json":
         return jsonify(_openai_response_to_anthropic(result[1])), 200
@@ -2246,6 +2396,11 @@ def embeddings():
     if not isinstance(payload, dict) or "input" not in payload:
         return jsonify({"error": {"message": "request body must be a JSON object with an 'input' field",
                                   "type": "invalid_request_error"}}), 400
+
+    token  = _caller_token()
+    budget = _check_budget(token)
+    if budget:
+        return budget
 
     ordered = _embed_ordered()
     if not ordered:
@@ -2306,6 +2461,8 @@ def embeddings():
             stats.record_success(name, elapsed); stats.record_health(name, True)
             log.info(f"  ✓ {name} embeddings ({elapsed*1000:.0f}ms)")
             data = resp.json()
+            if KEY_LIMITS_ON:
+                key_usage.add_tokens(token, (data.get("usage") or {}).get("total_tokens") or 0)
             cache.set(payload, data, ns)
             return jsonify(data), 200
 
@@ -2387,6 +2544,13 @@ def status():
         },
         "rotation": {
             "mode": ROTATION_MODE,
+        },
+        "limits": {
+            "enabled": KEY_LIMITS_ON,
+            "keys": ([
+                {"key_tail": k[-6:], "limits": KEY_LIMITS[k], "usage": key_usage.snapshot(k)}
+                for k in PROXY_API_KEYS
+            ] if KEY_LIMITS_ON else []),
         },
         "circuit_breaker": {
             "window":      BREAKER_WINDOW,

@@ -59,6 +59,31 @@ Sensible defaults — most users never touch these.
 | `BREAKER_ERROR_RATE` | `0.5` | Health-failure fraction that trips the breaker |
 | `BREAKER_COOLDOWN` | `60` | Seconds the breaker stays open before re-probing |
 
+### Per-key budgets & rate limits
+
+Give each `PROXY_API_KEYS` entry a ceiling so the router is safe to share with a team. These
+env vars are **global defaults**; set per-key overrides in `auth.json` with `hr limit set`.
+`0` = unlimited (the default — no enforcement). Live usage shows in `/v1/status` and `hr status`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROXY_LIMIT_RPM` | `0` | Requests/minute per key (rolling 60s window) |
+| `PROXY_LIMIT_REQ_DAY` | `0` | Requests per UTC day, per key |
+| `PROXY_LIMIT_TOKENS_DAY` | `0` | Tokens per UTC day, per key |
+
+```bash
+hr limit set sk-team-1 --rpm 60 --req-day 500 --tokens-day 100000   # per-key, written to auth.json
+hr limit list                                                       # show all
+hr restart                                                          # apply
+```
+
+Exceeding a limit returns `429` with a clear message and a `Retry-After` header. Per-key limits
+in `auth.json` look like:
+
+```json
+{ "proxy_keys": { "sk-team-1": { "rpm": 60, "req_per_day": 500, "tokens_per_day": 100000 } } }
+```
+
 ### Local model (Ollama / LM Studio / llama.cpp)
 
 Set either of the first two to enable a `local` provider pointing at a model on your own
