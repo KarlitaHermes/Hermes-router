@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+- **Fix duplicate model display.** When a provider has multiple models configured, the dashboard
+  no longer shows the primary model twice (once on its own line and again in the full list).
+  Only the comma-separated list is shown when multiple models are set.
+
 ## 0.5.0
 
 - **Usage in the dashboard.** The dashboard now shows a **Tokens** column per provider, total

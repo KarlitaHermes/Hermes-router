@@ -99,11 +99,12 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       const ready = keys.filter(k=>k.status==='ready').length;
       const cooling = keys.filter(k=>k.status==='cooling').length;
       const keyStr = keys.length ? (ready + ' ready' + (cooling?(' · '+cooling+' cooling'):'')) : '—';
-      const models = (p.models && p.models.length>1)
-        ? '<div class="models">'+esc(p.models.join(', '))+'</div>' : '';
+      const modelLine = (p.models && p.models.length > 1)
+        ? '<div class="models">'+esc(p.models.join(', '))+'</div>'
+        : '<div class="models">'+esc(p.model||'')+'</div>';
       const caps = [p.supports_tools?'tools':'', p.reasoning?'reasoning':''].filter(Boolean).join(' · ');
       const lat = p.latency_ms ? Math.round(p.latency_ms)+'ms' : '—';
-      return '<tr><td><b>'+esc(n)+'</b> '+avail+'<div class="models">'+esc(p.model||'')+'</div>'+models+'</td>'+
+      return '<tr><td><b>'+esc(n)+'</b> '+avail+modelLine+'</td>'+
              '<td>'+(p.rating??'—')+'</td>'+
              '<td>'+esc(lat)+'</td>'+
              '<td>'+esc(keyStr)+(caps?'<div class="models">'+esc(caps)+'</div>':'')+'</td>'+
