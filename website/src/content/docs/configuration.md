@@ -74,19 +74,35 @@ env vars are **global defaults**; set per-key overrides in `auth.json` with `hr 
 | `PROXY_LIMIT_RPM` | `0` | Requests/minute per key (rolling 60s window) |
 | `PROXY_LIMIT_REQ_DAY` | `0` | Requests per UTC day, per key |
 | `PROXY_LIMIT_TOKENS_DAY` | `0` | Tokens per UTC day, per key |
+| `PROXY_LIMIT_COST_DAY` | `0` | Estimated USD cost per UTC day, per key (see [Cost awareness](#cost--spend-awareness)) |
 
 ```bash
-hr limit set sk-team-1 --rpm 60 --req-day 500 --tokens-day 100000   # per-key, written to auth.json
-hr limit list                                                       # show all
-hr restart                                                          # apply
+hr limit set sk-team-1 --rpm 60 --req-day 500 --tokens-day 100000 --cost-day 5   # per-key, written to auth.json
+hr limit list                                                                    # show all
+hr restart                                                                       # apply
 ```
 
 Exceeding a limit returns `429` with a clear message and a `Retry-After` header. Per-key limits
 in `auth.json` look like:
 
 ```json
-{ "proxy_keys": { "sk-team-1": { "rpm": 60, "req_per_day": 500, "tokens_per_day": 100000 } } }
+{ "proxy_keys": { "sk-team-1": { "rpm": 60, "req_per_day": 500, "tokens_per_day": 100000, "cost_per_day": 5 } } }
 ```
+
+### Cost / spend awareness
+
+The router estimates **spend** from a built-in price table (USD per 1M tokens, input/output).
+Free providers and subscription plans (Codex, Kimi coding) are **$0**. Estimated cost shows per
+provider and per key in `/v1/usage`, `/v1/status`, `hr status`, the VS Code dashboard, and
+`/metrics` (`hermes_router_cost_usd_total`). USD is always the canonical figure.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `COST_CURRENCY` | `USD` | A second currency to *also* display (e.g. `INR`) — requires `COST_FX_RATE` |
+| `COST_FX_RATE` | `0` | USD→`COST_CURRENCY` multiplier (e.g. `83`); `0` shows USD only |
+| `MODEL_PRICES_FILE` | *(unset)* | JSON file of price overrides — `{"model-substr": [input, output]}` (USD per 1M tokens) — merged over the built-in table |
+
+Prices are **best-effort estimates** and drift over time; correct them with `MODEL_PRICES_FILE`.
 
 ### Local model (Ollama / LM Studio / llama.cpp)
 

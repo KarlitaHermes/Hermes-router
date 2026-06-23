@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- **Estimated spend in the dashboard.** When the router has cost awareness configured, the
+  dashboard header shows total estimated **spend** alongside tokens served (reads the new
+  `cost_usd` field from `/v1/status`). Free providers/subscription plans count as `$0`.
+
 ## 0.5.2
 
 - **Per-model capability in the dashboard.** Multi-model providers now show each model with its

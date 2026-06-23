@@ -88,10 +88,12 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
     const mode = (s.rotation && s.rotation.mode) || '—';
     const limits = s.limits || {};
     let totalTokens = 0;
+    let totalCost = 0;
 
     let rows = names.map(n => {
       const p = provs[n] || {};
       totalTokens += (p.tokens || 0);
+      totalCost += (p.cost_usd || 0);
       const avail = p.available === false ? '<span class="down">● down</span>'
                   : p.available === true ? '<span class="ok">● up</span>'
                   : '<span class="muted">● ?</span>';
@@ -141,7 +143,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
     el.innerHTML =
       '<div class="meta">rotation: <span class="pill">'+esc(mode)+'</span> &nbsp; ' +
-      'cache: '+cacheStr+(totalTokens?(' &nbsp; tokens: '+totalTokens.toLocaleString()):'')+'</div>' +
+      'cache: '+cacheStr+(totalTokens?(' &nbsp; tokens: '+totalTokens.toLocaleString()):'')+
+        (totalCost?(' &nbsp; spend: $'+totalCost.toFixed(4)):'')+'</div>' +
       limitStr +
       '<table><thead><tr><th>Provider</th><th>Rating</th><th>Latency</th><th>Keys</th><th>Tokens</th></tr></thead><tbody>'+
       (rows || '<tr><td colspan="5" class="muted">No providers configured.</td></tr>')+
