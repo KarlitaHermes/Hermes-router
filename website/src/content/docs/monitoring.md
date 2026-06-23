@@ -40,17 +40,22 @@ Point Prometheus/Grafana at it to track per-provider traffic and the cache over 
 | `hermes_router_cache_size` | gauge | — | Entries currently in the response cache |
 | `hermes_router_semantic_cache_hits_total` | counter | — | Semantic-cache hits |
 | `hermes_router_tokens_total` | counter | `provider` | Tokens served per provider (non-streaming) |
+| `hermes_router_cost_usd_total` | counter | `provider` | Estimated USD cost served per provider |
 | `hermes_router_key_requests_total` | counter | `key` | Requests per proxy key (key tail) |
 
 ## Usage analytics (`/v1/usage`)
 
 `GET /v1/usage` (proxy key required) returns a JSON summary for dashboards and billing:
 
-- **per provider** — requests, errors, tokens served
-- **per key** — request and token totals (lifetime + today, plus the live RPM window);
+- **per provider** — requests, errors, tokens served, and estimated `cost` (`{"usd": …}`, plus a
+  converted currency when `COST_FX_RATE` is set)
+- **per key** — request, token, and cost totals (lifetime + today, plus the live RPM window);
   keys are shown by their **last 6 chars only**, never in full
 - **cache** — hits, misses, hit-rate, semantic hits
-- **totals** — total tokens and uptime
+- **totals** — total tokens, total estimated cost, and uptime
+
+Cost is estimated from a built-in price table; free providers and subscription plans are `$0`.
+See [Configuration → Cost awareness](/configuration/#cost--spend-awareness).
 
 ```bash
 curl -H "Authorization: Bearer sk-router-1" http://localhost:8319/v1/usage

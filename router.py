@@ -82,6 +82,11 @@ FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabl
 # provider); falls back to exact match when off or unavailable.
 SEMANTIC_CACHE     = os.environ.get("SEMANTIC_CACHE", "0").strip().lower() not in ("0", "", "false", "no", "off")
 SEMANTIC_THRESHOLD = float(os.environ.get("SEMANTIC_CACHE_THRESHOLD", "0.95"))
+# Cost display: USD is always the canonical figure. Set COST_FX_RATE (e.g. 83) and
+# COST_CURRENCY (e.g. INR) to ALSO surface a converted amount in /v1/usage etc.
+COST_CURRENCY      = os.environ.get("COST_CURRENCY", "USD").strip().upper() or "USD"
+try:    COST_FX_RATE = float(os.environ.get("COST_FX_RATE", 0) or 0)
+except (TypeError, ValueError): COST_FX_RATE = 0.0
 # How keys are picked within a provider:
 #   round-robin — spread requests evenly across all keys (keys deplete together)
 #   sequential  — drain one key until it rate-limits, then move on (keeps reserves fresh)
@@ -279,6 +284,32 @@ _RATING_PATTERNS: list = [
     (5, ["micro", "tiny", "1b"]),
 ]
 _COMPLEXITY_LABELS = {1: "critical", 2: "complex", 3: "standard", 4: "simple", 5: "trivial"}
+
+# Approximate list prices (USD per 1M tokens) as (input, output), for cost
+# ESTIMATION only. Substring match like _rate_model (longest key wins). Anything
+# not listed — every free provider, and subscription plans like Codex (ChatGPT)
+# and the Kimi coding plan — is treated as $0. Prices drift; treat as estimates
+# and override/extend with MODEL_PRICES_FILE (JSON: {"model-substr": [in, out]}).
+MODEL_PRICES: dict = {
+    "gpt-4o-mini":      (0.15, 0.60),
+    "gpt-4o":           (2.50, 10.00),
+    "gpt-4.1-mini":     (0.40, 1.60),
+    "gpt-4.1":          (2.00, 8.00),
+    "o1-mini":          (1.10, 4.40),
+    "o1":               (15.00, 60.00),
+    "o3-mini":          (1.10, 4.40),
+    "claude-opus":      (15.00, 75.00),
+    "claude-sonnet":    (3.00, 15.00),
+    "claude-3-5-haiku": (0.80, 4.00),
+    "claude-haiku":     (0.80, 4.00),
+    "mistral-large":    (2.00, 6.00),
+    "mistral-medium":   (0.40, 2.00),
+    "mistral-small":    (0.10, 0.30),
+    "command-a":        (2.50, 10.00),
+    "command-r-plus":   (2.50, 10.00),
+    "command-r":        (0.15, 0.60),
+    "kimi-k2":          (0.60, 2.50),
+}
 _provider_state: dict = {}   # populated at startup by _initialize_ratings()
 # Per-(provider, model) capability — rating + tool/reasoning support. Keyed by
 # (provider_name, model). Lets smart routing treat each model in a provider's
@@ -613,6 +644,53 @@ def _rate_model(model_name: str) -> int:
         if any(p in mn for p in patterns):
             return rating
     return 3
+
+
+def _apply_price_overrides():
+    """Merge MODEL_PRICES_FILE (JSON {"model-substr": [in, out]}) over the built-in
+    price table, so users can correct/extend prices without editing code."""
+    path = os.environ.get("MODEL_PRICES_FILE")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        doc = json.loads(Path(path).read_text())
+        n = 0
+        for k, v in (doc or {}).items():
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                MODEL_PRICES[k.lower()] = (float(v[0]), float(v[1])); n += 1
+        log.info(f"Pricing: loaded {n} override(s) from {path}")
+    except Exception as e:
+        log.warning(f"Pricing: could not read MODEL_PRICES_FILE {path}: {e}")
+
+
+def _price_model(model: str) -> tuple:
+    """(input, output) USD per 1M tokens for a model; (0, 0) if unpriced/free.
+    Longest-substring match, mirroring _rate_model."""
+    mn = (model or "").lower()
+    for key in sorted(MODEL_PRICES, key=len, reverse=True):
+        if key in mn:
+            return MODEL_PRICES[key]
+    return (0.0, 0.0)
+
+
+def _cost(model: str, prompt_toks, completion_toks) -> float:
+    """Estimated USD cost of one response from its token usage. Free/unpriced = 0."""
+    pin, pout = _price_model(model)
+    if not pin and not pout:
+        return 0.0
+    return (int(prompt_toks or 0) / 1e6) * pin + (int(completion_toks or 0) / 1e6) * pout
+
+
+def _cost_obj(usd: float) -> dict:
+    """Serialize a USD amount for JSON output, adding a converted figure when
+    COST_FX_RATE is set (e.g. {"usd": 0.0123, "inr": 1.02})."""
+    out = {"usd": round(float(usd or 0), 6)}
+    if COST_FX_RATE > 0 and COST_CURRENCY != "USD":
+        out[COST_CURRENCY.lower()] = round(float(usd or 0) * COST_FX_RATE, 4)
+    return out
+
+
+_apply_price_overrides()
 
 
 def _model_env_suffix(model: str) -> str:
@@ -1341,6 +1419,8 @@ def _load_key_limits() -> dict:
     g_rpm    = _int_env("PROXY_LIMIT_RPM", 0)
     g_req    = _int_env("PROXY_LIMIT_REQ_DAY", 0)
     g_tokens = _int_env("PROXY_LIMIT_TOKENS_DAY", 0)
+    try:    g_cost = float(os.environ.get("PROXY_LIMIT_COST_DAY", 0) or 0)
+    except (TypeError, ValueError): g_cost = 0.0
     per_key = {}
     if AUTH_FILE.exists():
         try:
@@ -1357,6 +1437,7 @@ def _load_key_limits() -> dict:
             "rpm":            int(spec.get("rpm", g_rpm) or 0),
             "req_per_day":    int(spec.get("req_per_day", g_req) or 0),
             "tokens_per_day": int(spec.get("tokens_per_day", g_tokens) or 0),
+            "cost_per_day":   float(spec.get("cost_per_day", g_cost) or 0),
         }
     return limits
 
@@ -1379,8 +1460,8 @@ class KeyUsage:
     def __init__(self):
         self.lock = threading.Lock()
         self._win  = defaultdict(deque)   # key -> deque[timestamps] within the last 60s
-        self._day  = defaultdict(lambda: {"day": "", "req": 0, "tokens": 0})
-        self._life = defaultdict(lambda: {"req": 0, "tokens": 0})  # cumulative since start
+        self._day  = defaultdict(lambda: {"day": "", "req": 0, "tokens": 0, "cost": 0.0})
+        self._life = defaultdict(lambda: {"req": 0, "tokens": 0, "cost": 0.0})  # since start
 
     def _roll(self, key, now):
         w = self._win[key]
@@ -1392,7 +1473,7 @@ class KeyUsage:
         d = self._day[key]
         today = _utc_day()
         if d["day"] != today:
-            d.update(day=today, req=0, tokens=0)
+            d.update(day=today, req=0, tokens=0, cost=0.0)
         return d
 
     def check_and_record(self, key, limits):
@@ -1403,10 +1484,13 @@ class KeyUsage:
         rpm     = limits.get("rpm", 0)
         req_day = limits.get("req_per_day", 0)
         tpd     = limits.get("tokens_per_day", 0)
+        cpd     = limits.get("cost_per_day", 0)
         now = time.time()
         with self.lock:
             d = self._day_bucket(key)
             self._roll(key, now)
+            if cpd and d["cost"] >= cpd:
+                return (False, _secs_to_utc_midnight(), f"${cpd:g} cost/day")
             if tpd and d["tokens"] >= tpd:
                 return (False, _secs_to_utc_midnight(), f"{tpd} tokens/day")
             if rpm and len(self._win[key]) >= rpm:
@@ -1426,29 +1510,49 @@ class KeyUsage:
             self._day_bucket(key)["tokens"] += n
             self._life[key]["tokens"] += n
 
+    def add_cost(self, key, usd):
+        usd = float(usd or 0)
+        if not usd:
+            return
+        with self.lock:
+            self._day_bucket(key)["cost"] += usd
+            self._life[key]["cost"] += usd
+
     def snapshot(self, key):
         with self.lock:
             d = self._day_bucket(key)
             self._roll(key, time.time())
             l = self._life[key]
             return {"req_today": d["req"], "tokens_today": d["tokens"],
+                    "cost_today": round(d["cost"], 6),
                     "rpm_window": len(self._win[key]),
-                    "req_total": l["req"], "tokens_total": l["tokens"]}
+                    "req_total": l["req"], "tokens_total": l["tokens"],
+                    "cost_total": round(l["cost"], 6)}
 
 
 key_usage = KeyUsage()
 
-# Cumulative tokens served per provider (from provider-reported usage on
-# non-streaming responses), for /v1/usage and /metrics. Streaming omits usage,
-# so those requests count toward request totals but not token totals.
+# Cumulative tokens + estimated cost served per provider (from provider-reported
+# usage). Streaming responses that include a usage chunk are counted too; those
+# without usage count toward request totals but not tokens/cost.
 _provider_tokens = defaultdict(int)
+_provider_cost   = defaultdict(float)
 _ptok_lock = threading.Lock()
 
-def _add_provider_tokens(name: str, data: dict):
-    n = ((data.get("usage") or {}).get("total_tokens")) or 0
-    if n:
+def _add_provider_tokens(name: str, data: dict, model: str | None = None):
+    usage = data.get("usage") or {}
+    n = usage.get("total_tokens") or 0
+    # Cost uses the prompt/completion split (input and output are priced
+    # differently). Prefer the model the provider actually reports serving
+    # (authoritative for pricing); fall back to the routed model name.
+    cost = _cost(data.get("model") or model or "",
+                 usage.get("prompt_tokens"), usage.get("completion_tokens"))
+    if n or cost:
         with _ptok_lock:
-            _provider_tokens[name] += n
+            if n:
+                _provider_tokens[name] += n
+            if cost:
+                _provider_cost[name] += cost
 
 # ── Thinking field stripping ───────────────────────────────────────────────────
 # Some providers (e.g. Gemini 2.5) emit reasoning/thinking fields in responses.
@@ -1513,10 +1617,11 @@ def _with_cleanup(resp: requests.Response, gen):
         resp.close()
 
 
-def _streaming_with_usage(gen, name: str):
+def _streaming_with_usage(gen, name: str, model: str | None = None):
     """Wrap a streaming generator to capture the usage block from the final SSE
     chunk (present when stream_options.include_usage=true is sent upstream) and
-    record tokens in _provider_tokens. Yields every chunk unchanged."""
+    record tokens + cost in _provider_tokens/_provider_cost. Yields every chunk
+    unchanged."""
     usage: dict = {}
     for chunk in gen:
         text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
@@ -1531,7 +1636,7 @@ def _streaming_with_usage(gen, name: str):
                     pass
         yield chunk
     if usage:
-        _add_provider_tokens(name, {"usage": usage})
+        _add_provider_tokens(name, {"usage": usage}, model)
 
 # ── Anthropic format translation ──────────────────────────────────────────────
 # Anthropic's Messages API uses a different format from OpenAI. These helpers
@@ -2353,11 +2458,19 @@ def _admit_request(token: str):
 
 
 def _record_request_tokens(token: str, payload: dict, result):
-    """Post-flight: add this request's tokens to the caller's tally (daily + lifetime).
-    Uses provider-reported usage when present, else an estimate (e.g. streaming)."""
+    """Post-flight: add this request's tokens (and estimated cost) to the caller's
+    tally (daily + lifetime). Uses provider-reported usage when present, else an
+    estimate (e.g. streaming). Cost uses the response model's prompt/completion
+    split when available; $0 for free/unpriced models."""
     n = 0
     if result and result[0] == "json":
-        n = ((result[1].get("usage") or {}).get("total_tokens")) or 0
+        data  = result[1]
+        usage = data.get("usage") or {}
+        n = usage.get("total_tokens") or 0
+        cost = _cost(data.get("model") or payload.get("model") or "",
+                     usage.get("prompt_tokens"), usage.get("completion_tokens"))
+        if cost:
+            key_usage.add_cost(token, cost)
     if not n:
         n = _estimated_tokens(payload.get("messages", []))
     key_usage.add_tokens(token, n)
@@ -2555,20 +2668,20 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                             try: events.append(json.loads(ds))
                             except Exception: pass
                 data = _from_codex_response(events)
-                _add_provider_tokens(name, data)
+                _add_provider_tokens(name, data, model)
                 cache.set(payload, data, ns, query_emb)
                 return ("json", data)
             if streaming:
                 gen = (_anthropic_streaming_generator(resp) if is_anthropic
                        else _streaming_generator(resp))
-                wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name)
+                wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name, model)
                 return ("stream", wrapped, name)
             else:
                 data = (_from_anthropic_response(resp.json()) if is_anthropic
                         else resp.json())
                 if not is_anthropic:
                     _strip_response(data)
-                _add_provider_tokens(name, data)
+                _add_provider_tokens(name, data, model)
                 cache.set(payload, data, ns, query_emb)
                 return ("json", data)
 
@@ -2751,6 +2864,7 @@ def status():
             "stats": stats.summary(p["name"]),
             "breaker": stats.breaker_status(p["name"]),
             "tokens": _provider_tokens.get(p["name"], 0),
+            "cost_usd": round(_provider_cost.get(p["name"], 0.0), 6),
         }
         # Surface the internal routing signals (rating + probe latency + model)
         # so dashboards can show them. Added only when known, so un-probed
@@ -2836,12 +2950,14 @@ def usage():
             "requests": s["total_requests"],
             "errors":   s["errors"],
             "tokens":   _provider_tokens.get(p["name"], 0),
+            "cost":     _cost_obj(_provider_cost.get(p["name"], 0.0)),
         }
     keys = [{"key_tail": k[-6:], **key_usage.snapshot(k)} for k in PROXY_API_KEYS]
 
     return jsonify({
         "uptime_s":  round(time.time() - START_TIME),
-        "totals":    {"tokens": sum(_provider_tokens.values())},
+        "totals":    {"tokens": sum(_provider_tokens.values()),
+                      "cost":   _cost_obj(sum(_provider_cost.values()))},
         "providers": providers,
         "keys":      keys,
         "cache": {
@@ -2898,6 +3014,8 @@ def metrics():
 
     emit("hermes_router_tokens_total", "counter", "Total tokens served per provider (non-streaming)",
          [({"provider": n}, v) for n, v in _provider_tokens.items()])
+    emit("hermes_router_cost_usd_total", "counter", "Estimated USD cost served per provider",
+         [({"provider": n}, round(v, 6)) for n, v in _provider_cost.items()])
     emit("hermes_router_key_requests_total", "counter", "Total requests per proxy key (by key tail)",
          [({"key": k[-6:]}, key_usage.snapshot(k)["req_total"]) for k in PROXY_API_KEYS])
 

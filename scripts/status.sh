@@ -117,6 +117,7 @@ br_cfg = d.get("circuit_breaker", {})
 rotation = d.get("rotation", {})
 limits = d.get("limits", {})
 total_tokens = sum(p.get("tokens", 0) for p in providers.values())
+total_cost   = sum(p.get("cost_usd", 0) for p in providers.values())
 print()
 if rotation:
     print(f"  {DIM}rotation: {rotation.get('mode','?')}{RST}")
@@ -127,8 +128,9 @@ if cache:
     persist_str = " · persistent" if cache.get("persistent") else ""
     print(f"  {DIM}cache: {'on' if cache.get('enabled') else 'off'} · "
           f"hit-rate {cache.get('hit_rate',0)} · {cache.get('size',0)}/{cache.get('max_size','?')} entries{persist_str}{sem_str}{RST}")
-if total_tokens:
-    print(f"  {DIM}tokens served: {total_tokens}{RST}")
+if total_tokens or total_cost:
+    cost_str = f" · ${total_cost:.4f} spent" if total_cost else ""
+    print(f"  {DIM}tokens served: {total_tokens}{cost_str}{RST}")
 if limits.get("enabled"):
     for k in limits.get("keys", []):
         lim, use = k.get("limits", {}), k.get("usage", {})
@@ -136,6 +138,7 @@ if limits.get("enabled"):
         if lim.get("rpm"):            parts.append(f"{use.get('rpm_window',0)}/{lim['rpm']} rpm")
         if lim.get("req_per_day"):    parts.append(f"{use.get('req_today',0)}/{lim['req_per_day']} req/day")
         if lim.get("tokens_per_day"): parts.append(f"{use.get('tokens_today',0)}/{lim['tokens_per_day']} tok/day")
+        if lim.get("cost_per_day"):   parts.append(f"${use.get('cost_today',0):.4f}/${lim['cost_per_day']:g} cost/day")
         print(f"  {DIM}limit …{k.get('key_tail','?')}: {' · '.join(parts) if parts else 'unlimited'}{RST}")
 if br_cfg:
     print(f"  {DIM}breaker: trips at {int(br_cfg.get('error_rate',0)*100)}% fails over last "

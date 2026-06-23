@@ -113,12 +113,17 @@ embedding provider is available — so it adds savings without changing behavior
 
 ### Per-key budgets & rate limits
 
-Each `PROXY_API_KEYS` entry can carry a requests-per-minute ceiling and per-UTC-day request and
-token budgets (set globally via `PROXY_LIMIT_*` or per key in `auth.json` with `hr limit`). A
-caller over its limit gets a `429` with `Retry-After` *before* any provider is contacted; live
-counters appear in `/v1/status`. Unset = unlimited, so single-user setups are unaffected. This
-makes the router safe to share with a team. See
+Each `PROXY_API_KEYS` entry can carry a requests-per-minute ceiling and per-UTC-day request,
+token, **and estimated-cost** budgets (set globally via `PROXY_LIMIT_*` or per key in `auth.json`
+with `hr limit`). A caller over its limit gets a `429` with `Retry-After` *before* any provider is
+contacted; live counters appear in `/v1/status`. Unset = unlimited, so single-user setups are
+unaffected. This makes the router safe to share with a team. See
 [Configuration](/configuration/#per-key-budgets--rate-limits).
+
+**Cost awareness.** Spend is estimated from a built-in per-model price table (free providers and
+subscription plans are `$0`) and surfaced per provider and per key in `/v1/usage`, `/v1/status`,
+and `/metrics` — with an optional second currency (`COST_FX_RATE`). See
+[Configuration](/configuration/#cost--spend-awareness).
 
 ### Accurate token counting
 
