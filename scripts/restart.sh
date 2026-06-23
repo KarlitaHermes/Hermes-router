@@ -20,7 +20,14 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO" || { echo "cannot cd to repo dir"; exit 1; }
-PYTHON="${PYTHON:-python3}"
+# Prefer the venv Python created by install.sh (where flask/deps live); fall back
+# to system python3. Without this, the standalone restart path below relaunches
+# with bare python3 and fails with ModuleNotFoundError: No module named 'flask'.
+if [ -f "$REPO/venv/bin/python" ]; then
+  PYTHON="${PYTHON:-$REPO/venv/bin/python}"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
 PORT="${PORT:-8319}"
 SERVICE="${HERMES_ROUTER_SERVICE:-hermes-router}"
 
