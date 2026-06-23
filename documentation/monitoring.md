@@ -57,8 +57,8 @@ curl -H "Authorization: Bearer sk-router-1" http://localhost:8319/v1/usage
 
 `GET /v1/status` (proxy key required) returns the full picture as JSON: per-provider key
 cooldown state, rating, model, latency, `supports_tools`, `reasoning`, tokens served,
-circuit-breaker status, plus cache (incl. semantic), routing, and per-key limit/usage config.
-This is what `hr status` renders.
+circuit-breaker status, plus cache (incl. semantic + a `persistent` flag), routing, and per-key
+limit/usage config. This is what `hr status` renders.
 
 The `rotation` block reports the active key-rotation mode
 (`{"rotation": {"mode": "round-robin"}}`); the `limits` block reports per-key budgets and live

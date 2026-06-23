@@ -50,6 +50,8 @@ Sensible defaults — most users never touch these.
 | `MAX_REQUEST_BYTES` | `10485760` (10 MB) | Max request body size; larger requests get `413` (guards against memory exhaustion) |
 | `WORKER_THREADS` | `16` | Waitress worker threads (concurrency). The HTTP connection pool scales with this |
 | `CACHE_MAX_SIZE` | `100` | Max entries in the response cache (LRU eviction) |
+| `CACHE_PERSIST` | `0` | If `1`, mirror the cache to a SQLite file so it survives restarts (opt-in). The DB mirrors the in-memory LRU, so it stays bounded by `CACHE_MAX_SIZE` — raise that to persist more |
+| `CACHE_DB_PATH` | `./cache.db` | SQLite file for the persistent cache. On read-only hosts (e.g. HF Spaces) point it at `/tmp/cache.db` |
 | `SEMANTIC_CACHE` | `0` | If `1`, also serve cached answers for *similar* prompts (needs an embedding provider; falls back to exact match otherwise) |
 | `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Cosine-similarity cutoff for a semantic hit (`1.0` = identical; lower = looser matching) |
 | `FAST_ROUTE_THRESHOLD` | `0` | If >0, requests under this many tokens prefer low-latency providers first (`0` disables) |
