@@ -58,15 +58,24 @@ short cooldown and skipped until it recovers.
 list. Because free-tier rate limits are per-**model**, cooldowns are tracked per **(key,
 model)** pair: when one model hits a 429, the router fails over to the next model on the same
 key before cascading to the next provider. This multiplies free capacity along a third axis —
-**keys × models × providers** — with no extra signups. See
+**keys × models × providers** — with no extra signups. Each listed model is also a first-class
+routing candidate (see [Smart routing](#smart-routing) below), not just failover. See
 [Configuration](/configuration/#multiple-models-per-provider).
 
 ### Smart routing
 
 Requests are scored for difficulty and models for capability (both 1–5, lower = more capable).
 The router picks the cheapest model that can handle the request. Tool requests are only sent to
-providers whose model supports function calling (detected at startup). Optional **fast routing**
+models that support function calling (detected at startup). Optional **fast routing**
 (`FAST_ROUTE_THRESHOLD`) sends short requests to low-latency providers first.
+
+**Per-model scoring.** When a provider lists several models, each **(provider, model)** pair is its
+own routing candidate, scored on *its own* rating and tool/reasoning capability — not the primary's.
+So with `GEMINI_MODEL=gemini-2.5-flash-lite,gemini-2.5-pro`, an easy turn goes to `flash-lite` while
+a hard or tool-using turn can pick `gemini-2.5-pro`, instead of the extra models only being used for
+rate-limit failover. Within equal ratings, a provider's models keep their **listed order**
+(cheapest first). Tool/reasoning support is detected per model, so models of different classes can
+safely share one list. Each model's capability shows in `/v1/status` under `model_caps`.
 
 **Local models & conversation mode.** A model running on your own machine (Ollama / LM Studio /
 llama.cpp) can join the pool as the `local` provider — free, private, fast (see

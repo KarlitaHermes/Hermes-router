@@ -159,13 +159,18 @@ hr restart
 Free-tier rate limits are almost always **per-model**, so each model is its own quota
 bucket. When the first model hits its limit (429), the router **fails over to the next model
 on the same key** before cascading to the next provider — multiplying free throughput along a
-new axis (keys × models × providers), with no extra signups. The first model in the list is
-the **primary** (used for routing, rating, and status); list them in preference order
-(cheapest/fastest first).
+new axis (keys × models × providers), with no extra signups. Each model is **also a first-class
+routing candidate**, scored on its own rating and capability — so the router can pick the right
+model in the list for each request (e.g. a stronger model for a hard or tool-using turn), not just
+fall over to it. Within equal ratings, the **listed order** is preserved, so list them in
+preference order (cheapest/fastest first).
 
-> **Keep a provider's models the same class.** Tool-calling and reasoning are detected on the
-> primary model and applied to the whole provider, so list models that behave alike (e.g. the
-> Gemini `flash` family). Don't mix a tool-capable chat model with one that can't.
+> **Mixing model classes is fine.** Tool-calling and reasoning are detected **per model** at
+> startup, so you can safely list models of different classes (e.g.
+> `gemini-2.5-flash-lite,gemini-2.5-pro`) — each is routed and gated on its own capability. Force a
+> result per model with `<PROVIDER>_<MODEL>_SUPPORTS_TOOLS` / `_REASONING` (model id upper-cased,
+> non-alphanumerics → `_`, e.g. `GEMINI_GEMINI_2_5_PRO_SUPPORTS_TOOLS=1`); the provider-wide
+> `<PROVIDER>_SUPPORTS_TOOLS` / `_REASONING` still applies as the default for all its models.
 
 ## Key rotation mode
 

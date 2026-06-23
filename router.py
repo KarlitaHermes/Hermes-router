@@ -22,7 +22,7 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging, hashlib, hmac, itertools
+import json, os, time, threading, logging, hashlib, hmac, itertools, re
 from pathlib import Path
 from collections import deque, OrderedDict, defaultdict
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -275,6 +275,10 @@ _RATING_PATTERNS: list = [
 ]
 _COMPLEXITY_LABELS = {1: "critical", 2: "complex", 3: "standard", 4: "simple", 5: "trivial"}
 _provider_state: dict = {}   # populated at startup by _initialize_ratings()
+# Per-(provider, model) capability — rating + tool/reasoning support. Keyed by
+# (provider_name, model). Lets smart routing treat each model in a provider's
+# comma-separated list as its own candidate, instead of inheriting the primary's.
+_model_state: dict = {}
 
 
 def _keys(env_var: str) -> list[str]:
@@ -606,6 +610,27 @@ def _rate_model(model_name: str) -> int:
     return 3
 
 
+def _model_env_suffix(model: str) -> str:
+    """Sanitize a model id into an env-var fragment: upper-case, non-alnum → '_'.
+    e.g. 'gemini-2.5-pro' → 'GEMINI_2_5_PRO' (used for <PROVIDER>_<MODEL>_* overrides)."""
+    return re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_").upper()
+
+
+def _model_caps(name: str, model: str) -> dict:
+    """Per-(provider, model) capability with optimistic defaults. Rating is always
+    derivable (pattern-based, free); tools default to capable when unknown (mirrors
+    _supports_tools' stance) and reasoning defaults to off."""
+    st = _model_state.get((name, model))
+    if st:
+        return st
+    return {"rating": _rate_model(model), "supports_tools": True, "reasoning": False}
+
+
+def _model_supports_tools(name: str, model: str) -> bool:
+    """Whether this specific (provider, model) handles function calling."""
+    return bool(_model_caps(name, model).get("supports_tools", True))
+
+
 def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
                          free_only: bool = False) -> str | None:
     try:
@@ -777,38 +802,41 @@ def classify_complexity(messages: list) -> int:
 def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
                        prefer_local: bool = False) -> list:
     """
-    Sort providers for this complexity: cheapest capable model first, then
-    overkill models, then too-weak as last resort. Never blocks.
+    Rank every configured (provider, model) for this complexity: cheapest capable
+    model first, then overkill, then too-weak as last resort. Never blocks. Returns
+    a flat list of candidate dicts {"provider": <provider>, "model": <model str>}.
 
-    When FAST_ROUTE_THRESHOLD is set and the request is shorter than it,
-    low-latency providers win ties between otherwise equally-ranked options.
+    Each model in a provider's comma-separated list is its own candidate, scored on
+    its OWN rating — so e.g. gemini-2.5-pro can be picked for a hard request while
+    gemini-2.5-flash-lite handles easy ones, instead of the extra models only being
+    429-failover. Within equal ratings, a provider's models keep their listed order
+    (list_index tie-break), so cheapest-first ordering still holds.
 
-    With prefer_local (the `:fast` / conversation profile), a configured `local`
-    provider is moved to the very front for short/casual turns (complexity ≥ 3),
-    with the cloud providers as automatic fallback. Heavier turns ignore it so
-    they still go to a capable cloud model.
+    When FAST_ROUTE_THRESHOLD is set and the request is shorter than it, low-latency
+    providers win ties. With prefer_local (the `:fast` profile), a configured local
+    model leads on easy turns (complexity ≥ 3), with cloud as fallback.
 
-    Round-robin: providers that tie on every criterion (same rating, same
-    availability) are rotated each request so load spreads across them instead
-    of always hitting the same one first. We rotate the list by a per-request
-    counter before sorting; the sort is stable, so equal-keyed providers keep
-    their (rotated) relative order.
+    Round-robin: the PROVIDER list is rotated by a per-request counter before
+    flattening, so providers that tie on every criterion spread load; the sort is
+    stable, so equal-keyed candidates keep their (rotated) relative order.
     """
     fast_first = FAST_ROUTE_TOKENS > 0 and 0 < est_tokens < FAST_ROUTE_TOKENS
 
-    def _key(p):
-        state  = _provider_state.get(p["name"], {})
-        rating = state.get("rating", _rate_model(p["model"]))
-        avail  = state.get("available", True)
-        fast   = 0 if (fast_first and p["name"] in _FAST_PROVIDERS) else 1
+    def _key(cand):
+        p      = cand["provider"]
+        model  = cand["model"]
+        name   = p["name"]
+        rating = _model_caps(name, model)["rating"]
+        avail  = _provider_state.get(name, {}).get("available", True)
+        fast   = 0 if (fast_first and name in _FAST_PROVIDERS) else 1
         # `:fast` profile: a short/casual turn prefers the local model first.
-        local_first = 0 if (prefer_local and p["name"] == "local" and complexity >= 3) else 1
+        local_first = 0 if (prefer_local and name == "local" and complexity >= 3) else 1
         # Health-aware terms — tier/sort_within stay FIRST so capability matching
         # is never overridden by health (a healthy weak model must not outrank the
         # correct-capability one). When every candidate is healthy these two terms
         # are constant (0), leaving the existing round-robin/tie order untouched.
-        breaker_open = 1 if stats.breaker_open(p["name"]) else 0  # open breakers sink within tier
-        health       = stats.health_bucket(p["name"])            # 0 healthy / 1 degraded / 2 bad
+        breaker_open = 1 if stats.breaker_open(name) else 0  # open breakers sink within tier
+        health       = stats.health_bucket(name)             # 0 healthy / 1 degraded / 2 bad
         if rating <= complexity:
             tier        = 0
             sort_within = complexity - rating   # 0 = perfect match, larger = overkill
@@ -817,27 +845,66 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
             sort_within = rating - complexity   # too weak — closest first
         # local_first leads the key so a preferred local model sorts ahead of all
         # others on easy turns; it's a constant 1 otherwise, leaving order unchanged.
-        return (local_first, tier, sort_within, breaker_open, health, 0 if avail else 1, fast)
+        # list_index trails so a provider's listed model order breaks rating ties.
+        return (local_first, tier, sort_within, breaker_open, health,
+                0 if avail else 1, fast, cand["list_index"])
 
     n = len(providers)
     offset = next(_rr_counter) % n if n else 0
     rotated = providers[offset:] + providers[:offset]
-    return sorted(rotated, key=_key)
+    candidates = [{"provider": p, "model": m, "list_index": i}
+                  for p in rotated
+                  for i, m in enumerate(p.get("models") or [p["model"]])]
+    return sorted(candidates, key=_key)
+
+
+def _env_flag(name: str, suffix: str, model: str):
+    """Read a capability override env var, preferring the per-model form
+    <PROVIDER>_<MODEL>_<SUFFIX> over the provider-wide <PROVIDER>_<SUFFIX>.
+    Returns True/False if set, else None (= not overridden → probe)."""
+    val = os.environ.get(f"{name.upper()}_{_model_env_suffix(model)}_{suffix}")
+    if val is None:
+        val = os.environ.get(f"{name.upper()}_{suffix}")
+    if val is None:
+        return None
+    return val.strip().lower() not in ("0", "false", "no", "")
+
+
+def _resolve_caps(p: dict, key: str, model: str, ok: bool) -> dict:
+    """Capability for one (provider, model): rating (free, pattern-based) plus
+    tool/reasoning support. An env override (per-model first, then provider-wide)
+    wins; otherwise probe the model when the provider is reachable."""
+    name = p["name"]
+    et = _env_flag(name, "SUPPORTS_TOOLS", model)
+    supports_tools = et if et is not None else (_probe_tools(p, key, model) if ok else False)
+    er = _env_flag(name, "REASONING", model)
+    reasoning = er if er is not None else (_probe_reasoning(p, key, model) if ok else False)
+    return {"rating": _rate_model(model), "supports_tools": supports_tools, "reasoning": reasoning}
 
 
 def _initialize_ratings(providers: list, pool_ref):
     """Background: probe all providers, fix bad models, assign ratings, persist state."""
-    global _provider_state
+    global _provider_state, _model_state
     if STATE_FILE.exists():
         try:
             cached_doc = json.loads(STATE_FILE.read_text())
             _provider_state = cached_doc.get("providers", {})
-            log.info(f"[ratings] Loaded cached state ({len(_provider_state)} providers)")
-            # Probes cost a real completion per provider, so skip them while the
-            # state is fresh and still covers every configured provider.
+            # Per-model caps were persisted as "name::model" keys — restore tuples.
+            _model_state = {}
+            for k, v in (cached_doc.get("model_state") or {}).items():
+                n, _, m = k.partition("::")
+                if m:
+                    _model_state[(n, m)] = v
+            log.info(f"[ratings] Loaded cached state ({len(_provider_state)} providers, "
+                     f"{len(_model_state)} models)")
+            # Probes cost a real completion per model, so skip them while the state
+            # is fresh AND still covers every configured provider and model.
             age = time.time() - cached_doc.get("last_updated_ts", 0)
+            models_covered = all((p["name"], m) in _model_state
+                                 for p in providers for m in (p.get("models") or [p["model"]]))
             if (STATE_TTL_HOURS > 0 and age < STATE_TTL_HOURS * 3600
-                    and all(p["name"] in _provider_state for p in providers)):
+                    and all(p["name"] in _provider_state for p in providers)
+                    and models_covered):
                 for p in providers:
                     cached_model = _provider_state[p["name"]].get("model")
                     if cached_model and cached_model != p["model"]:
@@ -854,12 +921,17 @@ def _initialize_ratings(providers: list, pool_ref):
 
     log.info("[ratings] Background provider validation starting…")
     new_state = {}
+    new_model_state = {}
+    cached_models = dict(_model_state)   # reuse fresh entries; only probe new/expired ones
     for p in providers:
         name  = p["name"]
         key   = pool_ref.first_key(name)
         if not key:
             new_state[name] = {"rating": _rate_model(p["model"]), "model": p["model"],
                                 "available": False, "latency_ms": 0, "overridden": False}
+            for m in (p.get("models") or [p["model"]]):
+                new_model_state[(name, m)] = {"rating": _rate_model(m),
+                                              "supports_tools": False, "reasoning": False}
             continue
         ok, latency, actual = _probe_provider(p, key)
         original   = p["model"]
@@ -870,36 +942,30 @@ def _initialize_ratings(providers: list, pool_ref):
             if p.get("models"):
                 p["models"][0] = actual
             pool_ref.rename_model(name, original, actual)
-        rating = _rate_model(actual)
-        # Tool-capability: an explicit env override wins; otherwise probe (only
-        # when reachable — no point asking a down provider).
-        env_tools = os.environ.get(f"{name.upper()}_SUPPORTS_TOOLS")
-        if env_tools is not None:
-            supports_tools = env_tools.strip().lower() not in ("0", "false", "no", "")
-        elif ok:
-            supports_tools = _probe_tools(p, key, actual)
-        else:
-            supports_tools = False
-        # Reasoning-model detection (env override wins, else probe when reachable).
-        env_reason = os.environ.get(f"{name.upper()}_REASONING")
-        if env_reason is not None:
-            reasoning = env_reason.strip().lower() not in ("0", "false", "no", "")
-        elif ok:
-            reasoning = _probe_reasoning(p, key, actual)
-        else:
-            reasoning = False
-        log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} rating={rating} model={actual} "
-                 f"{latency:.0f}ms tools={'yes' if supports_tools else 'no'} "
-                 f"reasoning={'yes' if reasoning else 'no'}")
-        new_state[name] = {"rating": rating, "model": actual, "available": ok,
+        # Per-model capabilities for the whole list (primary = models[0] = actual).
+        # Reuse a cached entry when present so adding one model doesn't re-probe all.
+        for m in (p.get("models") or [actual]):
+            caps = cached_models.get((name, m)) or _resolve_caps(p, key, m, ok)
+            new_model_state[(name, m)] = caps
+            log.info(f"[ratings]   {name}/{m}: rating={caps['rating']} "
+                     f"tools={'yes' if caps['supports_tools'] else 'no'} "
+                     f"reasoning={'yes' if caps['reasoning'] else 'no'}")
+        # Provider-level fields mirror the primary model's caps (back-compat).
+        prim = new_model_state[(name, actual)]
+        log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} model={actual} {latency:.0f}ms")
+        new_state[name] = {"rating": prim["rating"], "model": actual, "available": ok,
                             "latency_ms": round(latency, 1), "overridden": overridden,
-                            "original_model": original, "supports_tools": supports_tools,
-                            "reasoning": reasoning}
+                            "original_model": original, "supports_tools": prim["supports_tools"],
+                            "reasoning": prim["reasoning"]}
     _provider_state = new_state
+    _model_state = new_model_state
     try:
         STATE_FILE.write_text(json.dumps({"last_updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                            "last_updated_ts": time.time(),
-                                           "providers": new_state}, indent=2))
+                                           "providers": new_state,
+                                           "model_state": {f"{n}::{m}": v
+                                                           for (n, m), v in new_model_state.items()}},
+                                          indent=2))
         log.info("[ratings] State persisted to disk")
     except Exception as e:
         log.warning(f"[ratings] Could not persist state: {e}")
@@ -1823,14 +1889,6 @@ def _estimated_tokens(messages: list) -> int:
     return sum(len(_message_text(m)) for m in messages) // 4
 
 
-def _supports_tools(provider: dict) -> bool:
-    """Whether this provider's model handles function calling, from the startup
-    probe. Unknown (e.g. state from before this feature, or never probed) is
-    treated optimistically as capable so we never hard-fail on missing data."""
-    val = _provider_state.get(provider["name"], {}).get("supports_tools")
-    return True if val is None else bool(val)
-
-
 def _ordered_providers(payload: dict, prefer_local: bool = False) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
@@ -1842,7 +1900,7 @@ def _ordered_providers(payload: dict, prefer_local: bool = False) -> list[dict]:
     complexity = classify_complexity(messages)
     ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages), prefer_local)
     log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
-             f"order={[p['name'] for p in ordered]}")
+             f"order={[c['provider']['name'] + '/' + c['model'] for c in ordered]}")
     return ordered
 
 # ── Codex (Responses API) format translation ──────────────────────────────────
@@ -2083,10 +2141,11 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
 
     # Reasoning models spend output tokens on hidden chain-of-thought, so a small
     # client max_tokens can be entirely consumed by thinking — leaving empty
-    # content. Give reasoning providers extra headroom on top of what the client
+    # content. Give reasoning models extra headroom on top of what the client
     # asked for, so the actual answer still fits. (The model stops when done, so
     # short answers stay short.) Tune/disable with REASONING_TOKEN_RESERVE.
-    if _provider_state.get(provider["name"], {}).get("reasoning"):
+    # Per-model: only the actual model being sent gets the reserve.
+    if _model_caps(provider["name"], body["model"]).get("reasoning"):
         reserve = _int_env("REASONING_TOKEN_RESERVE", 4096)
         if reserve > 0:
             for field in ("max_tokens", "max_completion_tokens"):
@@ -2302,145 +2361,149 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     est_tokens = _estimated_tokens(messages)
     ordered    = _ordered_providers(payload, prefer_local)
 
-    # Tool-aware routing: when the request carries tools, prefer providers whose
-    # model actually supports function calling — otherwise a provider that
-    # silently ignores tools would return plain text instead of the tool call.
-    # SAFETY — only enforce this when at least one tool-capable provider is
-    # available; if none are, fall through to all of them rather than hard-fail.
+    # Tool-aware routing: when the request carries tools, prefer (provider, model)
+    # candidates whose MODEL actually supports function calling — otherwise a model
+    # that silently ignores tools would return plain text instead of the tool call.
+    # SAFETY — only enforce this when at least one tool-capable candidate exists;
+    # if none do, fall through to all of them rather than hard-fail.
     needs_tools  = bool(payload.get("tools"))
-    enforce_tool = needs_tools and any(_supports_tools(p) for p in ordered)
+    enforce_tool = needs_tools and any(
+        _model_supports_tools(c["provider"]["name"], c["model"]) for c in ordered)
 
     # Circuit breaker: skip providers whose breaker is open. SAFETY — if EVERY
     # candidate is open, treat them all as half-open probes (skip none) so we
     # always make forward progress instead of hard-failing while options remain.
-    any_closed = any(not stats.breaker_open(p["name"]) for p in ordered)
+    any_closed = any(not stats.breaker_open(c["provider"]["name"]) for c in ordered)
 
-    for provider in ordered:
+    # Per-(provider, model) failover: walk the ranked candidate list, rotating keys
+    # within each candidate. A whole provider is taken out of the running for this
+    # request (skip_providers) on auth / payload / unexpected errors — those won't
+    # be fixed by another of its models.
+    skip_providers: set = set()
+    for cand in ordered:
+        provider = cand["provider"]
         name     = provider["name"]
+        model    = cand["model"]
 
-        # Breaker open → skip (unless all are open, then probe everything).
-        if any_closed and stats.breaker_open(name):
-            log.info(f"⨂ skipping {name} (circuit open)")
+        if name in skip_providers:
             continue
 
-        # Tool request → skip providers whose model can't do function calling.
-        if enforce_tool and not _supports_tools(provider):
-            log.info(f"⚒ skipping {name} (no tool support)")
+        # Breaker open → skip the whole provider (unless all are open, then probe).
+        if any_closed and stats.breaker_open(name):
+            log.info(f"⨂ skipping {name} (circuit open)")
+            skip_providers.add(name)
             continue
 
         # Skip providers whose payload ceiling this request would exceed
-        # (e.g. Groq's free TPM) — avoids a guaranteed 413 round-trip.
+        # (e.g. Groq's free TPM) — avoids a guaranteed 413 round-trip. Provider-wide.
         cap = provider.get("skip_if_tokens_over", 0)
         if cap and est_tokens > cap:
             log.info(f"⤳ skipping {name} (~{est_tokens} tok > {cap} cap)")
+            skip_providers.add(name)
             continue
 
-        # Model-major failover: try each of the provider's models (separate
-        # per-model rate-limit buckets) in listed order, rotating keys within each,
-        # before cascading to the next provider.
-        stop_provider = False
-        for model in provider["models"]:
-            attempts = pool.key_count(name, model) or 1
-            for _ in range(attempts):
-                key = pool.get_key(name, model)
-                if not key:
-                    break   # all keys for this model are cooling → try next model
+        # Tool request → skip candidates whose MODEL can't do function calling
+        # (per-model; another model on the same provider may still qualify).
+        if enforce_tool and not _model_supports_tools(name, model):
+            log.info(f"⚒ skipping {name}/{model} (no tool support)")
+            continue
 
-                log.info(f"→ Trying {name}/{model} ...{key[-6:]}")
-                t0   = time.time()
-                resp = forward(provider, key, payload, streaming, model)
-                elapsed = time.time() - t0
+        attempts = pool.key_count(name, model) or 1
+        for _ in range(attempts):
+            key = pool.get_key(name, model)
+            if not key:
+                break   # all keys for this (provider, model) are cooling → next candidate
 
-                if resp is None:
-                    stats.record_error(name)
-                    stats.record_health(name, False)   # network/timeout = provider health failure
-                    pool.mark_key_down(name, key, retry_after=30)
-                    continue
+            log.info(f"→ Trying {name}/{model} ...{key[-6:]}")
+            t0   = time.time()
+            resp = forward(provider, key, payload, streaming, model)
+            elapsed = time.time() - t0
 
-                if resp.status_code == 429:
-                    stats.record_error(name)
-                    # 429 is NOT a health failure — per-(key,model) cooldown handles it.
-                    retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
-                    pool.mark_rate_limited(name, key, model, retry_after=retry_after)
-                    log.warning(f"  {name}/{model} 429 — cooldown {retry_after}s, trying next")
-                    continue
+            if resp is None:
+                stats.record_error(name)
+                stats.record_health(name, False)   # network/timeout = provider health failure
+                pool.mark_key_down(name, key, retry_after=30)
+                continue
 
-                if resp.status_code in (401, 403):
-                    stats.record_error(name)
-                    # auth/permission — won't work for any model on this provider.
-                    log.error(f"  {name} {resp.status_code} — auth, skipping provider: {resp.text[:200]}")
-                    stop_provider = True
-                    break
+            if resp.status_code == 429:
+                stats.record_error(name)
+                # 429 is NOT a health failure — per-(key,model) cooldown handles it.
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                pool.mark_rate_limited(name, key, model, retry_after=retry_after)
+                log.warning(f"  {name}/{model} 429 — cooldown {retry_after}s, trying next")
+                continue
 
-                if resp.status_code in (400, 404):
-                    stats.record_error(name)
-                    # model-specific (e.g. bad model name) — try the next model.
-                    log.warning(f"  {name}/{model} {resp.status_code} — skipping this model: {resp.text[:150]}")
-                    break
-
-                if resp.status_code == 413:
-                    stats.record_error(name)
-                    # payload-specific — bigger model won't help; cascade providers.
-                    log.warning(f"  {name} 413 — payload too large, cascading")
-                    stop_provider = True
-                    break
-
-                if resp.status_code >= 500:
-                    stats.record_error(name)
-                    stats.record_health(name, False)   # 5xx = provider health failure
-                    pool.mark_key_down(name, key, retry_after=15)
-                    continue
-
-                if not (200 <= resp.status_code < 300):
-                    stats.record_error(name)
-                    stats.record_health(name, False)   # unexpected non-2xx = health failure
-                    log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
-                    stop_provider = True
-                    break
-
-                # Success
-                stats.record_success(name, elapsed)
-                stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
-                log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
-                is_anthropic = provider.get("protocol") == "anthropic"
-                is_codex     = provider.get("protocol") == "codex"
-                if is_codex:
-                    # Codex backend always streams SSE. Stream it through, or
-                    # aggregate it into one response for non-streaming clients.
-                    if streaming:
-                        return ("stream", _with_cleanup(resp, _codex_streaming_generator(resp)), name)
-                    events = []
-                    for raw in resp.iter_lines():
-                        if not raw:
-                            continue
-                        raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-                        if raw.startswith("data:"):
-                            ds = raw[5:].strip()
-                            if ds and ds != "[DONE]":
-                                try: events.append(json.loads(ds))
-                                except Exception: pass
-                    data = _from_codex_response(events)
-                    _add_provider_tokens(name, data)
-                    cache.set(payload, data, ns, query_emb)
-                    return ("json", data)
-                if streaming:
-                    gen = (_anthropic_streaming_generator(resp) if is_anthropic
-                           else _streaming_generator(resp))
-                    wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name)
-                    return ("stream", wrapped, name)
-                else:
-                    data = (_from_anthropic_response(resp.json()) if is_anthropic
-                            else resp.json())
-                    if not is_anthropic:
-                        _strip_response(data)
-                    _add_provider_tokens(name, data)
-                    cache.set(payload, data, ns, query_emb)
-                    return ("json", data)
-
-            if stop_provider:
+            if resp.status_code in (401, 403):
+                stats.record_error(name)
+                # auth/permission — won't work for any model on this provider.
+                log.error(f"  {name} {resp.status_code} — auth, skipping provider: {resp.text[:200]}")
+                skip_providers.add(name)
                 break
 
-        log.warning(f"✗ {name} exhausted — cascading")
+            if resp.status_code in (400, 404):
+                stats.record_error(name)
+                # model-specific (e.g. bad model name) — just skip this candidate.
+                log.warning(f"  {name}/{model} {resp.status_code} — skipping this model: {resp.text[:150]}")
+                break
+
+            if resp.status_code == 413:
+                stats.record_error(name)
+                # payload-specific — bigger model won't help; cascade providers.
+                log.warning(f"  {name} 413 — payload too large, cascading")
+                skip_providers.add(name)
+                break
+
+            if resp.status_code >= 500:
+                stats.record_error(name)
+                stats.record_health(name, False)   # 5xx = provider health failure
+                pool.mark_key_down(name, key, retry_after=15)
+                continue
+
+            if not (200 <= resp.status_code < 300):
+                stats.record_error(name)
+                stats.record_health(name, False)   # unexpected non-2xx = health failure
+                log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
+                skip_providers.add(name)
+                break
+
+            # Success
+            stats.record_success(name, elapsed)
+            stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
+            log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+            is_anthropic = provider.get("protocol") == "anthropic"
+            is_codex     = provider.get("protocol") == "codex"
+            if is_codex:
+                # Codex backend always streams SSE. Stream it through, or
+                # aggregate it into one response for non-streaming clients.
+                if streaming:
+                    return ("stream", _with_cleanup(resp, _codex_streaming_generator(resp)), name)
+                events = []
+                for raw in resp.iter_lines():
+                    if not raw:
+                        continue
+                    raw = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+                    if raw.startswith("data:"):
+                        ds = raw[5:].strip()
+                        if ds and ds != "[DONE]":
+                            try: events.append(json.loads(ds))
+                            except Exception: pass
+                data = _from_codex_response(events)
+                _add_provider_tokens(name, data)
+                cache.set(payload, data, ns, query_emb)
+                return ("json", data)
+            if streaming:
+                gen = (_anthropic_streaming_generator(resp) if is_anthropic
+                       else _streaming_generator(resp))
+                wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name)
+                return ("stream", wrapped, name)
+            else:
+                data = (_from_anthropic_response(resp.json()) if is_anthropic
+                        else resp.json())
+                if not is_anthropic:
+                    _strip_response(data)
+                _add_provider_tokens(name, data)
+                cache.set(payload, data, ns, query_emb)
+                return ("json", data)
 
     return ("error", {"error": {"message": "All providers exhausted", "type": "router_error"}}, 503)
 
@@ -2634,6 +2697,10 @@ def status():
             entry["model"] = st["model"]
         if p.get("models"):
             entry["models"] = p["models"]
+            # Per-model capability breakdown (rating + tool/reasoning support), so
+            # dashboards can show why a non-primary model gets picked for hard turns.
+            entry["model_caps"] = [
+                {"model": m, **_model_caps(p["name"], m)} for m in p["models"]]
         if "available" in st:
             entry["available"] = st["available"]
         if "supports_tools" in st:
