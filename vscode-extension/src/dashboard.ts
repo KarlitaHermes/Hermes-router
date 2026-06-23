@@ -99,9 +99,21 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       const ready = keys.filter(k=>k.status==='ready').length;
       const cooling = keys.filter(k=>k.status==='cooling').length;
       const keyStr = keys.length ? (ready + ' ready' + (cooling?(' · '+cooling+' cooling'):'')) : '—';
-      const modelLine = (p.models && p.models.length > 1)
-        ? '<div class="models">'+esc(p.models.join(', '))+'</div>'
-        : '<div class="models">'+esc(p.model||'')+'</div>';
+      // Multi-model providers: show each model with its own rating + capability,
+      // so it's clear why a non-primary model gets picked for harder turns.
+      const mcaps = p.model_caps || [];
+      let modelLine;
+      if (mcaps.length > 1) {
+        modelLine = mcaps.map(mc => {
+          const tags = ['r'+(mc.rating??'?'), mc.supports_tools?'tools':'', mc.reasoning?'reasoning':'']
+            .filter(Boolean).join(' · ');
+          return '<div class="models">'+esc(mc.model)+' <span class="muted">('+esc(tags)+')</span></div>';
+        }).join('');
+      } else if (p.models && p.models.length > 1) {
+        modelLine = '<div class="models">'+esc(p.models.join(', '))+'</div>';
+      } else {
+        modelLine = '<div class="models">'+esc(p.model||'')+'</div>';
+      }
       const caps = [p.supports_tools?'tools':'', p.reasoning?'reasoning':''].filter(Boolean).join(' · ');
       const lat = p.latency_ms ? Math.round(p.latency_ms)+'ms' : '—';
       return '<tr><td><b>'+esc(n)+'</b> '+avail+modelLine+'</td>'+

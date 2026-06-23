@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2
+
+- **Per-model capability in the dashboard.** Multi-model providers now show each model with its
+  own rating and capability flags (e.g. `gemini-2.5-pro (r1 · tools · reasoning)`), reflecting the
+  router's new per-(provider, model) smart routing — so you can see why a non-primary model gets
+  picked for harder or tool-using requests. Reads the new `model_caps` field from `/v1/status`.
+
 ## 0.5.1
 
 - **Fix duplicate model display.** When a provider has multiple models configured, the dashboard
