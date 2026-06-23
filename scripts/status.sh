@@ -124,8 +124,9 @@ if cache:
     sem = cache.get("semantic", {})
     sem_str = (f" · semantic ≥{sem.get('threshold')} ({sem.get('hits',0)} hits)"
                if sem.get("enabled") else "")
+    persist_str = " · persistent" if cache.get("persistent") else ""
     print(f"  {DIM}cache: {'on' if cache.get('enabled') else 'off'} · "
-          f"hit-rate {cache.get('hit_rate',0)} · {cache.get('size',0)}/{cache.get('max_size','?')} entries{sem_str}{RST}")
+          f"hit-rate {cache.get('hit_rate',0)} · {cache.get('size',0)}/{cache.get('max_size','?')} entries{persist_str}{sem_str}{RST}")
 if total_tokens:
     print(f"  {DIM}tokens served: {total_tokens}{RST}")
 if limits.get("enabled"):

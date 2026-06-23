@@ -98,6 +98,13 @@ entries are **namespaced by the caller's API key**, so two different `PROXY_API_
 a cached answer for the same prompt — safe to expose to multiple users. Disable with
 `CACHE_TTL_SECONDS=0`.
 
+**Persistent cache** (opt-in, `CACHE_PERSIST=1`): the cache is also mirrored to a SQLite file
+(`CACHE_DB_PATH`, default `./cache.db`) so it **survives restarts** — the router keeps saving quota
+on prompts it answered before a redeploy. The DB is a durable mirror of the in-memory LRU
+(write-through on store, deleted on eviction), so it stays bounded by `CACHE_MAX_SIZE` — raise that
+to persist more — and expired rows are pruned on startup. All DB access is fail-soft: an error
+degrades to the in-memory cache without breaking a request.
+
 **Semantic cache** (opt-in, `SEMANTIC_CACHE=1`) goes a step further: on an exact-match miss it
 embeds the prompt (reusing the router's own embeddings pipeline) and returns a cached answer
 whose stored prompt is *similar* above `SEMANTIC_CACHE_THRESHOLD` (cosine). It's a bounded linear

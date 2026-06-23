@@ -22,7 +22,7 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging, hashlib, hmac, itertools, re
+import json, os, time, threading, logging, hashlib, hmac, itertools, re, sqlite3
 from pathlib import Path
 from collections import deque, OrderedDict, defaultdict
 from flask import Flask, request, jsonify, Response, stream_with_context
@@ -71,6 +71,11 @@ PROXY_API_KEYS    = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-rou
 ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
+# Persistent cache: mirror the in-memory response/semantic cache to a SQLite file
+# so it survives restarts (opt-in). Use a writable path; on read-only hosts (e.g.
+# HF Spaces) point CACHE_DB_PATH at /tmp/..., like ROUTER_STATE_FILE.
+CACHE_PERSIST     = os.environ.get("CACHE_PERSIST", "0").strip().lower() not in ("0", "", "false", "no", "off")
+CACHE_DB_PATH     = os.environ.get("CACHE_DB_PATH", "./cache.db")
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
 # Semantic cache: serve a cached answer for a *similar* (not just identical) prompt,
 # by embedding prompts and comparing cosine similarity. Opt-in (needs an embedding
@@ -1180,9 +1185,16 @@ class ResponseCache:
     Identical requests (same model + messages) return a cached copy,
     saving free-tier quota for novel queries.
     Set CACHE_TTL_SECONDS=0 to disable.
+
+    Optionally backed by a SQLite file (CACHE_PERSIST=1) that mirrors the
+    in-memory LRU, so the cache survives restarts. The DB is a durable mirror —
+    write-through on set, delete on eviction — so it stays bounded at max_size
+    and the runtime data structure (and bounded semantic scan) are unchanged.
+    All DB access is fail-soft: an error logs and degrades to in-memory only.
     """
 
-    def __init__(self, ttl: int = 300, max_size: int = 100):
+    def __init__(self, ttl: int = 300, max_size: int = 100,
+                 persist: bool = False, db_path: str = "./cache.db"):
         self.ttl      = ttl
         self.max_size = max_size
         self.lock     = threading.Lock()
@@ -1190,6 +1202,51 @@ class ResponseCache:
         self.hits          = 0
         self.misses        = 0
         self.semantic_hits = 0
+        self._db = None
+        if persist and ttl > 0:
+            self._init_db(db_path)
+
+    def _init_db(self, db_path: str):
+        """Open the SQLite mirror, prune expired rows, and preload the most-recent
+        fresh entries (≤ max_size) into memory so hits/semantic work after restart."""
+        try:
+            self._db = sqlite3.connect(db_path, check_same_thread=False)
+            self._db.execute("CREATE TABLE IF NOT EXISTS cache "
+                             "(hash TEXT PRIMARY KEY, data TEXT, ts REAL, ns TEXT, embedding TEXT)")
+            cutoff = time.time() - self.ttl
+            self._db.execute("DELETE FROM cache WHERE ts < ?", (cutoff,))
+            self._db.commit()
+            rows = self._db.execute(
+                "SELECT hash, data, ts, ns, embedding FROM cache "
+                "ORDER BY ts DESC LIMIT ?", (self.max_size,)).fetchall()
+            for h, data, ts, ns, emb in reversed(rows):   # oldest-first → LRU order
+                self._store[h] = (json.loads(data), ts, ns,
+                                  json.loads(emb) if emb else None)
+            log.info(f"Cache: persistent (SQLite {db_path}) — preloaded {len(rows)} entr"
+                     f"{'y' if len(rows)==1 else 'ies'}")
+        except Exception as e:
+            log.warning(f"Cache: could not open persistent store {db_path}: {e} — in-memory only")
+            self._db = None
+
+    def _db_upsert(self, key, data, ts, ns, emb):
+        if self._db is None:
+            return
+        try:
+            self._db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?,?,?)",
+                             (key, json.dumps(data, default=str), ts, ns,
+                              json.dumps(emb) if emb is not None else None))
+            self._db.commit()
+        except Exception as e:
+            log.warning(f"Cache: persist write failed: {e}")
+
+    def _db_delete(self, key):
+        if self._db is None:
+            return
+        try:
+            self._db.execute("DELETE FROM cache WHERE hash = ?", (key,))
+            self._db.commit()
+        except Exception as e:
+            log.warning(f"Cache: persist delete failed: {e}")
 
     def _hash(self, payload: dict, ns: str = "") -> str:
         # Hash the entire request (minus "stream", which doesn't change the
@@ -1213,6 +1270,7 @@ class ResponseCache:
                     self.hits += 1
                     return data
                 del self._store[key]
+                self._db_delete(key)          # expired → drop from mirror too
             self.misses += 1
         return None
 
@@ -1220,10 +1278,14 @@ class ResponseCache:
         if self.ttl <= 0:
             return
         key = self._hash(payload, ns)
+        ts  = time.time()
         with self.lock:
-            if len(self._store) >= self.max_size:
-                self._store.popitem(last=False)  # evict oldest
-            self._store[key] = (data, time.time(), ns, embedding)
+            if key not in self._store and len(self._store) >= self.max_size:
+                old, _ = self._store.popitem(last=False)  # evict oldest
+                self._db_delete(old)
+            self._store[key] = (data, ts, ns, embedding)
+            self._store.move_to_end(key)
+            self._db_upsert(key, data, ts, ns, embedding)
 
     def semantic_lookup(self, query_emb: list, ns: str = "") -> dict | None:
         """Return the cached response whose stored prompt embedding is most similar
@@ -1256,12 +1318,17 @@ class ResponseCache:
             return len(self._store)
 
     @property
+    def persistent(self) -> bool:
+        return self._db is not None
+
+    @property
     def hit_rate(self) -> float:
         total = self.hits + self.misses
         return round(self.hits / total, 3) if total else 0.0
 
 
-cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE)
+cache = ResponseCache(ttl=CACHE_TTL, max_size=CACHE_MAX_SIZE,
+                      persist=CACHE_PERSIST, db_path=CACHE_DB_PATH)
 
 # ── Per-key budgets & rate limits ("virtual keys" lite) ─────────────────────────
 # Each PROXY_API_KEYS entry can carry a requests-per-minute ceiling and per-UTC-day
@@ -2716,13 +2783,14 @@ def status():
     return jsonify({
         "providers": provider_stats,
         "cache": {
-            "enabled":  CACHE_TTL > 0,
-            "ttl_s":    CACHE_TTL,
-            "size":     cache.size,
-            "max_size": CACHE_MAX_SIZE,
-            "hits":     cache.hits,
-            "misses":   cache.misses,
-            "hit_rate": cache.hit_rate,
+            "enabled":    CACHE_TTL > 0,
+            "ttl_s":      CACHE_TTL,
+            "size":       cache.size,
+            "max_size":   CACHE_MAX_SIZE,
+            "persistent": cache.persistent,
+            "hits":       cache.hits,
+            "misses":     cache.misses,
+            "hit_rate":   cache.hit_rate,
             "semantic": {
                 "enabled":   SEMANTIC_CACHE,
                 "threshold": SEMANTIC_THRESHOLD,
@@ -2841,7 +2909,8 @@ if __name__ == "__main__":
     log.info(f"Providers: {[p['name'] for p in PROVIDERS]}")
     _embed = {p["name"]: p["embed_model"] for p in PROVIDERS if p.get("embed_model")}
     log.info(f"Embeddings (/v1/embeddings): {_embed if _embed else 'no embed-capable providers'}")
-    log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE})")
+    log.info(f"Cache: {'enabled' if CACHE_TTL > 0 else 'disabled'} (TTL={CACHE_TTL}s, max={CACHE_MAX_SIZE}"
+             f"{', persistent' if cache.persistent else ''})")
     log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
     log.info(f"Key rotation: {ROTATION_MODE}")
     _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}
