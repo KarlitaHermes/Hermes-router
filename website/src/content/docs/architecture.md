@@ -223,3 +223,7 @@ The same `router.py` engine runs everywhere; you choose how to launch it and how
   [Configuration](/configuration/).
 - **Fail soft** — when in doubt the router makes forward progress (e.g. if every provider's
   breaker is open it probes them all) rather than hard-failing while options remain.
+
+---
+
+**Next:** [VS Code Extension](/vscode-extension/) — monitor and manage the router, and use it as a model inside Copilot Chat.

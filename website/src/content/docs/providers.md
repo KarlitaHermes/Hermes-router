@@ -126,3 +126,7 @@ Each provider's model is probed at startup for **function-calling** and **reason
 support; results show up in `hr status` and `/v1/status`. See
 [usage.md](/usage/) for how those affect tool routing, and
 [configuration.md](/configuration/) for the override variables.
+
+---
+
+**Next:** [Configuration](/configuration/) — tune models, per-key budgets, caching, and every other setting.

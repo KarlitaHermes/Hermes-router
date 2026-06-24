@@ -71,3 +71,7 @@ limit/usage config. This is what `hr status` renders.
 The `rotation` block reports the active key-rotation mode
 (`{"rotation": {"mode": "round-robin"}}`); the `limits` block reports per-key budgets and live
 usage; `hr status` shows both in the footer. See [configuration.md](/configuration/) for details.
+
+---
+
+**Next:** [How it works](/architecture/) — the full request pipeline and every moving part, under the hood.

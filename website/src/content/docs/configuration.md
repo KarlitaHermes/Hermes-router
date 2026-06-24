@@ -212,3 +212,7 @@ hr restart             # apply the change
 Either way, failover, per-key cooldowns, and the circuit breaker keep working — the mode
 only changes *which ready key is preferred* next. The active mode shows in `hr status` and
 at `/v1/status`.
+
+---
+
+**Next:** [Usage](/usage/) — call the router from the OpenAI or Anthropic SDK (tool calling, streaming, embeddings).
