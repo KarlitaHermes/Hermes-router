@@ -513,3 +513,7 @@ On Linux, `hr setup` can install a **systemd service** so the router starts on b
 restarts automatically if it crashes; after that, `hr restart` manages it. If systemd isn't
 available, `hr restart` falls back to a background process automatically. On Docker, use
 `restart: unless-stopped` (already set in `docker-compose.yml`) for the same effect.
+
+---
+
+**Next:** [Providers](/providers/) — add free API keys so the router has providers to route across.

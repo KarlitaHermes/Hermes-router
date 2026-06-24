@@ -21,24 +21,34 @@ export default defineConfig({
 					items: [
 						{ label: 'Introduction', slug: 'index' },
 						{ label: 'Getting Started', slug: 'getting-started' },
-						{ label: 'Concepts', slug: 'concepts' },
+						{ label: 'Core Concepts', slug: 'concepts' },
+					],
+				},
+				{
+					label: 'Set It Up',
+					items: [
+						{ label: 'Deployment', slug: 'deployment' },
+						{ label: 'Providers', slug: 'providers' },
+						{ label: 'Configuration', slug: 'configuration' },
+					],
+				},
+				{
+					label: 'Build With It',
+					items: [
+						{ label: 'Usage', slug: 'usage' },
 						{ label: 'Build an Agent', slug: 'build-an-agent' },
 					],
 				},
 				{
-					label: 'Architecture',
+					label: 'Operate',
 					items: [
-						{ label: 'How it works', slug: 'architecture' },
+						{ label: 'Monitoring', slug: 'monitoring' },
 					],
 				},
 				{
-					label: 'Reference',
+					label: 'Under the Hood',
 					items: [
-						{ label: 'Usage', slug: 'usage' },
-						{ label: 'Providers', slug: 'providers' },
-						{ label: 'Configuration', slug: 'configuration' },
-						{ label: 'Deployment', slug: 'deployment' },
-						{ label: 'Monitoring', slug: 'monitoring' },
+						{ label: 'How it works', slug: 'architecture' },
 					],
 				},
 				{

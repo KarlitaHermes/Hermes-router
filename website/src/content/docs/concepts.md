@@ -79,3 +79,7 @@ why apps break — and exactly what hermes-router routes around by switching pro
 ### Failover
 Automatically switching to a backup when something fails. hermes-router fails over between
 providers so a single outage or rate-limit never reaches your app.
+
+---
+
+**Next:** [Deployment](/deployment/) — run the router on your OS (Windows, macOS, Linux, Docker, or a free cloud Space).

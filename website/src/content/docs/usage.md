@@ -101,3 +101,7 @@ Some models (e.g. gpt-oss, Nemotron, GLM-4.5) spend output tokens on hidden
 chain-of-thought before answering. The router detects these at startup and reserves extra
 output budget for them, so a small `max_tokens` never yields an empty reply. Tune with
 `REASONING_TOKEN_RESERVE` (see [configuration.md](/configuration/)).
+
+---
+
+**Next:** [Build an Agent](/build-an-agent/) — go from a chatbot to a memory-backed, tool-using agent, copy-paste.

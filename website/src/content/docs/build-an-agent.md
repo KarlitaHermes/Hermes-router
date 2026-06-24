@@ -188,6 +188,8 @@ boils down to one theme: **keep it simple**.
 
 ## Where to go next
 
+**Next:** [Monitoring](/monitoring/) — once it's running, watch provider health, cache, tokens, and spend.
+
 - **Long-term memory / search your own docs:** use embeddings (`/v1/embeddings`) to store and
   retrieve facts — the RAG pattern (see *embedding* and *RAG* in **[concepts.md](/concepts/)**).
 - **Frameworks (optional):** once you understand the loop, tools like LangChain can save

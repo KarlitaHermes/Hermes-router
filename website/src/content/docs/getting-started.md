@@ -94,8 +94,8 @@ Run it — you just made your first AI call, for free, through hermes-router. �
 
 ## Where to go next
 
-- **Want to build something that *does* things, not just chat?** → **[build-an-agent.md](/build-an-agent/)**
-  walks you from a chatbot to a real AI agent, step by step.
-- **Confused by a term?** → **[concepts.md](/concepts/)** is a plain-language glossary.
-- **Want more providers / more reliability?** → **[providers.md](/providers/)**.
-- **Want to change settings?** → **[configuration.md](/configuration/)**.
+**Next:** **[Core Concepts](/concepts/)** — a plain-language glossary of every term you'll meet.
+
+Then keep following the guide in order (it's built to read top-to-bottom):
+**Set It Up** → [Deployment](/deployment/) · [Providers](/providers/) · [Configuration](/configuration/),
+then **Build With It** → [Usage](/usage/) · [Build an Agent](/build-an-agent/).
