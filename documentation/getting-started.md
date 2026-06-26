@@ -65,6 +65,10 @@ curl http://localhost:8319/health
 
 You should see `{"status":"ok",...}`. That means the router is up and listening.
 
+> **Want it to stay up after a reboot?** On a server, run `hr service install` so the router
+> starts on boot and restarts itself if it crashes (`hr setup` also offers this). See
+> **[deployment.md](deployment.md)** → "Keep it running".
+
 ## Step 4 — Send your first message
 
 The router understands the same "language" as the popular OpenAI library, so any OpenAI

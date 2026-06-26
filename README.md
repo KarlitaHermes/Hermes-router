@@ -23,24 +23,33 @@ already talks to either works unchanged — just point it at hermes-router inste
 failover · smart routing (sends each request to the cheapest model that can handle it) ·
 **local models** (Ollama / LM Studio) with cloud fallback · tool calling · embeddings ·
 response caching (incl. optional **semantic** cache) · **per-key budgets & rate limits** ·
-**usage analytics** (`/v1/usage`) · circuit breaker for unhealthy providers ·
-Prometheus `/metrics` · one structured `auth.json` for all your keys.
+**usage analytics** (`/v1/usage`) with **cost/spend tracking** · circuit breaker for unhealthy
+providers · Prometheus `/metrics` · **runs as a reboot-surviving service** (`hr service`) ·
+toggle optional features with `hr features` · one structured `auth.json` for all your keys.
 
 ## Documentation
 
-**New to AI? Start here** — these assume zero experience:
+The docs read in order, from zero experience to a running, monitored agent:
+
+**Start here** (assume no experience):
 
 - 🚀 **[Getting started](documentation/getting-started.md)** — what this is, key terms, your first message
-- 🤖 **[Build your first AI agent](documentation/build-an-agent.md)** — chatbot → memory → tools, copy-paste
 - 📖 **[Concepts](documentation/concepts.md)** — plain-language glossary (LLM, token, agent, RAG…)
 
-**Reference:**
+**Set it up:**
 
+- **[Deployment](documentation/deployment.md)** — Windows/macOS/Linux, Docker, Hugging Face Spaces, **surviving reboots**
 - **[Providers](documentation/providers.md)** — free & paid providers, sign-up links, capabilities
+- **[Configuration](documentation/configuration.md)** — `auth.json`, all `.env` settings, **core features vs. add-ons** (`hr features`)
+
+**Build with it:**
+
 - **[Usage](documentation/usage.md)** — OpenAI SDK, Anthropic SDK, tool use, embeddings
-- **[Configuration](documentation/configuration.md)** — `auth.json`, all `.env` settings, model overrides
-- **[Deployment](documentation/deployment.md)** — Windows/macOS/Linux support, Docker, Hugging Face Spaces
-- **[Monitoring](documentation/monitoring.md)** — `hr status`, Prometheus `/metrics`, `/v1/status`
+- 🤖 **[Build your first AI agent](documentation/build-an-agent.md)** — chatbot → memory → tools, copy-paste
+
+**Operate & extend:**
+
+- **[Monitoring](documentation/monitoring.md)** — `hr status`, Prometheus `/metrics`, `/v1/status` (tokens, spend)
 - **[VS Code Extension](documentation/vscode-extension.md)** — monitor & manage the router, and use it as a model in Copilot Chat
 
 ---
@@ -167,6 +176,7 @@ The `./install.sh` step puts `hr` (and the full name `hermes-router`) on your PA
 | `hr features list` | Show core features + optional add-ons, with on/off state |
 | `hr features enable\|disable <name>` | Turn an add-on on/off (writes `.env`; see [Configuration](documentation/configuration.md)) |
 | `hr start` | Run the router (same as `python router.py`) |
+| `hr service install` | Run as a service that **survives reboots** (systemd; `status`/`uninstall` too) |
 | `hr status` | Live dashboard — per-provider health, latency, cache stats |
 | `hr restart` | Restart the router so key/config changes take effect |
 | `hr doctor` | Diagnose installation issues (Python, venv, keys, PATH, router health) |

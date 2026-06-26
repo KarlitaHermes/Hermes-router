@@ -17,6 +17,8 @@
 #   hr limit clear <key>              Remove a key's limits
 #   hr features list                  Show core features + optional add-ons (on/off)
 #   hr features enable|disable <name> Turn an add-on on/off (writes .env)
+#   hr service install                Run as a service that survives reboots (systemd)
+#   hr service status|uninstall       Show / remove the boot service
 #   hr start                          Run the router (same as: python router.py)
 #   hr status                         Live health dashboard for the running router
 #   hr restart                        Restart the router so key/config changes take effect
@@ -69,6 +71,9 @@ case "$cmd" in
     ;;
   features)
     exec "$REPO/scripts/features.sh" "$@"
+    ;;
+  service)
+    exec "$REPO/scripts/service.sh" "$@"
     ;;
   status)
     exec "$REPO/scripts/status.sh" "$@"

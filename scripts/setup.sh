@@ -121,6 +121,21 @@ else
   esac
 fi
 
+# ── Step 3b: Survive reboots (Linux/systemd) ──────────────────────────────────
+# A plain `hr start` is a foreground/background process that does NOT come back
+# after a server reboot. Offer to install a systemd service so it does.
+if command -v systemctl >/dev/null 2>&1 \
+   && ! systemctl cat "${HERMES_ROUTER_SERVICE:-hermes-router}.service" >/dev/null 2>&1; then
+  step 3b "Start on boot (recommended for servers)"
+  printf '\033[1;36m[setup]\033[0m Start hermes-router automatically on boot? [Y/n]: '
+  read -r ans
+  echo ""
+  case "${ans:-y}" in
+    [nN]*) warn "Skipped — your router will NOT restart after a reboot. Run 'hr service install' anytime." ;;
+    *)     bash "$REPO/scripts/service.sh" install || warn "Could not install the boot service — see the message above." ;;
+  esac
+fi
+
 # ── Step 4: Verify ────────────────────────────────────────────────────────────
 step 4 "Verifying"
 

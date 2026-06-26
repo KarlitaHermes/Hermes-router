@@ -504,9 +504,29 @@ Still stuck? Run `hr doctor` (Linux/macOS/WSL) for an automated diagnosis, or ch
 
 ---
 
-## Keeping it running (Linux)
+## Keep it running (survive reboots)
 
-On Linux, `hr setup` can install a **systemd service** so the router starts on boot and
-restarts automatically if it crashes; after that, `hr restart` manages it. If systemd isn't
-available, `hr restart` falls back to a background process automatically. On Docker, use
-`restart: unless-stopped` (already set in `docker-compose.yml`) for the same effect.
+> **Important:** a plain `hr start` (or `hr setup`'s "start now") runs the router as a normal
+> background process — it does **not** come back after a server reboot. To survive reboots, install
+> it as a service. Pick the line that matches how you run it:
+
+**`hr` (Linux):**
+
+```bash
+hr service install      # installs a systemd unit + enables it on boot
+```
+
+That's it — the router now starts on boot and restarts automatically if it crashes, and `hr restart`
+manages it. `hr setup` also **offers this as a step**. Run as root (or with `sudo`) for a system
+service; without either it installs a per-user service and enables *lingering* so it still starts at
+boot. Check it with `hr service status`; remove it with `hr service uninstall`. (The unit name is
+`hermes-router`, overridable with `HERMES_ROUTER_SERVICE`.)
+
+**Docker:** already handled — `docker-compose.yml` sets `restart: unless-stopped`, so the container
+comes back on reboot as long as Docker itself starts on boot (the default; `sudo systemctl enable
+docker` if not).
+
+**macOS:** there's no systemd — `hr service install` prints a ready-to-paste **launchd** plist you
+drop in `~/Library/LaunchAgents` and `launchctl load -w`.
+
+**Hugging Face Space:** always-on by the platform — nothing to do.

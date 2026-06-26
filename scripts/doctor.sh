@@ -88,6 +88,16 @@ else
   warn "Router not running on port $PORT — start with: hr start"
 fi
 
+# Boot service (survives reboots)
+SVC="${HERMES_ROUTER_SERVICE:-hermes-router}"
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl is-enabled "${SVC}.service" >/dev/null 2>&1 || systemctl --user is-enabled "${SVC}.service" >/dev/null 2>&1; then
+    pass "Boot service '${SVC}' enabled — survives reboots"
+  else
+    warn "No boot service — router won't restart after a reboot. Install with: hr service install"
+  fi
+fi
+
 echo "  ──────────────────────────────────────────"
 if [ "$ISSUES" -eq 0 ]; then
   printf '  \033[1;32mAll checks passed.\033[0m\n'
