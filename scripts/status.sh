@@ -116,6 +116,7 @@ cache = d.get("cache", {})
 br_cfg = d.get("circuit_breaker", {})
 rotation = d.get("rotation", {})
 limits = d.get("limits", {})
+feats = d.get("features", {})
 total_tokens = sum(p.get("tokens", 0) for p in providers.values())
 total_cost   = sum(p.get("cost_usd", 0) for p in providers.values())
 print()
@@ -131,6 +132,9 @@ if cache:
 if total_tokens or total_cost:
     cost_str = f" · ${total_cost:.4f} spent" if total_cost else ""
     print(f"  {DIM}tokens served: {total_tokens}{cost_str}{RST}")
+on_addons = [a["name"] for a in feats.get("addons", []) if a.get("enabled")]
+if on_addons:
+    print(f"  {DIM}add-ons: {', '.join(on_addons)}  (hr features){RST}")
 if limits.get("enabled"):
     for k in limits.get("keys", []):
         lim, use = k.get("limits", {}), k.get("usage", {})

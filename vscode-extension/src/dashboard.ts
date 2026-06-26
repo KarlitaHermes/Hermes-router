@@ -141,10 +141,14 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       }).join(' &nbsp; ') + '</div>';
     }
 
+    const addons = ((s.features && s.features.addons) || []).filter(a => a.enabled).map(a => a.name);
+    const addonStr = addons.length ? '<div class="meta">add-ons: ' + esc(addons.join(', ')) + '</div>' : '';
+
     el.innerHTML =
       '<div class="meta">rotation: <span class="pill">'+esc(mode)+'</span> &nbsp; ' +
       'cache: '+cacheStr+(totalTokens?(' &nbsp; tokens: '+totalTokens.toLocaleString()):'')+
         (totalCost?(' &nbsp; spend: $'+totalCost.toFixed(4)):'')+'</div>' +
+      addonStr +
       limitStr +
       '<table><thead><tr><th>Provider</th><th>Rating</th><th>Latency</th><th>Keys</th><th>Tokens</th></tr></thead><tbody>'+
       (rows || '<tr><td colspan="5" class="muted">No providers configured.</td></tr>')+

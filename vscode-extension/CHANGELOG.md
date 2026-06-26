@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+- **Add-ons at a glance.** The dashboard now shows which optional add-ons are enabled (semantic
+  cache, persistent cache, fast routing, …) — reads the new `features` block from `/v1/status`.
+  Manage them from the terminal with `hr features list|enable|disable`.
+
 ## 0.6.0
 
 - **Estimated spend in the dashboard.** When the router has cost awareness configured, the

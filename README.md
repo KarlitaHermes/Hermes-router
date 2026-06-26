@@ -163,6 +163,9 @@ The `./install.sh` step puts `hr` (and the full name `hermes-router`) on your PA
 | `hr model reset <provider>` | Revert a provider back to its default model |
 | `hr mode` | Show how keys are rotated within a provider |
 | `hr mode <round-robin\|sequential>` | Set the key rotation mode (see [Configuration](documentation/configuration.md)) |
+| `hr limit set <key> [opts]` | Set a proxy key's rate/budget limits (`--rpm`/`--req-day`/`--tokens-day`/`--cost-day`) |
+| `hr features list` | Show core features + optional add-ons, with on/off state |
+| `hr features enable\|disable <name>` | Turn an add-on on/off (writes `.env`; see [Configuration](documentation/configuration.md)) |
 | `hr start` | Run the router (same as `python router.py`) |
 | `hr status` | Live dashboard — per-provider health, latency, cache stats |
 | `hr restart` | Restart the router so key/config changes take effect |
