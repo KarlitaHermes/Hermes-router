@@ -2,7 +2,7 @@
   "name": "hermes-router",
   "displayName": "hermes-router",
   "description": "Control panel for hermes-router — monitor provider health and manage your free-tier AI load balancer from VS Code.",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "publisher": "MohammedShafiq",
   "license": "MIT",
   "icon": "icon.png",
