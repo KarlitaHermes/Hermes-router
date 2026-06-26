@@ -2833,6 +2833,54 @@ def embeddings():
     return jsonify({"error": {"message": "All embedding providers exhausted", "type": "router_error"}}), 503
 
 
+# ── Feature add-ons ─────────────────────────────────────────────────────────────
+# hermes-router separates CORE features (always on — the router's identity) from
+# ADD-ONS (opt-in behaviors, each backed by an env var or some config). The
+# registry below is the single source of truth: it powers the `features` block in
+# /v1/status, the `hr features` CLI (which reads it and toggles the `env` flag in
+# .env), and the dashboard. Env vars remain authoritative — this is just a unified
+# view + friendly toggle, so behavior is unchanged whether or not you use it.
+CORE_FEATURES = [
+    "auth", "credential_pool", "key_rotation", "failover", "circuit_breaker",
+    "smart_routing", "protocol_translation", "capability_probing", "token_counting",
+    "request_guardrails", "usage_cost_tracking",
+]
+
+def _features_snapshot() -> dict:
+    """Live core/add-on categorization for /v1/status and `hr features`.
+    `enabled` is computed from the already-parsed config (env vars stay the source
+    of truth). Flag add-ons carry env/on/off so the CLI can toggle them; config
+    add-ons carry a `manage` command instead."""
+    has_local = any(p["name"] == "local" for p in PROVIDERS)
+    addons = [
+        {"name": "response_cache", "title": "Response cache", "kind": "flag",
+         "enabled": CACHE_TTL > 0, "env": "CACHE_TTL_SECONDS", "on": "300", "off": "0",
+         "desc": "Serve identical requests from an in-memory TTL+LRU cache."},
+        {"name": "semantic_cache", "title": "Semantic cache", "kind": "flag",
+         "enabled": SEMANTIC_CACHE, "env": "SEMANTIC_CACHE", "on": "1", "off": "0",
+         "desc": "Also serve cached answers for similar (not just identical) prompts."},
+        {"name": "persistent_cache", "title": "Persistent cache", "kind": "flag",
+         "enabled": cache.persistent, "env": "CACHE_PERSIST", "on": "1", "off": "0",
+         "desc": "Mirror the cache to SQLite so it survives restarts."},
+        {"name": "fast_routing", "title": "Fast routing", "kind": "flag",
+         "enabled": FAST_ROUTE_TOKENS > 0, "env": "FAST_ROUTE_THRESHOLD", "on": "200", "off": "0",
+         "desc": "Short requests prefer low-latency providers on ties."},
+        {"name": "metrics_auth", "title": "Metrics auth", "kind": "flag",
+         "enabled": bool(_int_env("METRICS_REQUIRE_AUTH", 0)), "env": "METRICS_REQUIRE_AUTH",
+         "on": "1", "off": "0", "desc": "Require the proxy key on /metrics."},
+        {"name": "cost_currency", "title": "Cost currency conversion", "kind": "flag",
+         "enabled": COST_FX_RATE > 0, "env": "COST_FX_RATE", "on": "83", "off": "0",
+         "desc": "Show a second currency (e.g. INR) alongside USD spend."},
+        {"name": "key_budgets", "title": "Per-key budgets & rate limits", "kind": "config",
+         "enabled": KEY_LIMITS_ON, "manage": "hr limit set <key> --rpm/--req-day/--tokens-day/--cost-day",
+         "desc": "Per-key RPM / daily request / token / cost ceilings."},
+        {"name": "local_model", "title": "Local model provider", "kind": "config",
+         "enabled": has_local, "manage": "hr model set local <model>",
+         "desc": "Route to a model on your own machine (Ollama / LM Studio / llama.cpp)."},
+    ]
+    return {"core": CORE_FEATURES, "addons": addons}
+
+
 @app.route("/v1/status")
 def status():
     """Show key cooldown state, latency/error stats, and cache metrics."""
@@ -2932,6 +2980,7 @@ def status():
             "error_rate":  BREAKER_ERROR_RATE,
             "cooldown_s":  BREAKER_COOLDOWN,
         },
+        "features": _features_snapshot(),
     })
 
 

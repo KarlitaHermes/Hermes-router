@@ -7,6 +7,43 @@ All configuration is via environment variables (in `.env`) and the `auth.json` c
 store. Everything is optional with sensible defaults — the router runs out of the box once
 it has at least one key.
 
+## Core features vs. add-ons
+
+hermes-router splits its behavior into two groups:
+
+- **Core features** — always on; they *are* the router. Auth, the credential pool + key
+  rotation, failover, the circuit breaker, smart routing, protocol translation
+  (OpenAI/Anthropic/Codex), capability probing, token counting, request guardrails, and
+  usage/cost tracking. You don't configure these on/off.
+- **Add-ons** — optional behaviors you turn on when you want them. Each is backed by an
+  environment variable (or some `auth.json` config), and unset = off (except the response
+  cache, on by default).
+
+### `hr features` — see and toggle add-ons
+
+```bash
+hr features list                      # core features + every add-on, with on/off
+hr features enable persistent_cache   # writes the backing var to .env
+hr features disable semantic_cache
+hr restart                            # apply
+```
+
+| Add-on | Backing setting | Default | What it does |
+|---|---|---|---|
+| `response_cache` | `CACHE_TTL_SECONDS` | **on** | Serve identical requests from an in-memory TTL+LRU cache |
+| `semantic_cache` | `SEMANTIC_CACHE` | off | Also serve cached answers for *similar* prompts |
+| `persistent_cache` | `CACHE_PERSIST` | off | Mirror the cache to SQLite so it survives restarts |
+| `fast_routing` | `FAST_ROUTE_THRESHOLD` | off | Short requests prefer low-latency providers on ties |
+| `metrics_auth` | `METRICS_REQUIRE_AUTH` | off | Require the proxy key on `/metrics` |
+| `cost_currency` | `COST_FX_RATE` | off | Show a second currency (e.g. ₹) alongside USD spend |
+| `key_budgets` | `auth.json` / `PROXY_LIMIT_*` | off | Per-key RPM / daily request / token / cost ceilings — manage with `hr limit` |
+| `local_model` | `LOCAL_BASE_URL` / `LOCAL_MODEL` | off | Route to a model on your own machine — manage with `hr model set local` |
+
+`hr features enable/disable` toggles the simple **flag** add-ons by writing their variable to
+`.env`. The last two are richer config, so `hr features` shows their status and points you to
+the command that manages them (`hr limit`, `hr model`). The live state is also in `/v1/status`
+under `features` and in the VS Code dashboard.
+
 ## Where your keys live
 
 `hr auth add` writes to **`auth.json`** — the router's own credential store, kept next to

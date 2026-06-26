@@ -221,6 +221,10 @@ The same `router.py` engine runs everywhere; you choose how to launch it and how
   Nothing is installed system-wide beyond the `hr` symlink.
 - **Configured by environment** — every behavior is an env var with a sensible default; see
   [Configuration](/configuration/).
+- **Core vs. add-ons** — a small set of **core** features is always on (auth, failover, smart
+  routing, the circuit breaker…); everything optional is an **add-on** you toggle with
+  [`hr features`](/configuration/#hr-features--see-and-toggle-add-ons). Add-ons default to off
+  (so a fresh install is minimal) and never change core behavior.
 - **Fail soft** — when in doubt the router makes forward progress (e.g. if every provider's
   breaker is open it probes them all) rather than hard-failing while options remain.
 
