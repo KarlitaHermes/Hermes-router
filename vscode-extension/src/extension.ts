@@ -114,6 +114,24 @@ export function activate(context: vscode.ExtensionContext) {
     await refresh();
   });
 
+  // Toggle an optional add-on from the dashboard: `hr features enable|disable <name>`
+  // then restart so it takes effect. Only flag add-ons reach here (the dashboard
+  // renders config-driven ones as status-only).
+  reg("hermesRouter.toggleFeature", async (name: string, enable: boolean) => {
+    if (!name) return;
+    const res = await runHr(out, ["features", enable ? "enable" : "disable", name]);
+    if (!res.ok) {
+      vscode.window.showWarningMessage(
+        `Couldn't ${enable ? "enable" : "disable"} '${name}'. See the hermes-router output for details.`
+      );
+      await refresh();
+      return;
+    }
+    await runHr(out, ["restart"]);
+    await refresh();
+    vscode.window.setStatusBarMessage(`hermes-router: ${name} ${enable ? "enabled" : "disabled"}`, 4000);
+  });
+
   reg("hermesRouter.setMode", async () => {
     const mode = await vscode.window.showQuickPick(["round-robin", "sequential"], {
       placeHolder: "Key rotation mode",

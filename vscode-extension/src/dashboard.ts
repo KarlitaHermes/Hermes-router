@@ -16,6 +16,8 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         void this.refresh();
       } else if (msg?.type === "command" && typeof msg.command === "string") {
         void vscode.commands.executeCommand(msg.command);
+      } else if (msg?.type === "feature" && typeof msg.name === "string") {
+        void vscode.commands.executeCommand("hermesRouter.toggleFeature", msg.name, !!msg.enable);
       }
     });
     void this.refresh();
@@ -49,13 +51,24 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
   table { width:100%; border-collapse: collapse; }
   th, td { text-align:left; padding:4px 6px; border-bottom:1px solid var(--vscode-panel-border); font-size:12px; vertical-align:top; }
   th { color: var(--vscode-descriptionForeground); font-weight:600; }
+  td.num, th.num { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  td.prov { width:99%; }                 /* provider column takes the slack; rest size to content */
   .ok { color: var(--vscode-testing-iconPassed, #3fb950); }
   .down { color: var(--vscode-testing-iconFailed, #f85149); }
   .muted { color: var(--vscode-descriptionForeground); }
   .pill { font-size:10px; padding:1px 5px; border-radius:8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
   .err { color: var(--vscode-testing-iconFailed, #f85149); padding:8px 0; }
   .meta { margin:8px 0; color: var(--vscode-descriptionForeground); font-size:12px; }
-  .models { color: var(--vscode-descriptionForeground); font-size:11px; }
+  .models { color: var(--vscode-descriptionForeground); font-size:11px; line-height:1.5; }
+  /* Add-ons toggles */
+  .section-title { font-size:11px; font-weight:600; color: var(--vscode-descriptionForeground); margin:10px 0 4px; text-transform:uppercase; letter-spacing:.04em; }
+  .addons { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px; }
+  .addon { font-size:11px; padding:2px 9px; border-radius:11px; border:1px solid var(--vscode-panel-border); user-select:none; white-space:nowrap; }
+  .addon.flag { cursor:pointer; }
+  .addon.flag:hover { border-color: var(--vscode-focusBorder); }
+  .addon.on { color: var(--vscode-testing-iconPassed, #3fb950); border-color: var(--vscode-testing-iconPassed, #3fb950); }
+  .addon.off { color: var(--vscode-descriptionForeground); }
+  .addon.cfg { cursor:default; opacity:.85; }
 </style></head>
 <body>
   <div class="bar">
@@ -70,7 +83,9 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
   const vscode = acquireVsCodeApi();
   function send(type){ vscode.postMessage({type}); }
   function cmd(command){ vscode.postMessage({type:'command', command}); }
+  function feature(name, enable){ vscode.postMessage({type:'feature', name, enable}); }
   function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+  function attr(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
   window.addEventListener('message', (ev) => {
     const m = ev.data;
@@ -118,11 +133,11 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       }
       const caps = [p.supports_tools?'tools':'', p.reasoning?'reasoning':''].filter(Boolean).join(' · ');
       const lat = p.latency_ms ? Math.round(p.latency_ms)+'ms' : '—';
-      return '<tr><td><b>'+esc(n)+'</b> '+avail+modelLine+'</td>'+
-             '<td>'+(p.rating??'—')+'</td>'+
-             '<td>'+esc(lat)+'</td>'+
+      return '<tr><td class="prov"><b>'+esc(n)+'</b> '+avail+modelLine+'</td>'+
+             '<td class="num">'+(p.rating??'—')+'</td>'+
+             '<td class="num">'+esc(lat)+'</td>'+
              '<td>'+esc(keyStr)+(caps?'<div class="models">'+esc(caps)+'</div>':'')+'</td>'+
-             '<td>'+(p.tokens?p.tokens.toLocaleString():'—')+'</td></tr>';
+             '<td class="num">'+(p.tokens?p.tokens.toLocaleString():'—')+'</td></tr>';
     }).join('');
 
     const sem = cache.semantic || {};
@@ -141,8 +156,25 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       }).join(' &nbsp; ') + '</div>';
     }
 
-    const addons = ((s.features && s.features.addons) || []).filter(a => a.enabled).map(a => a.name);
-    const addonStr = addons.length ? '<div class="meta">add-ons: ' + esc(addons.join(', ')) + '</div>' : '';
+    // Add-ons panel: flag add-ons are clickable toggles (enable/disable → restart);
+    // config-driven ones (key_budgets, local_model) show status + their manage command.
+    const addonList = (s.features && s.features.addons) || [];
+    let addonStr = '';
+    if (addonList.length) {
+      const chips = addonList.map(a => {
+        const on = !!a.enabled;
+        const label = (on ? '● ' : '○ ') + esc(a.title || a.name);
+        if (a.kind === 'flag') {
+          const tip = (on ? 'Disable' : 'Enable') + ' — restarts the router. ' + (a.desc || '');
+          return '<span class="addon flag '+(on?'on':'off')+'" title="'+attr(tip)+'"'
+               + ' onclick="feature(\\''+attr(a.name)+'\\','+(!on)+')">'+label+'</span>';
+        }
+        const tip = (a.desc || '') + (a.manage ? ('  ·  manage: '+a.manage) : '');
+        return '<span class="addon cfg '+(on?'on':'off')+'" title="'+attr(tip)+'">'+label+'</span>';
+      }).join('');
+      addonStr = '<div class="section-title">Add-ons <span class="muted" style="text-transform:none;font-weight:400">(click a flag to toggle)</span></div>'
+               + '<div class="addons">'+chips+'</div>';
+    }
 
     el.innerHTML =
       '<div class="meta">rotation: <span class="pill">'+esc(mode)+'</span> &nbsp; ' +
@@ -150,7 +182,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
         (totalCost?(' &nbsp; spend: $'+totalCost.toFixed(4)):'')+'</div>' +
       addonStr +
       limitStr +
-      '<table><thead><tr><th>Provider</th><th>Rating</th><th>Latency</th><th>Keys</th><th>Tokens</th></tr></thead><tbody>'+
+      '<table><thead><tr><th class="prov">Provider</th><th class="num">Rating</th><th class="num">Latency</th><th>Keys</th><th class="num">Tokens</th></tr></thead><tbody>'+
       (rows || '<tr><td colspan="5" class="muted">No providers configured.</td></tr>')+
       '</tbody></table>';
   });

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+- **Toggle add-ons from the dashboard.** The dashboard now has an **Add-ons** panel — click a
+  feature (semantic cache, persistent cache, fast routing, metrics auth, cost currency) to
+  enable/disable it; the extension runs `hr features …` and restarts the router for you.
+  Config-driven add-ons (per-key budgets, local model) show their status and how to manage them.
+  Works for both local and Docker-managed routers.
+- **Tidier layout.** Provider table columns (Rating / Latency / Tokens) are right-aligned with
+  tabular numbers, the provider column takes the slack, and multi-model rows read more cleanly.
+
 ## 0.6.1
 
 - **Add-ons at a glance.** The dashboard now shows which optional add-ons are enabled (semantic
