@@ -10,7 +10,8 @@
 #
 # Supported providers:
 #   gemini  openrouter  sambanova  github_models  cerebras
-#   groq  mistral  cohere  zai  naga  nvidia  huggingface  kimi  openai  anthropic
+#   groq  mistral  cohere  zai  naga  nvidia  huggingface  kimi
+#   opencode  opencode_go  openai  anthropic
 #
 # Codex (ChatGPT subscription) uses OAuth, not an API key. Log in once with the
 # official Codex CLI (`codex login`), then run `hr auth import-codex` to copy the
@@ -36,7 +37,7 @@ err()  { printf '\033[1;31m[auth]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[auth]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[auth]\033[0m %s\n' "$*"; }
 
-PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface kimi openai anthropic"
+PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface kimi opencode opencode_go openai anthropic"
 
 # Normalize a provider name to its canonical form (accepts a couple of aliases).
 canonical_provider() {
@@ -54,6 +55,8 @@ canonical_provider() {
     nvidia|nim)            echo "nvidia" ;;
     huggingface|hf|hugging_face) echo "huggingface" ;;
     kimi|moonshot)         echo "kimi" ;;
+    opencode|opencode_zen|zen) echo "opencode" ;;
+    opencode_go|opencodego|opencode-go|go) echo "opencode_go" ;;
     openai|gpt)            echo "openai" ;;
     anthropic|claude)      echo "anthropic" ;;
     *)                     echo "" ;;

@@ -33,7 +33,7 @@ err()  { printf '\033[1;31m[model]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[1;32m[model]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[model]\033[0m %s\n' "$*"; }
 
-PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface kimi openai anthropic codex local"
+PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface kimi opencode opencode_go openai anthropic codex local"
 
 canonical_provider() {
   case "${1,,}" in
@@ -49,6 +49,8 @@ canonical_provider() {
     naga)                  echo "naga" ;;
     nvidia|nim)            echo "nvidia" ;;
     kimi|moonshot)         echo "kimi" ;;
+    opencode|opencode_zen|zen) echo "opencode" ;;
+    opencode_go|opencodego|opencode-go|go) echo "opencode_go" ;;
     openai|gpt)            echo "openai" ;;
     anthropic|claude)      echo "anthropic" ;;
     codex|chatgpt)         echo "codex" ;;
@@ -73,6 +75,8 @@ env_var_for() {
     nvidia)        echo "NVIDIA_MODEL" ;;
     huggingface)   echo "HUGGINGFACE_MODEL" ;;
     kimi)          echo "KIMI_MODEL" ;;
+    opencode)      echo "OPENCODE_MODEL" ;;
+    opencode_go)   echo "OPENCODE_GO_MODEL" ;;
     openai)        echo "OPENAI_MODEL" ;;
     anthropic)     echo "ANTHROPIC_MODEL" ;;
     codex)         echo "CODEX_MODEL" ;;
@@ -96,6 +100,8 @@ default_for() {
     nvidia)        echo "deepseek-ai/deepseek-v4-flash" ;;
     huggingface)   echo "openai/gpt-oss-120b:cheapest" ;;
     kimi)          echo "kimi-for-coding" ;;
+    opencode)      echo "deepseek-v4-flash-free,minimax-m3-free,qwen3.6-plus-free" ;;
+    opencode_go)   echo "deepseek-v4-flash,minimax-m3" ;;
     openai)        echo "gpt-4o-mini" ;;
     anthropic)     echo "claude-haiku-4-5-20251001" ;;
     codex)         echo "gpt-5.5" ;;

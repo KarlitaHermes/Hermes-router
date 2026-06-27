@@ -83,6 +83,35 @@ Moonshot API instead of the coding plan? Point it elsewhere with `KIMI_BASE_URL`
 (e.g. `https://api.moonshot.ai/v1`) and set `KIMI_MODEL` to a model like `kimi-k2-0905-preview`.
 Get a key at [platform.kimi.ai](https://platform.kimi.ai) / [platform.moonshot.ai](https://platform.moonshot.ai).
 
+## OpenCode (Zen + Go)
+
+[OpenCode](https://opencode.ai) Zen is an OpenAI-compatible gateway of coding-tuned models —
+including a rotating pool of **genuinely free** ones. It's a normal API-key provider (no OAuth):
+sign in at [opencode.ai](https://opencode.ai), copy your key from **API Keys**, then:
+
+```bash
+hr auth add opencode
+hr restart
+```
+
+The default routes to free models (`deepseek-v4-flash-free`, `minimax-m3-free`,
+`qwen3.6-plus-free`). Free promotions rotate — when one ends OpenCode returns a model error and
+the router automatically **skips it and fails over** to the next, so you stay online. Reach the
+premium models (Claude, GPT, Gemini, GLM, Kimi, Qwen…) by setting `OPENCODE_MODEL`.
+
+**OpenCode Go** is OpenCode's low-cost subscription tier (**$5 first month, then $10/mo**) —
+the *same* API key against a different endpoint, no separate auth. Enable Go billing on
+opencode.ai, then add it as its own provider so it's only used once you've subscribed:
+
+```bash
+hr auth add opencode_go      # paste the same OpenCode key
+hr restart
+```
+
+Defaults to `https://opencode.ai/zen/go/v1` with `deepseek-v4-flash,minimax-m3`; override with
+`OPENCODE_GO_MODEL`. (Go models: Kimi K2.7/K2.6, GLM-5.2/5.1, MiniMax M3/M2.7, Qwen3.7, DeepSeek
+V4 Pro/Flash, MiMo…)
+
 ## Local models (Ollama / LM Studio / llama.cpp)
 
 Run a model on your **own machine** and route to it — free, private, and fast, with the cloud
@@ -117,8 +146,8 @@ Use these names with `hr auth add`, `hr model set`, and the `<PROVIDER>_*` envir
 variables:
 
 `gemini`, `openrouter`, `sambanova`, `github_models`, `cerebras`, `groq`, `mistral`,
-`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `kimi`, `openai`, `anthropic`, `codex`,
-`local`.
+`cohere`, `zai`, `naga`, `nvidia`, `huggingface`, `kimi`, `opencode`, `opencode_go`, `openai`,
+`anthropic`, `codex`, `local`.
 
 ## Per-provider capabilities
 

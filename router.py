@@ -520,6 +520,32 @@ def _build_providers() -> list[dict]:
             "keys":     kimi_keys,
         })
 
+    # OpenCode Zen — an OpenAI-compatible gateway for coding models with a pool of
+    # genuinely FREE models (default below). One API key (`hr auth add opencode`);
+    # paid premium models (claude/gpt/gemini/…) are reachable too via OPENCODE_MODEL.
+    opencode_keys = _keys_for("opencode", "OPENCODE_API_KEYS")
+    if opencode_keys:
+        providers.append({
+            "name":     "opencode",
+            "base_url": os.environ.get("OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"),
+            "model":    os.environ.get("OPENCODE_MODEL",
+                        "deepseek-v4-flash-free,minimax-m3-free,qwen3.6-plus-free"),
+            "keys":     opencode_keys,
+        })
+
+    # OpenCode Go — the same OpenCode key + an OpenAI-compatible endpoint, but the
+    # low-cost subscription tier ($5 first month, then $10/mo). Enabled only when an
+    # `opencode_go` key is configured (signals you've turned on Go billing), so it
+    # never adds dead attempts before you subscribe.
+    opencode_go_keys = _keys_for("opencode_go", "OPENCODE_GO_API_KEYS")
+    if opencode_go_keys:
+        providers.append({
+            "name":     "opencode_go",
+            "base_url": os.environ.get("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1"),
+            "model":    os.environ.get("OPENCODE_GO_MODEL", "deepseek-v4-flash,minimax-m3"),
+            "keys":     opencode_go_keys,
+        })
+
     openai_keys = _keys_for("openai", "OPENAI_API_KEYS")
     if openai_keys:
         providers.append({
@@ -2615,8 +2641,16 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
 
             if resp.status_code in (401, 403):
                 stats.record_error(name)
-                # auth/permission — won't work for any model on this provider.
-                log.error(f"  {name} {resp.status_code} — auth, skipping provider: {resp.text[:200]}")
+                btxt = (resp.text or "")[:300]
+                # Some gateways (e.g. OpenCode) return a MODEL-level rejection as a
+                # 401 — an ended free promo, an unsupported/paywalled model. That's
+                # not a credential problem, so skip just this model and try the
+                # provider's next one instead of disabling the whole provider.
+                if re.search(r"modelerror|not supported|promotion has ended|subscrib|no payment|credits", btxt, re.I):
+                    log.warning(f"  {name}/{model} {resp.status_code} model-level — skipping this model: {btxt[:160]}")
+                    break
+                # Genuine auth/permission failure — won't work for any model here.
+                log.error(f"  {name} {resp.status_code} — auth, skipping provider: {btxt[:200]}")
                 skip_providers.add(name)
                 break
 
