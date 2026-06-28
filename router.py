@@ -1668,24 +1668,90 @@ def _streaming_with_usage(gen, name: str, model: str | None = None):
 # Anthropic's Messages API uses a different format from OpenAI. These helpers
 # translate transparently so the caller never has to know which provider they hit.
 
+def _openai_content_to_anthropic(content) -> list | str:
+    """Convert an OpenAI content value (string or list) to Anthropic format.
+
+    OpenAI image_url blocks become Anthropic image blocks (base64 or url source).
+    Text blocks are preserved. Thinking/reasoning blocks are dropped (already
+    stripped by _strip_message, but safe to double-check here).
+    Returns a list when images are present, plain string otherwise.
+    """
+    if not isinstance(content, list):
+        return content or ""
+    converted = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        t = block.get("type")
+        if t in ("thinking", "think"):
+            continue
+        if t == "text":
+            converted.append({"type": "text", "text": block.get("text", "")})
+        elif t == "image_url":
+            url = (block.get("image_url") or {}).get("url", "")
+            if url.startswith("data:"):
+                # data:image/jpeg;base64,<data>
+                try:
+                    header, data = url.split(",", 1)
+                    media_type = header.split(";")[0][5:]  # strip "data:"
+                    converted.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    })
+                except Exception:
+                    pass  # malformed data URL — skip
+            elif url.startswith(("http://", "https://")):
+                converted.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": url},
+                })
+        # unknown types are silently dropped
+    if not converted:
+        return ""
+    # If it's purely text with no images, return a plain string for cleanliness
+    if all(b.get("type") == "text" for b in converted):
+        return " ".join(b.get("text", "") for b in converted)
+    return converted
+
+
+def _merge_anthropic_content(existing, incoming) -> list | str:
+    """Merge two content values when combining consecutive same-role messages.
+    Produces a list when either side contains images, plain string otherwise."""
+    def _to_list(c) -> list:
+        if isinstance(c, list):
+            return c
+        return [{"type": "text", "text": c}] if c else []
+
+    if isinstance(existing, list) or isinstance(incoming, list):
+        merged = _to_list(existing) + _to_list(incoming)
+        # Collapse back to string if no images remain
+        if all(b.get("type") == "text" for b in merged):
+            return " ".join(b.get("text", "") for b in merged)
+        return merged
+    # Both plain strings
+    return (existing + "\n" + incoming) if existing else incoming
+
+
 def _to_anthropic_body(payload: dict, model: str) -> dict:
-    """Convert an OpenAI chat-completions request body to Anthropic Messages format."""
+    """Convert an OpenAI chat-completions request body to Anthropic Messages format.
+    Image content (image_url blocks) is translated to Anthropic image blocks so
+    vision requests work correctly when routed to Claude.
+    """
     system_parts = []
     messages = []
     for msg in payload.get("messages", []):
         role = msg.get("role", "")
-        content = msg.get("content", "")
-        # Flatten list content to plain text
-        if isinstance(content, list):
-            content = " ".join(
-                p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
-            )
+        content = _openai_content_to_anthropic(msg.get("content", ""))
         if role == "system":
-            system_parts.append(content)
+            # System content is always plain text in Anthropic's API
+            text = " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text") if isinstance(content, list) else content
+            system_parts.append(text)
         else:
             # Merge consecutive same-role messages (Anthropic requires alternating roles)
             if messages and messages[-1]["role"] == role:
-                messages[-1]["content"] += "\n" + content
+                messages[-1]["content"] = _merge_anthropic_content(
+                    messages[-1]["content"], content
+                )
             else:
                 messages.append({"role": role, "content": content})
 
@@ -2711,8 +2777,27 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name, model)
                 return ("stream", wrapped, name)
             else:
-                data = (_from_anthropic_response(resp.json()) if is_anthropic
-                        else resp.json())
+                try:
+                    raw = resp.json()
+                except Exception:
+                    raw = None
+                data = (_from_anthropic_response(raw) if (is_anthropic and isinstance(raw, dict))
+                        else raw)
+                # Guard: a 2xx that carries no usable completion (no `choices`) — e.g.
+                # a gateway that wraps an error in an HTTP-200 body (NVIDIA NIM's gRPC
+                # "ResourceExhausted: Worker local total request limit reached"), or a
+                # non-JSON body. Don't surface that to the caller as the answer —
+                # treat it as a provider failure, cool this (key,model), and cascade.
+                if not isinstance(data, dict) or not data.get("choices"):
+                    stats.record_error(name)
+                    stats.record_health(name, False)
+                    err = data.get("error") if isinstance(data, dict) else None
+                    emsg = (err.get("message", "") if isinstance(err, dict)
+                            else err if isinstance(err, str)
+                            else (data.get("message", "") if isinstance(data, dict) else ""))
+                    log.warning(f"  {name}/{model} 2xx without choices — cascading: {str(emsg)[:140]}")
+                    pool.mark_rate_limited(name, key, model, retry_after=30)
+                    break
                 if not is_anthropic:
                     _strip_response(data)
                 _add_provider_tokens(name, data, model)
