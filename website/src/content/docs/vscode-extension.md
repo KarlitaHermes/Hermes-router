@@ -92,7 +92,8 @@ dashboard has buttons for them too):
 
 | Command | What it does |
 |---|---|
-| **Open Dashboard** | Show the live provider table |
+| **Open Dashboard** | Show the live provider table (in-editor panel) |
+| **Open Web Dashboard (browser)** | Open the router's full browser dashboard at `/dashboard` — request log, per-key usage, cache stats |
 | **Restart Router** | Apply key/config changes (`hr restart`) |
 | **Run Doctor (diagnose)** | Diagnose install/health problems (`hr doctor`) |
 | **Update to Latest** | Upgrade the router (`hr update`) |

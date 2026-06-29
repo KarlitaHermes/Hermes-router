@@ -23,9 +23,10 @@ already talks to either works unchanged — just point it at hermes-router inste
 failover · smart routing (sends each request to the cheapest model that can handle it) ·
 **local models** (Ollama / LM Studio) with cloud fallback · tool calling · embeddings ·
 response caching (incl. optional **semantic** cache) · **per-key budgets & rate limits** ·
-**usage analytics** (`/v1/usage`) with **cost/spend tracking** · circuit breaker for unhealthy
-providers · Prometheus `/metrics` · **runs as a reboot-surviving service** (`hr service`) ·
-toggle optional features with `hr features` · one structured `auth.json` for all your keys.
+**built-in web dashboard** (just open `http://localhost:8319/`) · **usage analytics**
+(`/v1/usage`) with **cost/spend tracking** · circuit breaker for unhealthy providers ·
+Prometheus `/metrics` · **runs as a reboot-surviving service** (`hr service`) · toggle
+optional features with `hr features` · one structured `auth.json` for all your keys.
 
 ## Documentation
 
@@ -49,7 +50,7 @@ The docs read in order, from zero experience to a running, monitored agent:
 
 **Operate & extend:**
 
-- **[Monitoring](documentation/monitoring.md)** — `hr status`, Prometheus `/metrics`, `/v1/status` (tokens, spend)
+- **[Monitoring](documentation/monitoring.md)** — **web dashboard** (`/dashboard`), `hr status`, Prometheus `/metrics`, `/v1/status` (tokens, spend)
 - **[VS Code Extension](documentation/vscode-extension.md)** — monitor & manage the router, and use it as a model in Copilot Chat
 
 ---
@@ -135,6 +136,9 @@ Check it's running:
 ```bash
 curl http://localhost:8319/health
 ```
+
+Or open **`http://localhost:8319/`** in a browser for the live monitoring dashboard —
+provider health, request log, cache stats, and per-key usage (it'll ask for your proxy key).
 
 ### Quick start
 

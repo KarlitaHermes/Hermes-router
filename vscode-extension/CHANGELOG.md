@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0
+
+- **Open the full web dashboard in your browser.** New **⬈ Web dashboard** button (and a globe
+  icon in the panel header) opens the router's built-in browser dashboard at `/dashboard` —
+  a richer live view with the request log, per-key budget usage, cache stats, and provider
+  health. The compact in-editor panel stays for at-a-glance monitoring. Command:
+  **hermes-router: Open Web Dashboard (browser)**.
+
 ## 0.7.0
 
 - **Toggle add-ons from the dashboard.** The dashboard now has an **Add-ons** panel — click a

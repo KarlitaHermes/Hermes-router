@@ -61,6 +61,13 @@ export function activate(context: vscode.ExtensionContext) {
     await vscode.commands.executeCommand("hermesRouter.dashboard.focus");
     await refresh();
   });
+  // Open the full browser dashboard (served by the router at /dashboard). The
+  // in-editor webview is a compact view; the web one has the live request log,
+  // per-key usage, and richer charts.
+  reg("hermesRouter.openWebDashboard", async () => {
+    const url = makeClient().dashboardUrl();
+    await vscode.env.openExternal(vscode.Uri.parse(url));
+  });
   reg("hermesRouter.refresh", refresh);
 
   reg("hermesRouter.restart", async () => {

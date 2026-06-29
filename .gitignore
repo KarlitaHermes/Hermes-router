@@ -24,3 +24,4 @@ env/
 *.swp
 *.swo
 router.log
+.claude/settings.json

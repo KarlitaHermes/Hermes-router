@@ -25,7 +25,7 @@ Quick start:
 import json, os, time, threading, logging, hashlib, hmac, itertools, re, sqlite3
 from pathlib import Path
 from collections import deque, OrderedDict, defaultdict
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, redirect
 import requests
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -96,6 +96,9 @@ if ROTATION_MODE not in ("round-robin", "sequential"):
 STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
 STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 AUTH_FILE         = Path(os.environ.get("ROUTER_AUTH_FILE", "./auth.json"))  # router's own key store
+# In-memory request log: last N requests kept in a ring buffer. Pure RAM, no disk
+# writes. Set REQUEST_LOG_SIZE=0 to disable. Exposed via GET /v1/logs.
+REQUEST_LOG_SIZE  = max(0, int(os.environ.get("REQUEST_LOG_SIZE", "500")))
 
 
 def _load_auth_json() -> dict[str, list[str]]:
@@ -1269,6 +1272,65 @@ class ProviderStats:
 
 
 stats = ProviderStats()
+
+# ── Request ring buffer ─────────────────────────────────────────────────────────
+# Per-thread context written by _route_completion so endpoint handlers can read
+# back routing metadata (chosen provider, model, cascade count) after the call
+# returns without changing _route_completion's return signature.
+_req_ctx = threading.local()
+
+
+class RequestRingBuffer:
+    """Fixed-size in-memory circular log of recent requests.
+
+    Oldest entries are silently dropped when full. Never touches disk.
+    Thread-safe: all mutations hold a lock."""
+
+    def __init__(self, maxlen: int = 500):
+        self._buf   = deque(maxlen=max(1, maxlen)) if maxlen > 0 else None
+        self._lock  = threading.Lock()
+        self.maxlen = maxlen
+
+    def append(self, entry: dict) -> None:
+        if self._buf is None:
+            return
+        with self._lock:
+            self._buf.append(entry)
+
+    def snapshot(self, limit: int = 100, provider: str | None = None,
+                 status: str | None = None, endpoint: str | None = None) -> list:
+        if self._buf is None:
+            return []
+        with self._lock:
+            items = list(self._buf)
+        if provider:
+            items = [e for e in items if e.get("provider") == provider]
+        if status:
+            items = [e for e in items if e.get("status") == status]
+        if endpoint:
+            items = [e for e in items if e.get("endpoint") == endpoint]
+        items = list(reversed(items))   # most recent first
+        return items[:limit]
+
+    def clear(self) -> None:
+        if self._buf is None:
+            return
+        with self._lock:
+            self._buf.clear()
+
+    @property
+    def size(self) -> int:
+        if self._buf is None:
+            return 0
+        with self._lock:
+            return len(self._buf)
+
+    @property
+    def enabled(self) -> bool:
+        return self._buf is not None
+
+
+request_log = RequestRingBuffer(maxlen=REQUEST_LOG_SIZE)
 
 # ── Response cache ─────────────────────────────────────────────────────────────
 
@@ -2568,6 +2630,561 @@ def _record_request_tokens(token: str, payload: dict, result):
     key_usage.add_tokens(token, n)
 
 
+_DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hermes Router — Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f1117;--surface:#181c27;--surface2:#1e2333;--border:#2a3050;
+  --text:#e2e8f0;--muted:#8892a4;--accent:#6c8cff;--green:#4ade80;
+  --yellow:#facc15;--red:#f87171;--orange:#fb923c;--purple:#c084fc;
+  --font:'Inter',system-ui,sans-serif;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;min-height:100vh}
+
+/* ── layout ── */
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;
+  background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+header h1{font-size:15px;font-weight:600;letter-spacing:.3px;color:var(--text)}
+header h1 span{color:var(--accent)}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 8px;
+  border-radius:99px;background:var(--surface2);border:1px solid var(--border);color:var(--muted)}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green)}
+.badge .dot.err{background:var(--red);box-shadow:0 0 5px var(--red)}
+.header-right{display:flex;align-items:center;gap:10px}
+#last-update{font-size:11px;color:var(--muted)}
+.btn{cursor:pointer;font-size:11px;padding:4px 10px;border-radius:6px;border:1px solid var(--border);
+  background:var(--surface2);color:var(--text);transition:.15s}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+
+main{padding:18px 20px;display:grid;gap:16px}
+
+/* ── key input overlay ── */
+#key-gate{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;
+  align-items:center;justify-content:center;z-index:100}
+#key-gate.hidden{display:none}
+.gate-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:28px 32px;min-width:320px;text-align:center}
+.gate-box h2{margin-bottom:6px;font-size:15px}
+.gate-box p{color:var(--muted);font-size:12px;margin-bottom:18px}
+.gate-box input{width:100%;padding:8px 12px;border-radius:7px;border:1px solid var(--border);
+  background:var(--bg);color:var(--text);font-size:13px;outline:none;margin-bottom:10px}
+.gate-box input:focus{border-color:var(--accent)}
+.gate-box .btn{width:100%;padding:7px}
+
+/* ── stat cards ── */
+.stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:14px 16px}
+.stat-card .label{font-size:11px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;
+  letter-spacing:.5px}
+.stat-card .value{font-size:22px;font-weight:700;color:var(--text)}
+.stat-card .sub{font-size:11px;color:var(--muted);margin-top:3px}
+
+/* ── panels ── */
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.panel-header{display:flex;align-items:center;justify-content:space-between;
+  padding:10px 14px;border-bottom:1px solid var(--border);background:var(--surface2)}
+.panel-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;
+  color:var(--muted)}
+.panel-body{overflow-x:auto}
+
+/* ── tables ── */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:7px 12px;text-align:left;color:var(--muted);font-weight:500;
+  font-size:11px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:7px 12px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(108,140,255,.04)}
+
+/* ── status dots ── */
+.dot-ok{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--green);box-shadow:0 0 5px var(--green);margin-right:5px}
+.dot-warn{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--yellow);box-shadow:0 0 5px var(--yellow);margin-right:5px}
+.dot-err{display:inline-block;width:8px;height:8px;border-radius:50%;
+  background:var(--red);box-shadow:0 0 5px var(--red);margin-right:5px}
+
+/* ── pill badges ── */
+.pill{display:inline-block;padding:2px 7px;border-radius:99px;font-size:10px;font-weight:600}
+.pill-ok{background:rgba(74,222,128,.12);color:var(--green)}
+.pill-err{background:rgba(248,113,113,.12);color:var(--red)}
+.pill-cache{background:rgba(192,132,252,.12);color:var(--purple)}
+.pill-warn{background:rgba(250,204,21,.12);color:var(--yellow)}
+.pill-grey{background:rgba(136,146,164,.12);color:var(--muted)}
+
+/* ── rating bar ── */
+.rating-bar{display:flex;gap:3px;align-items:center}
+.rating-pip{width:9px;height:9px;border-radius:2px;background:var(--border)}
+.r1 .rating-pip.active{background:var(--green)}
+.r2 .rating-pip.active{background:#22d3ee}
+.r3 .rating-pip.active{background:var(--accent)}
+.r4 .rating-pip.active{background:var(--yellow)}
+.r5 .rating-pip.active{background:var(--red)}
+
+/* ── progress bar ── */
+.prog-track{background:var(--surface2);border-radius:99px;height:5px;min-width:80px;overflow:hidden}
+.prog-fill{height:100%;border-radius:99px;background:var(--accent);transition:width .4s}
+.prog-fill.green{background:var(--green)}
+.prog-fill.red{background:var(--red)}
+.prog-fill.yellow{background:var(--yellow)}
+
+/* ── add-on toggles ── */
+.addon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;padding:12px}
+.addon-card{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px}
+.addon-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
+.addon-name{font-size:12px;font-weight:600}
+.addon-desc{font-size:11px;color:var(--muted);line-height:1.4}
+
+/* ── log table ── */
+#log-wrap{max-height:340px;overflow-y:auto}
+.log-row-success td:first-child{border-left:2px solid var(--green)}
+.log-row-error td:first-child{border-left:2px solid var(--red)}
+.log-row-cache_hit td:first-child{border-left:2px solid var(--purple)}
+
+/* ── two-col layout for lower panels ── */
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:820px){.two-col{grid-template-columns:1fr}}
+
+/* ── misc ── */
+.mono{font-family:monospace;font-size:11px}
+.right{text-align:right}
+.muted{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<!-- API key gate -->
+<div id="key-gate">
+  <div class="gate-box">
+    <h2>Hermes Router</h2>
+    <p>Enter your proxy API key to view the dashboard.</p>
+    <input id="key-input" type="password" placeholder="sk-router-..." autocomplete="off">
+    <button class="btn" onclick="submitKey()">Open Dashboard</button>
+  </div>
+</div>
+
+<header>
+  <h1><span>Hermes</span> Router &mdash; Dashboard</h1>
+  <div class="header-right">
+    <div class="badge"><div class="dot" id="hdr-dot"></div><span id="hdr-status">connecting</span></div>
+    <span id="last-update"></span>
+    <button class="btn" onclick="refresh()">↺ Refresh</button>
+  </div>
+</header>
+
+<main>
+  <!-- stat cards row -->
+  <div class="stat-row" id="stat-row">
+    <div class="stat-card"><div class="label">Providers</div><div class="value" id="s-providers">—</div><div class="sub" id="s-providers-sub"></div></div>
+    <div class="stat-card"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div><div class="sub">since last restart</div></div>
+    <div class="stat-card"><div class="label">Total Requests</div><div class="value" id="s-requests">—</div><div class="sub" id="s-requests-sub"></div></div>
+    <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="s-tokens">—</div><div class="sub" id="s-cost"></div></div>
+    <div class="stat-card"><div class="label">Cache Hit Rate</div><div class="value" id="s-hitrate">—</div><div class="sub" id="s-cache-sub"></div></div>
+    <div class="stat-card"><div class="label">Error Rate</div><div class="value" id="s-errrate">—</div><div class="sub" id="s-errrate-sub"></div></div>
+  </div>
+
+  <!-- provider health table -->
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">Provider Health</span></div>
+    <div class="panel-body">
+      <table>
+        <thead><tr>
+          <th>Provider</th><th>Model</th><th>Rating</th>
+          <th class="right">Requests</th><th class="right">Errors</th>
+          <th class="right">Err %</th><th class="right">Avg Latency</th>
+          <th class="right">Tokens</th><th class="right">Cost (USD)</th>
+          <th>Keys</th><th>Breaker</th><th>Status</th>
+        </tr></thead>
+        <tbody id="provider-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- live request log -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Live Request Log</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="log-filter-status" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
+          <option value="">All statuses</option>
+          <option value="success">success</option>
+          <option value="error">error</option>
+          <option value="cache_hit">cache_hit</option>
+        </select>
+        <select id="log-filter-endpoint" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
+          <option value="">All endpoints</option>
+          <option value="chat">chat</option>
+          <option value="messages">messages</option>
+          <option value="embeddings">embeddings</option>
+        </select>
+      </div>
+    </div>
+    <div class="panel-body" id="log-wrap">
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Endpoint</th><th>Provider</th><th>Model</th>
+          <th class="right">Latency</th><th class="right">Complexity</th>
+          <th class="right">Cascades</th><th class="right">Prompt tok</th>
+          <th class="right">Compl tok</th><th>Status</th>
+        </tr></thead>
+        <tbody id="log-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- bottom two-col: cache+features | key usage -->
+  <div class="two-col">
+
+    <!-- cache stats + add-ons -->
+    <div style="display:grid;gap:16px">
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Cache</span></div>
+        <div class="panel-body">
+          <table>
+            <tbody id="cache-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header"><span class="panel-title">Feature Add-ons</span></div>
+        <div class="addon-grid" id="addon-grid"></div>
+      </div>
+    </div>
+
+    <!-- key usage -->
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">Key & Budget Usage</span></div>
+      <div class="panel-body">
+        <table>
+          <thead><tr>
+            <th>Key</th><th class="right">Requests</th>
+            <th class="right">Tokens (day)</th><th class="right">Cost (day)</th>
+            <th>RPM used</th>
+          </tr></thead>
+          <tbody id="keys-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /two-col -->
+</main>
+
+<script>
+// ── state ──────────────────────────────────────────────────────────────────────
+let apiKey = localStorage.getItem('hermes_dash_key') || '';
+let statusData = null, usageData = null, logsData = [];
+let INTERVAL = 5000;
+let timer = null;
+
+// ── key gate ──────────────────────────────────────────────────────────────────
+(function init() {
+  if (apiKey) { document.getElementById('key-gate').classList.add('hidden'); start(); }
+  document.getElementById('key-input').addEventListener('keydown', e => { if (e.key==='Enter') submitKey(); });
+})();
+
+function submitKey() {
+  const v = document.getElementById('key-input').value.trim();
+  if (!v) return;
+  apiKey = v;
+  localStorage.setItem('hermes_dash_key', v);
+  document.getElementById('key-gate').classList.add('hidden');
+  start();
+}
+
+// ── polling ───────────────────────────────────────────────────────────────────
+function start() { refresh(); timer = setInterval(refresh, INTERVAL); }
+
+async function refresh() {
+  try {
+    const h = { 'Authorization': 'Bearer ' + apiKey };
+    const logStatus  = document.getElementById('log-filter-status').value;
+    const logEp      = document.getElementById('log-filter-endpoint').value;
+    let logUrl = '/v1/logs?limit=100';
+    if (logStatus) logUrl += '&status=' + logStatus;
+    if (logEp)     logUrl += '&endpoint=' + logEp;
+
+    const [s, u, l] = await Promise.all([
+      fetch('/v1/status', {headers:h}).then(r=>r.json()),
+      fetch('/v1/usage',  {headers:h}).then(r=>r.json()),
+      fetch(logUrl,       {headers:h}).then(r=>r.json()),
+    ]);
+    statusData = s; usageData = u; logsData = l.entries || [];
+    renderAll();
+    setHeader(true);
+  } catch(e) {
+    setHeader(false);
+  }
+  document.getElementById('log-filter-status').onchange  = refresh;
+  document.getElementById('log-filter-endpoint').onchange = refresh;
+}
+
+function setHeader(ok) {
+  const dot = document.getElementById('hdr-dot');
+  const lbl = document.getElementById('hdr-status');
+  dot.className = ok ? 'dot' : 'dot err';
+  lbl.textContent = ok ? 'live' : 'error';
+  document.getElementById('last-update').textContent =
+    'Updated ' + new Date().toLocaleTimeString();
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+const fmt = {
+  num:  n => n == null ? '—' : Number(n).toLocaleString(),
+  tok:  n => { if (n==null||n===0) return '0'; if (n>=1e9) return (n/1e9).toFixed(1)+'B'; if (n>=1e6) return (n/1e6).toFixed(1)+'M'; if (n>=1e3) return (n/1e3).toFixed(1)+'K'; return String(n); },
+  pct:  n => n == null ? '—' : n.toFixed(1) + '%',
+  ms:   n => n == null ? '—' : (n >= 1000 ? (n/1000).toFixed(1)+'s' : Math.round(n)+'ms'),
+  usd:  n => n == null ? '—' : (n < 0.0001 ? '<$0.0001' : '$' + n.toFixed(4)),
+  uptime: s => { if (!s) return '—'; const h=Math.floor(s/3600),m=Math.floor((s%3600)/60); return (h?h+'h ':'') + m+'m'; },
+  time: ts => { if (!ts) return '—'; try { return new Date(ts).toLocaleTimeString(); } catch { return ts; } },
+};
+
+function el(tag, cls, html) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  return e;
+}
+
+function ratingPips(r) {
+  if (!r) return '<span class="muted">—</span>';
+  const cls = ['','r1','r2','r3','r4','r5'][r] || 'r5';
+  const labels = ['','Outstanding','Best','Good','Fair','Basic'];
+  let h = `<div class="rating-bar ${cls}" title="${labels[r]||''}">`;
+  for (let i=1;i<=5;i++) h += `<div class="rating-pip ${i<=r?'active':''}"></div>`;
+  return h + '</div>';
+}
+
+function statusPill(s, breaker) {
+  if (breaker) return '<span class="pill pill-err">⨂ tripped</span>';
+  if (s && s.total_requests === 0) return '<span class="pill pill-grey">idle</span>';
+  const erp = s ? (s.errors / (s.total_requests||1) * 100) : 0;
+  if (erp > 20) return '<span class="pill pill-err">degraded</span>';
+  if (erp > 5)  return '<span class="pill pill-warn">unstable</span>';
+  return '<span class="pill pill-ok">healthy</span>';
+}
+
+function keyDots(keys) {
+  if (!keys || !keys.length) return '<span class="muted">—</span>';
+  return keys.map(k => {
+    const cls = k.status === 'cooling' ? 'dot-warn' : 'dot-ok';
+    const title = k.status === 'cooling' ? `cooling (${k.ready_in}s)` : 'ready';
+    return `<span class="${cls}" title="${title}" style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:2px"></span>`;
+  }).join('');
+}
+
+// ── render all ────────────────────────────────────────────────────────────────
+function renderAll() {
+  renderStats();
+  renderProviders();
+  renderLogs();
+  renderCache();
+  renderAddons();
+  renderKeys();
+}
+
+// ── stat cards ────────────────────────────────────────────────────────────────
+function renderStats() {
+  if (!statusData || !usageData) return;
+  const prov   = statusData.providers || {};
+  const nProv  = Object.keys(prov).length;
+  const broken = Object.values(prov).filter(p => p.breaker && p.breaker.open).length;
+  document.getElementById('s-providers').textContent = nProv;
+  document.getElementById('s-providers-sub').textContent =
+    broken ? `${broken} breaker(s) tripped` : 'all healthy';
+
+  document.getElementById('s-uptime').textContent = fmt.uptime(usageData.uptime_s);
+
+  const totReq = Object.values(prov).reduce((a,p) => a + (p.stats?.total_requests||0), 0);
+  const totErr = Object.values(prov).reduce((a,p) => a + (p.stats?.errors||0), 0);
+  document.getElementById('s-requests').textContent = fmt.num(totReq);
+  document.getElementById('s-requests-sub').textContent =
+    totReq ? fmt.pct(totErr/totReq*100) + ' error rate' : '';
+
+  const tot = usageData.totals || {};
+  document.getElementById('s-tokens').textContent = fmt.tok(tot.tokens);
+  document.getElementById('s-cost').textContent   = 'est. ' + fmt.usd(tot.cost?.usd);
+
+  const cache = statusData.cache || {};
+  document.getElementById('s-hitrate').textContent = fmt.pct((cache.hit_rate||0)*100);
+  document.getElementById('s-cache-sub').textContent =
+    `${fmt.num(cache.hits)} hits / ${fmt.num(cache.misses)} misses`;
+
+  const errRate = totReq ? (totErr / totReq * 100) : 0;
+  const errEl = document.getElementById('s-errrate');
+  errEl.textContent = fmt.pct(errRate);
+  errEl.style.color = errRate > 10 ? 'var(--red)' : errRate > 3 ? 'var(--yellow)' : 'var(--green)';
+  document.getElementById('s-errrate-sub').textContent = fmt.num(totErr) + ' total errors';
+}
+
+// ── provider table ────────────────────────────────────────────────────────────
+function renderProviders() {
+  if (!statusData) return;
+  const prov = statusData.providers || {};
+  const tbody = document.getElementById('provider-tbody');
+  tbody.innerHTML = '';
+  Object.entries(prov).forEach(([name, p]) => {
+    const s   = p.stats || {};
+    const req = s.total_requests || 0;
+    const err = s.errors || 0;
+    const erp = req ? err / req * 100 : 0;
+    const lat = s.avg_latency_ms;
+    const brk = p.breaker?.open || false;
+    const tr  = document.createElement('tr');
+    tr.innerHTML = `
+      <td><strong>${name}</strong></td>
+      <td class="muted mono" style="max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${p.model||''}">${p.model||'—'}</td>
+      <td>${ratingPips(p.rating)}</td>
+      <td class="right">${fmt.num(req)}</td>
+      <td class="right ${err>0?'':'muted'}">${fmt.num(err)}</td>
+      <td class="right" style="color:${erp>10?'var(--red)':erp>3?'var(--yellow)':'var(--muted)'}">${req?fmt.pct(erp):'—'}</td>
+      <td class="right">${fmt.ms(lat)}</td>
+      <td class="right muted">${fmt.tok(p.tokens)}</td>
+      <td class="right muted">${fmt.usd(p.cost_usd)}</td>
+      <td>${keyDots(p.keys)}</td>
+      <td>${brk?'<span class="pill pill-err">open</span>':'<span class="pill pill-ok">closed</span>'}</td>
+      <td>${statusPill(s, brk)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// ── live log ──────────────────────────────────────────────────────────────────
+function renderLogs() {
+  const tbody = document.getElementById('log-tbody');
+  if (!logsData.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:24px">No requests logged yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  logsData.forEach(e => {
+    const tr = document.createElement('tr');
+    tr.className = 'log-row-' + (e.status||'');
+    const sp = e.status === 'success' ? 'pill-ok' : e.status === 'error' ? 'pill-err' : 'pill-cache';
+    const cascBadge = e.cascades > 0
+      ? `<span class="pill pill-warn">${e.cascades}</span>`
+      : '<span class="muted">0</span>';
+    const cmpx = e.complexity;
+    const cmpxColor = !cmpx ? 'var(--muted)' : cmpx<=2?'var(--red)':cmpx>=5?'var(--green)':'var(--yellow)';
+    tr.innerHTML = `
+      <td class="mono muted">${fmt.time(e.ts)}</td>
+      <td>${e.endpoint||'—'}</td>
+      <td><strong>${e.provider||'—'}</strong></td>
+      <td class="muted mono" style="max-width:140px;overflow:hidden;text-overflow:ellipsis" title="${e.model||''}">${e.model||'—'}</td>
+      <td class="right">${fmt.ms(e.latency_ms)}</td>
+      <td class="right" style="color:${cmpxColor}">${cmpx||'—'}</td>
+      <td class="right">${cascBadge}</td>
+      <td class="right muted">${e.prompt_tokens!=null?fmt.num(e.prompt_tokens):'—'}</td>
+      <td class="right muted">${e.completion_tokens!=null?fmt.num(e.completion_tokens):'—'}</td>
+      <td><span class="pill ${sp}">${e.status||'—'}</span></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// ── cache panel ───────────────────────────────────────────────────────────────
+function renderCache() {
+  if (!statusData) return;
+  const c = statusData.cache || {};
+  const sem = c.semantic || {};
+  const rows = [
+    ['Enabled',       c.enabled ? '<span class="pill pill-ok">yes</span>' : '<span class="pill pill-grey">no</span>'],
+    ['TTL',           c.ttl_s != null ? c.ttl_s + 's' : '—'],
+    ['Size',          `${fmt.num(c.size)} / ${fmt.num(c.max_size)}`],
+    ['Persistent',    c.persistent ? '<span class="pill pill-ok">yes</span>' : '<span class="pill pill-grey">no</span>'],
+    ['Hits',          fmt.num(c.hits)],
+    ['Misses',        fmt.num(c.misses)],
+    ['Hit rate',      fmt.pct((c.hit_rate||0)*100)],
+    ['Semantic cache',sem.enabled ? '<span class="pill pill-ok">yes</span>' : '<span class="pill pill-grey">no</span>'],
+    ['Semantic hits', fmt.num(sem.hits)],
+    ['Sem. threshold',sem.threshold != null ? sem.threshold : '—'],
+  ];
+  const tbody = document.getElementById('cache-tbody');
+  tbody.innerHTML = rows.map(([k,v]) =>
+    `<tr><td class="muted" style="width:50%">${k}</td><td>${v}</td></tr>`
+  ).join('');
+}
+
+// ── add-ons panel ─────────────────────────────────────────────────────────────
+function renderAddons() {
+  if (!statusData?.features) return;
+  const addons = statusData.features.addons || [];
+  const grid = document.getElementById('addon-grid');
+  grid.innerHTML = addons.map(a => `
+    <div class="addon-card">
+      <div class="addon-top">
+        <span class="addon-name">${a.title || a.name}</span>
+        <span class="pill ${a.enabled ? 'pill-ok' : 'pill-grey'}">${a.enabled ? 'on' : 'off'}</span>
+      </div>
+      <div class="addon-desc">${a.desc || ''}</div>
+      ${a.env ? `<div class="mono muted" style="margin-top:5px;font-size:10px">${a.env}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+// ── key usage ─────────────────────────────────────────────────────────────────
+function renderKeys() {
+  if (!usageData) return;
+  const keys = usageData.keys || [];
+  const limData = statusData?.limits || {};
+  const tbody = document.getElementById('keys-tbody');
+  if (!keys.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">No key data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = keys.map(k => {
+    const limEntry = (limData.keys || []).find(l => l.key_tail === k.key_tail);
+    const lim = limEntry?.limits || {};
+    const rpmUsed = k.rpm_current || 0;
+    const rpmMax  = lim.rpm || 0;
+    const rpmPct  = rpmMax ? Math.min(rpmUsed / rpmMax * 100, 100) : 0;
+    const rpmColor = rpmPct > 80 ? 'red' : rpmPct > 50 ? 'yellow' : 'green';
+    return `<tr>
+      <td class="mono">...${k.key_tail}</td>
+      <td class="right">${fmt.num(k.req_total)}</td>
+      <td class="right">
+        ${fmt.tok(k.tokens_today)}
+        ${lim.tokens_day ? `<br><span class="muted" style="font-size:10px">/ ${fmt.tok(lim.tokens_day)}</span>` : ''}
+      </td>
+      <td class="right">
+        ${fmt.usd(k.cost_today)}
+        ${lim.cost_day ? `<br><span class="muted" style="font-size:10px">/ ${fmt.usd(lim.cost_day)}</span>` : ''}
+      </td>
+      <td style="min-width:100px">
+        ${rpmMax
+          ? `<div class="prog-track"><div class="prog-fill ${rpmColor}" style="width:${rpmPct}%"></div></div>
+             <span class="muted" style="font-size:10px">${rpmUsed}/${rpmMax} rpm</span>`
+          : '<span class="muted">unlimited</span>'}
+      </td>
+    </tr>`;
+  }).join('');
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def root():
+    """Land bare-host visitors on the dashboard so `http://<host>:<port>` just works
+    in a browser — no need to know the /dashboard path. API clients use /v1/* and
+    never hit this."""
+    return redirect("/dashboard", code=302)
+
+
+@app.route("/dashboard")
+def dashboard():
+    """Self-contained monitoring dashboard. Opens in any browser.
+    Polls /v1/status, /v1/usage, and /v1/logs every 5 seconds.
+    Prompts for the proxy API key on first load (stored in localStorage)."""
+    return Response(_DASHBOARD_HTML, content_type="text/html; charset=utf-8")
+
+
 @app.route("/health")
 def health():
     """Unauthenticated health check for uptime monitoring."""
@@ -2596,6 +3213,13 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                                          OpenAI-format SSE regardless of upstream
         ("error",  error_dict, status)   every provider exhausted
     """
+    # Seed per-thread routing context so endpoint handlers can read it back
+    # after this call returns (provider chosen, cascade count, cache-hit flag).
+    _req_ctx.provider  = None
+    _req_ctx.model     = None
+    _req_ctx.cache_hit = False
+    _req_ctx.attempts  = 0   # total forward() calls made (cascades = attempts-1)
+
     # Routing profile: `hermes-router:fast` (or header X-Hermes-Profile: fast)
     # prefers a local model for short/casual turns, with cloud as fallback. We
     # normalize the model back to the router id so the cache and upstream model
@@ -2621,6 +3245,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
         cached = cache.get(payload, ns)
         if cached is not None:
             log.info("↩ cache hit")
+            _req_ctx.cache_hit = True
             return ("json", cached)
         if SEMANTIC_CACHE and _embed_ordered():
             query_emb = _embed_text(_prompt_text(messages))
@@ -2628,6 +3253,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 hit = cache.semantic_lookup(query_emb, ns)
                 if hit is not None:
                     log.info("↩ semantic cache hit")
+                    _req_ctx.cache_hit = True
                     return ("json", hit)
 
     est_tokens = _estimated_tokens(messages)
@@ -2687,6 +3313,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 break   # all keys for this (provider, model) are cooling → next candidate
 
             log.info(f"→ Trying {name}/{model} ...{key[-6:]}")
+            _req_ctx.attempts += 1
             t0   = time.time()
             resp = forward(provider, key, payload, streaming, model)
             elapsed = time.time() - t0
@@ -2750,6 +3377,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
             stats.record_success(name, elapsed)
             stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
             log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+            _req_ctx.provider = name
+            _req_ctx.model    = model
             is_anthropic = provider.get("protocol") == "anthropic"
             is_codex     = provider.get("protocol") == "codex"
             if is_codex:
@@ -2807,6 +3436,44 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     return ("error", {"error": {"message": "All providers exhausted", "type": "router_error"}}, 503)
 
 
+def _log_completion(token: str, endpoint: str, payload: dict, result: tuple, elapsed: float) -> None:
+    """Append one entry to the request ring buffer. Never raises."""
+    try:
+        messages = payload.get("messages", [])
+        is_cache = getattr(_req_ctx, "cache_hit", False)
+        attempts = getattr(_req_ctx, "attempts", 0)
+
+        if result[0] == "json":
+            status = "cache_hit" if is_cache else "success"
+            usage  = result[1].get("usage", {}) if isinstance(result[1], dict) else {}
+            ptok   = usage.get("prompt_tokens")
+            ctok   = usage.get("completion_tokens")
+        elif result[0] == "stream":
+            status = "success"
+            ptok   = ctok = None
+        else:
+            status = "error"
+            ptok   = ctok = None
+
+        request_log.append({
+            "ts":               time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "endpoint":         endpoint,
+            "caller":           token[-6:] if token else "anon",
+            "streaming":        bool(payload.get("stream", False)),
+            "complexity":       classify_complexity(messages),
+            "est_tokens":       _estimated_tokens(messages),
+            "provider":         "cache" if is_cache else getattr(_req_ctx, "provider", None),
+            "model":            getattr(_req_ctx, "model", None) or payload.get("model"),
+            "latency_ms":       round(elapsed * 1000),
+            "cascades":         max(0, attempts - 1),
+            "status":           status,
+            "prompt_tokens":    ptok,
+            "completion_tokens": ctok,
+        })
+    except Exception:
+        pass   # logging must never break the response path
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat():
     err = _auth_check()
@@ -2823,8 +3490,12 @@ def chat():
     if gate:
         return gate
 
-    result = _route_completion(payload, payload.get("stream", False), _cache_ns())
+    t_start = time.time()
+    result  = _route_completion(payload, payload.get("stream", False), _cache_ns())
     _record_request_tokens(token, payload, result)
+
+    _log_completion(token, "chat", payload, result, time.time() - t_start)
+
     if result[0] == "json":
         return jsonify(result[1]), 200
     if result[0] == "stream":
@@ -2855,8 +3526,11 @@ def anthropic_messages():
 
     streaming = bool(body.get("stream", False))
     payload   = _anthropic_request_to_openai(body)
+    t_start   = time.time()
     result    = _route_completion(payload, streaming, _cache_ns())
     _record_request_tokens(token, payload, result)
+
+    _log_completion(token, "messages", payload, result, time.time() - t_start)
 
     if result[0] == "json":
         return jsonify(_openai_response_to_anthropic(result[1])), 200
@@ -2890,10 +3564,26 @@ def embeddings():
                                   "type": "router_error"}}), 503
 
     # Embeddings are deterministic — identical input is a perfect cache hit.
-    ns = _cache_ns()
-    cached = cache.get(payload, ns)
+    ns      = _cache_ns()
+    t_start = time.time()
+    cached  = cache.get(payload, ns)
     if cached is not None:
         log.info("↩ cache hit (embeddings)")
+        request_log.append({
+            "ts":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "endpoint":   "embeddings",
+            "caller":     token[-6:] if token else "anon",
+            "streaming":  False,
+            "complexity": None,
+            "est_tokens": 0,
+            "provider":   "cache",
+            "model":      payload.get("model"),
+            "latency_ms": round((time.time() - t_start) * 1000),
+            "cascades":   0,
+            "status":     "cache_hit",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+        })
         return jsonify(cached)
 
     any_closed = any(not stats.breaker_open(p["name"]) for p in ordered)
@@ -2945,10 +3635,40 @@ def embeddings():
             key_usage.add_tokens(token, (data.get("usage") or {}).get("total_tokens") or 0)
             _add_provider_tokens(name, data)
             cache.set(payload, data, ns)
+            request_log.append({
+                "ts":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "endpoint":   "embeddings",
+                "caller":     token[-6:] if token else "anon",
+                "streaming":  False,
+                "complexity": None,
+                "est_tokens": 0,
+                "provider":   name,
+                "model":      em,
+                "latency_ms": round((time.time() - t_start) * 1000),
+                "cascades":   0,
+                "status":     "success",
+                "prompt_tokens": (data.get("usage") or {}).get("total_tokens"),
+                "completion_tokens": None,
+            })
             return jsonify(data), 200
 
         log.warning(f"✗ {name} embeddings exhausted — cascading")
 
+    request_log.append({
+        "ts":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "endpoint":   "embeddings",
+        "caller":     token[-6:] if token else "anon",
+        "streaming":  False,
+        "complexity": None,
+        "est_tokens": 0,
+        "provider":   None,
+        "model":      None,
+        "latency_ms": round((time.time() - t_start) * 1000),
+        "cascades":   0,
+        "status":     "error",
+        "prompt_tokens": None,
+        "completion_tokens": None,
+    })
     return jsonify({"error": {"message": "All embedding providers exhausted", "type": "router_error"}}), 503
 
 
@@ -2996,6 +3716,12 @@ def _features_snapshot() -> dict:
         {"name": "local_model", "title": "Local model provider", "kind": "config",
          "enabled": has_local, "manage": "hr model set local <model>",
          "desc": "Route to a model on your own machine (Ollama / LM Studio / llama.cpp)."},
+        {"name": "request_log", "title": "Request log", "kind": "flag",
+         "enabled": request_log.enabled, "env": "REQUEST_LOG_SIZE", "on": "500", "off": "0",
+         "desc": f"In-memory ring buffer of the last {REQUEST_LOG_SIZE} requests. No disk writes. Query via GET /v1/logs."},
+        {"name": "dashboard", "title": "Monitoring dashboard", "kind": "builtin",
+         "enabled": True,
+         "desc": "Browser-based live dashboard at /dashboard — provider health, request log, cache stats, key usage."},
     ]
     return {"core": CORE_FEATURES, "addons": addons}
 
@@ -3137,6 +3863,49 @@ def usage():
     })
 
 
+@app.route("/v1/logs")
+def logs():
+    """In-memory request log — last REQUEST_LOG_SIZE entries, most recent first.
+
+    Never writes to disk. Returns an empty list when REQUEST_LOG_SIZE=0.
+
+    Query params (all optional):
+      limit=N          Max entries to return (default 100, capped at REQUEST_LOG_SIZE)
+      provider=name    Filter by provider name (e.g. "gemini", "anthropic", "cache")
+      status=s         Filter by status: success | error | cache_hit
+      endpoint=e       Filter by endpoint: chat | messages | embeddings
+    """
+    err = _auth_check()
+    if err:
+        return err
+
+    try:
+        limit = min(int(request.args.get("limit", 100)), max(1, REQUEST_LOG_SIZE))
+    except (TypeError, ValueError):
+        limit = 100
+    provider = request.args.get("provider") or None
+    status   = request.args.get("status")   or None
+    endpoint = request.args.get("endpoint") or None
+
+    valid_statuses  = {"success", "error", "cache_hit"}
+    valid_endpoints = {"chat", "messages", "embeddings"}
+    if status and status not in valid_statuses:
+        return jsonify({"error": {"message": f"status must be one of {sorted(valid_statuses)}",
+                                  "type": "invalid_request_error"}}), 400
+    if endpoint and endpoint not in valid_endpoints:
+        return jsonify({"error": {"message": f"endpoint must be one of {sorted(valid_endpoints)}",
+                                  "type": "invalid_request_error"}}), 400
+
+    entries = request_log.snapshot(limit=limit, provider=provider,
+                                   status=status, endpoint=endpoint)
+    return jsonify({
+        "buffer_size": REQUEST_LOG_SIZE,
+        "stored":      request_log.size,
+        "returned":    len(entries),
+        "entries":     entries,
+    })
+
+
 @app.route("/metrics")
 def metrics():
     """Prometheus text-format metrics for scraping (Grafana, etc.). Exposes only
@@ -3199,6 +3968,7 @@ if __name__ == "__main__":
              f"{', persistent' if cache.persistent else ''})")
     log.info(f"Fast routing: {'enabled' if FAST_ROUTE_TOKENS > 0 else 'disabled'} (threshold={FAST_ROUTE_TOKENS} tokens)")
     log.info(f"Key rotation: {ROTATION_MODE}")
+    log.info(f"Dashboard: http://{'localhost' if HOST in ('0.0.0.0','') else HOST}:{PORT}/dashboard")
     _skips = {p["name"]: p["skip_if_tokens_over"] for p in PROVIDERS if p.get("skip_if_tokens_over")}
     if _skips:
         log.info(f"Large-payload skip ceilings: {_skips}")

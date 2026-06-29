@@ -73,6 +73,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 <body>
   <div class="bar">
     <button onclick="send('refresh')">↻ Refresh</button>
+    <button onclick="cmd('hermesRouter.openWebDashboard')">⬈ Web dashboard</button>
     <button class="secondary" onclick="cmd('hermesRouter.restart')">Restart</button>
     <button class="secondary" onclick="cmd('hermesRouter.setMode')">Rotation</button>
     <button class="secondary" onclick="cmd('hermesRouter.authAdd')">Add key</button>

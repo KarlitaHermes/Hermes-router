@@ -2,7 +2,7 @@
   "name": "hermes-router",
   "displayName": "hermes-router",
   "description": "Control panel for hermes-router — monitor provider health and manage your free-tier AI load balancer from VS Code.",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "publisher": "MohammedShafiq",
   "license": "MIT",
   "icon": "icon.png",
@@ -45,6 +45,7 @@
     },
     "commands": [
       { "command": "hermesRouter.openDashboard", "title": "hermes-router: Open Dashboard" },
+      { "command": "hermesRouter.openWebDashboard", "title": "hermes-router: Open Web Dashboard (browser)", "icon": "$(globe)" },
       { "command": "hermesRouter.refresh", "title": "hermes-router: Refresh Status", "icon": "$(refresh)" },
       { "command": "hermesRouter.restart", "title": "hermes-router: Restart Router" },
       { "command": "hermesRouter.doctor", "title": "hermes-router: Run Doctor (diagnose)" },
@@ -56,7 +57,8 @@
     ],
     "menus": {
       "view/title": [
-        { "command": "hermesRouter.refresh", "when": "view == hermesRouter.dashboard", "group": "navigation" }
+        { "command": "hermesRouter.openWebDashboard", "when": "view == hermesRouter.dashboard", "group": "navigation@1" },
+        { "command": "hermesRouter.refresh", "when": "view == hermesRouter.dashboard", "group": "navigation@2" }
       ]
     },
     "configuration": {

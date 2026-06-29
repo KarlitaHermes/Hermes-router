@@ -57,6 +57,11 @@ export class RouterClient {
     return this.baseUrl.replace(/\/+$/, "");
   }
 
+  /** URL of the browser monitoring dashboard served by the router. */
+  dashboardUrl(): string {
+    return `${this.base()}/dashboard`;
+  }
+
   async getHealth(): Promise<Health> {
     const { code, body } = await get(`${this.base()}/health`, {});
     if (code !== 200) {

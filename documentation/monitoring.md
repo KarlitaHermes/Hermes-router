@@ -1,6 +1,43 @@
 # Monitoring
 
-## Live dashboard
+## Web dashboard
+
+The router serves a built-in **browser dashboard** — no install, no extra service. It ships
+inside `router.py`, so it's available the moment the router is running. Just open the router
+in a browser:
+
+```
+http://localhost:8319/          # redirects to the dashboard
+http://localhost:8319/dashboard
+```
+
+On first load it asks for your proxy API key (one of `PROXY_API_KEYS`) and remembers it in
+the browser's local storage. The page then auto-refreshes every 5 seconds and shows:
+
+- **Summary cards** — providers online, uptime, total requests, tokens + estimated spend,
+  cache hit-rate, and live error rate
+- **Provider health** — per-provider requests, errors, error %, latency, tokens, cost,
+  key pool (ready/cooling), circuit-breaker state, and a health pill
+- **Live request log** — the last requests (endpoint, provider, model, latency, complexity
+  score, cascade count, tokens, status), filterable by status and endpoint
+- **Cache & add-ons** — hit/miss counts, semantic cache, persistence, and which optional
+  features are on
+- **Key & budget usage** — per-key requests, daily tokens/cost, and RPM headroom
+
+It's pure HTML/JS (no framework, no external CDN, ~25 KB) and reads only the existing
+`/v1/status`, `/v1/usage`, and `/v1/logs` endpoints — so it adds essentially no memory or CPU
+to the router itself.
+
+> **Accessing it remotely.** By default the router binds to `0.0.0.0` (all interfaces). If you
+> set `HOST=127.0.0.1` (localhost-only, recommended on a shared/VPS host), reach the dashboard
+> over an SSH tunnel: `ssh -L 8319:127.0.0.1:8319 user@server`, then open
+> `http://localhost:8319/` locally. With **Docker** the mapped port (`-p 8319:8319`) exposes it
+> to your host automatically. The raw API endpoints stay key-protected either way.
+
+From **VS Code**, the extension's dashboard panel has a **⬈ Web dashboard** button (and a globe
+icon in the panel header) that opens this page in your browser.
+
+## Terminal dashboard (`hr status`)
 
 `hr status` prints a live, per-provider dashboard — rating, health (circuit-breaker
 state), key pool, latency, and cache stats — without needing curl or an API key:
@@ -68,3 +105,23 @@ limit/usage config. This is what `hr status` renders.
 The `rotation` block reports the active key-rotation mode
 (`{"rotation": {"mode": "round-robin"}}`); the `limits` block reports per-key budgets and live
 usage; `hr status` shows both in the footer. See [configuration.md](configuration.md) for details.
+
+## Request log (`/v1/logs`)
+
+`GET /v1/logs` (proxy key required) returns the most recent requests from an **in-memory ring
+buffer** — the data source behind the web dashboard's live log. It never writes to disk: the
+last `REQUEST_LOG_SIZE` entries (default **500**) are kept in RAM and the oldest fall off as new
+ones arrive (~250 KB at the default size). Set `REQUEST_LOG_SIZE=0` to disable it entirely.
+
+Each entry records: timestamp, endpoint (`chat`/`messages`/`embeddings`), caller (key tail),
+streaming flag, complexity score (1–5), estimated tokens, chosen provider + model, latency,
+cascade count, status (`success`/`error`/`cache_hit`), and prompt/completion token counts.
+Request and response **content is never stored** — only metadata.
+
+Query parameters (all optional): `limit` (default 100), `provider`, `status`
+(`success`/`error`/`cache_hit`), and `endpoint` (`chat`/`messages`/`embeddings`).
+
+```bash
+curl -H "Authorization: Bearer sk-router-1" \
+  "http://localhost:8319/v1/logs?limit=20&status=error"
+```
