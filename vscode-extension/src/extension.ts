@@ -40,14 +40,22 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  // ── Shared refresh: update the status bar (via /health + /v1/status) ─────────
+  // ── Shared refresh: update the dashboard panel AND the status bar ────────────
+  // Update the webview first and unconditionally — dashboard.refresh() always posts
+  // a `status` or `error` message to it, so the panel can never get stuck on
+  // "Loading…". The /health probe only feeds the status bar; a health blip must not
+  // block the panel from rendering (that was the old bug).
   const refresh = async () => {
-    const client = makeClient();
+    const status = await dashboard.refresh();
+    if (status) {
+      statusBar.setHealthy(status);
+      return;
+    }
+    // getStatus failed (unreachable or bad key). Fall back to /health so the status
+    // bar can distinguish "router down" from "router up but /v1/status rejected".
     try {
-      await client.getHealth();
-      const status = await dashboard.refresh();
-      if (status) statusBar.setHealthy(status);
-      else statusBar.setUnknown();
+      await makeClient().getHealth();
+      statusBar.setUnknown();
     } catch (e: any) {
       statusBar.setUnreachable(e?.message || "no response");
     }

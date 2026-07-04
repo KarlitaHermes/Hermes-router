@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+- **Fix: dashboard panel could get stuck on "Loading…".** The shared refresh now updates the
+  webview unconditionally (a `/health` blip no longer blocks it), and the panel requests its
+  own data once its script is ready — so a lost initial message can't leave it hanging. A bad
+  `hermesRouter.apiKey` now shows a clear error instead of a blank panel.
+
 ## 0.8.0
 
 - **Open the full web dashboard in your browser.** New **⬈ Web dashboard** button (and a globe

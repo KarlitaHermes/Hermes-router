@@ -2764,6 +2764,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
     <h2>Hermes Router</h2>
     <p>Enter your proxy API key to view the dashboard.</p>
     <input id="key-input" type="password" placeholder="sk-router-..." autocomplete="off">
+    <p id="gate-error" style="color:var(--red);font-size:12px;min-height:16px;margin:8px 0 0"></p>
     <button class="btn" onclick="submitKey()">Open Dashboard</button>
   </div>
 </div>
@@ -2892,12 +2893,14 @@ function submitKey() {
   if (!v) return;
   apiKey = v;
   localStorage.setItem('hermes_dash_key', v);
+  const errEl = document.getElementById('gate-error');
+  if (errEl) errEl.textContent = '';
   document.getElementById('key-gate').classList.add('hidden');
   start();
 }
 
 // ── polling ───────────────────────────────────────────────────────────────────
-function start() { refresh(); timer = setInterval(refresh, INTERVAL); }
+function start() { stop(); refresh(); timer = setInterval(refresh, INTERVAL); }
 
 async function refresh() {
   try {
@@ -2908,26 +2911,52 @@ async function refresh() {
     if (logStatus) logUrl += '&status=' + logStatus;
     if (logEp)     logUrl += '&endpoint=' + logEp;
 
-    const [s, u, l] = await Promise.all([
-      fetch('/v1/status', {headers:h}).then(r=>r.json()),
-      fetch('/v1/usage',  {headers:h}).then(r=>r.json()),
-      fetch(logUrl,       {headers:h}).then(r=>r.json()),
+    const resps = await Promise.all([
+      fetch('/v1/status', {headers:h}),
+      fetch('/v1/usage',  {headers:h}),
+      fetch(logUrl,       {headers:h}),
     ]);
+    // fetch() only rejects on network errors, not on HTTP 4xx/5xx — so a bad key
+    // (401) would otherwise parse to an error body and render as all-zeros. Detect
+    // it explicitly and send the user back to the key gate instead of faking data.
+    if (resps.some(r => r.status === 401)) {
+      stop();
+      apiKey = '';
+      localStorage.removeItem('hermes_dash_key');
+      showGate('That key was rejected (401). It must match one of PROXY_API_KEYS.');
+      return;
+    }
+    if (resps.some(r => !r.ok)) { setHeader(false, 'HTTP ' + (resps.find(r=>!r.ok)||{}).status); return; }
+
+    const [s, u, l] = await Promise.all(resps.map(r => r.json()));
     statusData = s; usageData = u; logsData = l.entries || [];
     renderAll();
     setHeader(true);
   } catch(e) {
-    setHeader(false);
+    setHeader(false, 'unreachable');
   }
   document.getElementById('log-filter-status').onchange  = refresh;
   document.getElementById('log-filter-endpoint').onchange = refresh;
 }
 
-function setHeader(ok) {
+function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+function showGate(errMsg) {
+  stop();
+  const gate = document.getElementById('key-gate');
+  gate.classList.remove('hidden');
+  const errEl = document.getElementById('gate-error');
+  if (errEl) errEl.textContent = errMsg || '';
+  const input = document.getElementById('key-input');
+  input.value = '';
+  input.focus();
+}
+
+function setHeader(ok, detail) {
   const dot = document.getElementById('hdr-dot');
   const lbl = document.getElementById('hdr-status');
   dot.className = ok ? 'dot' : 'dot err';
-  lbl.textContent = ok ? 'live' : 'error';
+  lbl.textContent = ok ? 'live' : ('error' + (detail ? ' · ' + detail : ''));
   document.getElementById('last-update').textContent =
     'Updated ' + new Date().toLocaleTimeString();
 }
@@ -3424,7 +3453,17 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                     emsg = (err.get("message", "") if isinstance(err, dict)
                             else err if isinstance(err, str)
                             else (data.get("message", "") if isinstance(data, dict) else ""))
-                    log.warning(f"  {name}/{model} 2xx without choices — cascading: {str(emsg)[:140]}")
+                    # NVIDIA NIM (and similar gateways) wrap a transient rate-limit /
+                    # resource-exhaustion error in an HTTP-200 body. That's expected under
+                    # load and is fully handled here (cascade + per-key cooldown), so log it
+                    # at debug to keep it out of the logs; only a genuinely unexpected empty
+                    # 2xx body warns.
+                    _emsg_l = str(emsg).lower()
+                    _transient = any(s in _emsg_l for s in (
+                        "resourceexhausted", "resource exhausted", "request limit reached",
+                        "rate limit", "too many requests", "quota", "overloaded"))
+                    (log.debug if _transient else log.warning)(
+                        f"  {name}/{model} 2xx without choices — cascading: {str(emsg)[:140]}")
                     pool.mark_rate_limited(name, key, model, retry_after=30)
                     break
                 if not is_anthropic:

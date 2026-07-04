@@ -187,6 +187,12 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       (rows || '<tr><td colspan="5" class="muted">No providers configured.</td></tr>')+
       '</tbody></table>';
   });
+
+  // Pull data as soon as this script is ready. resolveWebviewView also pushes an
+  // initial status, but that message can race the listener above (and be lost),
+  // leaving the panel stuck on "Loading…". Requesting a refresh here guarantees we
+  // fetch once we're actually listening — the handler calls dashboard.refresh().
+  send('refresh');
 </script>
 </body></html>`;
   }
