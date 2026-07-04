@@ -2,7 +2,7 @@
   "name": "hermes-router",
   "displayName": "hermes-router",
   "description": "Control panel for hermes-router — monitor provider health and manage your free-tier AI load balancer from VS Code.",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "publisher": "MohammedShafiq",
   "license": "MIT",
   "icon": "icon.png",
@@ -50,10 +50,7 @@
       { "command": "hermesRouter.restart", "title": "hermes-router: Restart Router" },
       { "command": "hermesRouter.doctor", "title": "hermes-router: Run Doctor (diagnose)" },
       { "command": "hermesRouter.update", "title": "hermes-router: Update to Latest" },
-      { "command": "hermesRouter.authAdd", "title": "hermes-router: Add Provider Key" },
-      { "command": "hermesRouter.importCodex", "title": "hermes-router: Import Codex (ChatGPT) Login" },
-      { "command": "hermesRouter.setModel", "title": "hermes-router: Set Provider Model(s)" },
-      { "command": "hermesRouter.setMode", "title": "hermes-router: Set Key Rotation Mode" }
+      { "command": "hermesRouter.importCodex", "title": "hermes-router: Import Codex (ChatGPT) Login" }
     ],
     "menus": {
       "view/title": [

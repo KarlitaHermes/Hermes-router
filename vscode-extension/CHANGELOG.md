@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.0
+
+- **Simplified the extension — all configuration moved to the web dashboard.** The in-editor
+  panel is now a compact, at-a-glance health view: provider status, latency, the currently
+  active model per provider (not the full model list), and a Refresh/Restart button. Adding
+  API keys, setting provider models, toggling add-ons, and changing the key rotation mode are
+  now done in the **web dashboard** (`/dashboard`), which now has real forms for all of it — one
+  place to configure the router, not two.
+- Removed the **Add Provider Key**, **Set Provider Model(s)**, and **Set Key Rotation Mode**
+  commands (superseded by the web dashboard). **Import Codex (ChatGPT) Login** stays in the
+  extension — it reads a local `~/.codex` OAuth login the web dashboard can't reach.
+- The router itself gained new endpoints backing this
+  (`POST /v1/config/keys/<provider>`, `POST`/`DELETE /v1/config/model/<provider>`,
+  `POST /v1/config/features/<name>`, `POST /v1/config/restart`) — same proxy-key auth as
+  everything else, writing to the same `auth.json`/`.env` files `hr` already uses.
+
 ## 0.8.1
 
 - **Fix: dashboard panel could get stuck on "Loading…".** The shared refresh now updates the

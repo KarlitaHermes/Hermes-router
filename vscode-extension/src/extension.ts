@@ -5,16 +5,6 @@ import { DashboardProvider } from "./dashboard";
 import { HermesChatModelProvider } from "./lmProvider";
 import { runHr, runHrTerminal, isDocker } from "./cli";
 
-const PROVIDERS = [
-  "gemini", "openrouter", "sambanova", "github_models", "cerebras", "groq",
-  "mistral", "cohere", "zai", "naga", "nvidia", "huggingface", "kimi",
-  "openai", "anthropic",
-];
-
-// Providers whose model can be set via `hr model set`. Includes `local` (Ollama /
-// LM Studio / llama.cpp), which is keyless so it isn't in the key-add list above.
-const MODEL_PROVIDERS = [...PROVIDERS, "local"];
-
 function makeClient(): RouterClient {
   const cfg = vscode.workspace.getConfiguration("hermesRouter");
   return new RouterClient(
@@ -96,12 +86,10 @@ export function activate(context: vscode.ExtensionContext) {
     await refresh();
   });
 
-  reg("hermesRouter.authAdd", async () => {
-    const provider = await vscode.window.showQuickPick(PROVIDERS, {
-      placeHolder: "Provider to add a key for",
-    });
-    if (provider) runHrTerminal(["auth", "add", provider]);
-  });
+  // Codex import stays here: it reads a local ~/.codex OAuth login from this
+  // machine, which isn't something a paste-a-key web form can do. Everything
+  // else config-related (API keys, provider models, add-ons, rotation mode)
+  // lives in the web dashboard now — see hermesRouter.openWebDashboard above.
   reg("hermesRouter.importCodex", () => {
     if (isDocker()) {
       vscode.window.showInformationMessage(
@@ -112,49 +100,6 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     runHrTerminal(["auth", "import-codex"]);
-  });
-
-  reg("hermesRouter.setModel", async () => {
-    const provider = await vscode.window.showQuickPick(MODEL_PROVIDERS, {
-      placeHolder: "Provider to set model(s) for",
-    });
-    if (!provider) return;
-    const model = await vscode.window.showInputBox({
-      prompt: `Model(s) for ${provider} — comma-separate for multiple (rate-limit failover)`,
-      placeHolder: "e.g. gemini-2.5-flash-lite,gemini-2.5-flash",
-    });
-    if (!model) return;
-    await runHr(out, ["model", "set", provider, model]);
-    await runHr(out, ["restart"]);
-    await refresh();
-  });
-
-  // Toggle an optional add-on from the dashboard: `hr features enable|disable <name>`
-  // then restart so it takes effect. Only flag add-ons reach here (the dashboard
-  // renders config-driven ones as status-only).
-  reg("hermesRouter.toggleFeature", async (name: string, enable: boolean) => {
-    if (!name) return;
-    const res = await runHr(out, ["features", enable ? "enable" : "disable", name]);
-    if (!res.ok) {
-      vscode.window.showWarningMessage(
-        `Couldn't ${enable ? "enable" : "disable"} '${name}'. See the hermes-router output for details.`
-      );
-      await refresh();
-      return;
-    }
-    await runHr(out, ["restart"]);
-    await refresh();
-    vscode.window.setStatusBarMessage(`hermes-router: ${name} ${enable ? "enabled" : "disabled"}`, 4000);
-  });
-
-  reg("hermesRouter.setMode", async () => {
-    const mode = await vscode.window.showQuickPick(["round-robin", "sequential"], {
-      placeHolder: "Key rotation mode",
-    });
-    if (!mode) return;
-    await runHr(out, ["mode", mode]);
-    await runHr(out, ["restart"]);
-    await refresh();
   });
 
   // ── Polling ──────────────────────────────────────────────────────────────────

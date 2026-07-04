@@ -8,8 +8,11 @@ have to leave VS Code to check provider health, add a key, or chat through herme
 
 It does three things:
 
-1. **Monitor** — a status-bar badge and a live dashboard showing every provider's health.
-2. **Manage** — add keys, restart, set models/rotation, run the doctor, all from the palette.
+1. **Monitor** — a status-bar badge and a live in-editor panel showing every provider's health.
+2. **Manage the basics** — restart, run the doctor, update, all from the palette. Everything else
+   (API keys, provider models, add-ons, key rotation mode) is configured in the **web
+   dashboard** (`/dashboard`), which the extension opens for you in one click — there's one place
+   to configure the router, not two.
 3. **Use as a model** — pick **hermes-router** in Copilot Chat and your prompts route through
    the free pool (text *and* tool calling, so it works in **agent mode**).
 
@@ -67,76 +70,80 @@ Click it to open the dashboard.
 
 ### Dashboard
 
-Click the **hermes-router** icon in the activity bar (left edge) to open a live dashboard. It
-shows, for every provider: up/down status and health rating, latency, the model(s) it's using,
-and any key cooldowns — plus the overall cache hit-rate and the active key-rotation mode. It
-refreshes on its own every few seconds.
+Click the **hermes-router** icon in the activity bar (left edge) to open a live in-editor panel.
+It shows, for every provider: up/down status and health rating, latency, the model it's
+currently using, and any key cooldowns — plus the overall cache hit-rate and the active
+key-rotation mode. It refreshes on its own every few seconds.
 
-This is the same information as `hr status` and the `/v1/status` endpoint — just always visible
-in your editor.
+This panel is deliberately compact — an at-a-glance health check, not a config screen. Click
+**⬈ Web dashboard** (in the panel or the palette) for the full picture: the live request log,
+per-key usage, and every configuration action. See [monitoring.md](monitoring.md).
 
 ---
 
 ## Managing the router
 
 Open the Command Palette (`Ctrl/Cmd+Shift+P`) and type "hermes-router" to see every action (the
-dashboard has buttons for them too):
+in-editor panel has buttons for Refresh and Restart; the rest are palette-only):
 
 | Command | What it does |
 |---|---|
 | **Open Dashboard** | Show the live provider table (in-editor panel) |
-| **Open Web Dashboard (browser)** | Open the router's full browser dashboard at `/dashboard` — request log, per-key usage, cache stats |
-| **Restart Router** | Apply key/config changes (`hr restart`) |
+| **Open Web Dashboard (browser)** | Open the router's full browser dashboard at `/dashboard` — health, request log, per-key usage, and every config action |
+| **Restart Router** | Apply config changes (`hr restart`) |
 | **Run Doctor (diagnose)** | Diagnose install/health problems (`hr doctor`) |
 | **Update to Latest** | Upgrade the router (`hr update`) |
-| **Add Provider Key** | Add a key for a provider — runs `hr auth add <provider>` in a terminal, where you paste the key (input hidden) |
-| **Import Codex (ChatGPT) Login** | Bring in a ChatGPT-subscription login (`hr auth import-codex`) |
-| **Set Provider Model(s)** | Set the model(s) for a provider — comma-separate several for per-model failover ([configuration.md](configuration.md)) |
-| **Set Key Rotation Mode** | Switch between `round-robin` and `sequential` ([configuration.md](configuration.md)) |
+| **Import Codex (ChatGPT) Login** | Bring in a ChatGPT-subscription login (`hr auth import-codex`) — the one config action that stays here, since it reads a local OAuth login file the web dashboard can't reach |
 
-> **Your keys stay private.** When you add a key, the extension opens a terminal that runs the
-> `hr` command and *you* type the key there — the extension never reads or stores it.
+> **Adding keys, setting models, toggling add-ons, and changing key rotation mode** all live in
+> the **web dashboard** now (open it with the button above) — see
+> [monitoring.md → Web dashboard](monitoring.md#web-dashboard). This keeps configuration in one
+> place instead of split between the extension and the browser.
 
-> **Remote routers:** monitoring works against any `baseUrl` over HTTP. The *manage* commands
-> use the local `hr` CLI, so they're disabled (with a notice) when `baseUrl` isn't localhost —
-> manage a remote router on the machine that hosts it.
+> **Remote routers:** everything here — monitoring *and* the web dashboard — works against any
+> `baseUrl` over HTTP, local or remote. Only **Restart / Doctor / Update / Import Codex** use the
+> local `hr` CLI, so those stay disabled (with a notice) when `baseUrl` isn't localhost.
 
 ---
 
-## Managing a router running in Docker
+## Using the router in Docker
 
-If your router runs in a **Docker container** (common on Windows), there's no `hr` on your host —
-so by default the manage buttons can't do anything. Instead, point the extension at the container
-and it will manage it *through Docker*.
+**Configuring** the router (add keys, set models, toggle add-ons) is done entirely through the
+**web dashboard** now, and that works identically whether the router runs bare-metal or in
+Docker — it's just HTTP to the router itself, no `hr` CLI needed inside the container. Point your
+browser (or the extension's **Open Web Dashboard** button) at the container's mapped port, e.g.
+`http://localhost:8319/`.
 
-**1. Run the `:cli` image with a volume.** The standard image is just the router; the **`:cli`**
-variant also bundles the `hr` CLI, and the volume keeps your keys/settings across restarts:
+**Restarting** to apply a change is where Docker needs a little care, since it's an OS-level
+operation on the container, not just an HTTP call:
+
+- **Preferred: set `hermesRouter.dockerContainer`** to your container's name in the extension's
+  settings. Its own **Restart Router** command then correctly runs `docker restart <container>`
+  instead of `hr restart` (which would just kill the container's main process). This also makes
+  **Doctor** and **Update** work via `docker exec` — see the `:cli` image setup below.
+- **Or use the web dashboard's own "Restart Now" button.** This restarts the router process
+  in-place. Inside a container where `router.py` is the main process, that process exiting stops
+  the *container* — it only comes back on its own if the container has a restart policy. The
+  provided `docker-compose.yml` already sets `restart: unless-stopped`, so Compose users are
+  covered automatically. A bare `docker run` with no restart flag would need a manual
+  `docker start <container>` afterward — add `--restart unless-stopped` to avoid that.
+
+**1. Run the `:cli` image with a volume** — the standard image is just the router; the **`:cli`**
+variant also bundles the `hr` CLI (for the extension's Restart/Doctor/Update/Import-Codex via
+`docker exec`), and the volume keeps your keys/settings across restarts:
 
 ```bash
-docker run -d --name hermes-router -p 8319:8319 \
+docker run -d --name hermes-router -p 8319:8319 --restart unless-stopped \
   -v hermes-data:/app/data -e PROXY_API_KEYS=sk-router-1 \
   shafiq735/hermes-router:cli
 ```
 
-(On Windows PowerShell, put that on one line — see [deployment.md](deployment.md).)
+**2. Set `hermesRouter.dockerContainer`** to `hermes-router` in the extension's settings (keep
+`baseUrl` = `http://localhost:8319`).
 
-**2. Tell the extension the container name.** In settings, set **`hermesRouter.dockerContainer`**
-to `hermes-router` (and keep `baseUrl` = `http://localhost:8319`, `apiKey` = your `PROXY_API_KEYS`).
-
-Now the manage buttons run against the container:
-
-| Button | Runs |
-|---|---|
-| **Add Key** / **Import Codex** | a terminal with `docker exec -it <container> hr auth add …` — you type the key **inside the container** (the extension never sees it), then it `docker restart`s to apply |
-| **Set Model** / **Rotation** | `docker exec <container> hr …` then `docker restart <container>` |
-| **Restart** | `docker restart <container>` — *not* `hr restart` (that would stop the container) |
-
-Requires the **`docker` CLI** on your PATH (Docker Desktop provides it). Because keys/settings
-live on the `/app/data` volume, they survive `docker restart` and even recreating the container
-(as long as you reuse the same volume).
-
-> **Why a volume?** Without `-v …:/app/data`, anything you add with the buttons lives only inside
-> that container and is lost the moment it's recreated.
+Codex import (the one config action that stays in the extension, since it reads a local `~/.codex`
+OAuth login the web dashboard can't reach) needs `-v ~/.codex:/root/.codex` mounted too — see
+[Providers](providers.md#codex-chatgpt-subscription).
 
 ---
 
@@ -173,17 +180,19 @@ sends tool-using requests only to providers whose models support function callin
   `PROXY_API_KEYS`. Make them match.
 - **hermes-router doesn't appear in the Copilot model picker** — you need **VS Code ≥ 1.104**
   *and* the **GitHub Copilot Chat** extension. Reload the window after installing both.
-- **"Add Key / Restart / …" says `hr` isn't on your PATH (or `spawn hr ENOENT`)** — those commands
-  use the `hr` CLI, the **Linux/macOS/WSL** helper. It doesn't exist on a plain **Windows** host,
-  and you don't use it when the **router runs in Docker**. Manage it to match how you run it:
-  - **Docker:** either set `hermesRouter.dockerContainer` to your container name to manage it
-    in-place (see "Managing a router running in Docker" above), or set keys as container env vars
-    (`-e GEMINI_API_KEYS=…`) and apply with `docker restart <container>`. See
-    [deployment.md](deployment.md).
+- **"Restart / Doctor / Update" says `hr` isn't on your PATH (or `spawn hr ENOENT`)** — those
+  commands use the `hr` CLI, the **Linux/macOS/WSL** helper. It doesn't exist on a plain
+  **Windows** host or inside a container that doesn't bundle it:
+  - **Docker:** set `hermesRouter.dockerContainer` to your container's name so these commands run
+    via `docker exec`/`docker restart` instead (see "Using the router in Docker" above) — or just
+    use the web dashboard's own Restart button, which needs no `hr` at all (works as long as your
+    container has a restart policy, e.g. `--restart unless-stopped`).
   - **Windows without Docker:** run the router under **WSL2**, where `hr` works.
-  - The dashboard and "use as a model" features work regardless.
-- **The manage commands are greyed out for a remote router** — they use the local `hr` CLI, so they
-  only work when `baseUrl` is localhost.
+  - Monitoring, the web dashboard, and "use as a model" all work regardless — only these three
+    commands need `hr` (or `docker`) reachable.
+- **Restart / Doctor / Update are greyed out for a remote router** — they use the local `hr`
+  CLI, so they only work when `baseUrl` is localhost. Everything else (monitoring, the web
+  dashboard) works against any remote router over HTTP.
 
 ---
 

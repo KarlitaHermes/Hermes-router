@@ -22,7 +22,7 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging, hashlib, hmac, itertools, re, sqlite3
+import json, os, time, threading, logging, hashlib, hmac, itertools, re, sqlite3, subprocess
 from pathlib import Path
 from collections import deque, OrderedDict, defaultdict
 from flask import Flask, request, jsonify, Response, stream_with_context, redirect
@@ -659,6 +659,128 @@ PROVIDERS = _build_providers()
 # When auto-discovering a replacement model for these, restrict to :free ids so
 # a probe can never silently promote the router onto a paid model.
 _FREE_ONLY_DISCOVERY = {"openrouter", "naga"}
+
+# ── Config-write support (web dashboard "Add key" / "Set model" / add-on toggles) ──
+# Mirrors the canonical provider lists + env-var mappings already used by the `hr`
+# CLI scripts (scripts/auth.sh, scripts/model.sh), so the dashboard and CLI agree
+# on what's valid. Kept as plain data here (not shelling out to bash) so it works
+# identically in Docker, where those scripts aren't necessarily present.
+
+# Providers that take a plain API key (excludes "codex" — OAuth via `hr auth
+# import-codex` — and "local", which is keyless).
+KEY_SETTABLE_PROVIDERS = [
+    "gemini", "openrouter", "sambanova", "github_models", "cerebras", "groq",
+    "mistral", "cohere", "zai", "naga", "nvidia", "huggingface", "kimi",
+    "opencode", "opencode_go", "openai", "anthropic",
+]
+
+# Providers whose model(s) can be overridden — a superset of the above (codex and
+# local don't take a key here, but do have a settable model).
+PROVIDER_MODEL_ENV = {
+    "gemini": "GEMINI_MODEL", "openrouter": "OPENROUTER_MODEL",
+    "sambanova": "SAMBANOVA_MODEL", "github_models": "GITHUB_MODELS_MODEL",
+    "cerebras": "CEREBRAS_MODEL", "groq": "GROQ_MODEL", "mistral": "MISTRAL_MODEL",
+    "cohere": "COHERE_MODEL", "zai": "ZAI_MODEL", "naga": "NAGA_MODEL",
+    "nvidia": "NVIDIA_MODEL", "huggingface": "HUGGINGFACE_MODEL", "kimi": "KIMI_MODEL",
+    "opencode": "OPENCODE_MODEL", "opencode_go": "OPENCODE_GO_MODEL",
+    "openai": "OPENAI_MODEL", "anthropic": "ANTHROPIC_MODEL",
+    "codex": "CODEX_MODEL", "local": "LOCAL_MODEL",
+}
+
+# Built-in default model per provider — shown as a placeholder in the dashboard;
+# "reset" just deletes the .env override line, so the code's own default (set in
+# _build_providers via os.environ.get(..., default)) takes over on restart. This
+# table is display-only and must stay in sync with those inline defaults.
+PROVIDER_MODEL_DEFAULT = {
+    "gemini": "gemini-2.5-flash-lite", "openrouter": "nvidia/nemotron-3-super-120b-a12b:free",
+    "sambanova": "DeepSeek-V3.2", "github_models": "gpt-4o", "cerebras": "gpt-oss-120b",
+    "groq": "llama-3.3-70b-versatile", "mistral": "mistral-medium-latest",
+    "cohere": "command-a-03-2025", "zai": "glm-4.5-flash",
+    "naga": "nemotron-3-super-120b-a12b:free", "nvidia": "deepseek-ai/deepseek-v4-flash",
+    "huggingface": "openai/gpt-oss-120b:cheapest", "kimi": "kimi-for-coding",
+    "opencode": "deepseek-v4-flash-free,minimax-m3-free,qwen3.6-plus-free",
+    "opencode_go": "deepseek-v4-flash,minimax-m3", "openai": "gpt-4o-mini",
+    "anthropic": "claude-haiku-4-5-20251001", "codex": "gpt-5.5", "local": "llama3.1",
+}
+
+ENV_FILE_PATH = Path(os.environ.get("HR_ENV_FILE", ".env"))
+
+
+def _env_read_line(key: str) -> str | None:
+    """Current value of KEY in .env (last occurrence wins), or None if unset."""
+    if not ENV_FILE_PATH.exists():
+        return None
+    val = None
+    for line in ENV_FILE_PATH.read_text().splitlines():
+        if line.strip().startswith(f"{key}="):
+            val = line.split("=", 1)[1]
+    return val
+
+
+def _env_write_line(key: str, value: str | None) -> None:
+    """Upsert (or, if value is None, delete) a KEY=VALUE line in .env, preserving
+    every other line untouched. Mirrors scripts/model.sh's write_env / scripts/
+    features.sh's set_env so the CLI and dashboard produce identical files."""
+    lines = ENV_FILE_PATH.read_text().splitlines() if ENV_FILE_PATH.exists() else []
+    found, out = False, []
+    for line in lines:
+        if line.strip().startswith(f"{key}="):
+            found = True
+            if value is not None:
+                out.append(f"{key}={value}")
+            # value is None → delete this line (skip appending it)
+        else:
+            out.append(line)
+    if not found and value is not None:
+        out.append(f"{key}={value}")
+    ENV_FILE_PATH.write_text("\n".join(out) + "\n")
+
+
+def _auth_json_add_key(provider: str, key: str) -> tuple[bool, int]:
+    """Append `key` to auth.json's providers[provider] list (creating the file/
+    section as needed). Returns (added, total_count) — added=False on duplicate.
+    Mirrors scripts/auth.sh's append_key."""
+    doc = {}
+    if AUTH_FILE.exists():
+        try:
+            doc = json.loads(AUTH_FILE.read_text())
+        except Exception:
+            doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    providers = doc.setdefault("providers", {})
+    keys = providers.setdefault(provider, [])
+    if key in keys:
+        return False, len(keys)
+    keys.append(key)
+    AUTH_FILE.write_text(json.dumps(doc, indent=2) + "\n")
+    try:
+        os.chmod(AUTH_FILE, 0o600)   # keys are secrets — owner read/write only
+    except OSError:
+        pass
+    return True, len(keys)
+
+
+def _trigger_restart(delay_s: float = 1.2) -> None:
+    """Restart the router shortly after this call returns, so the HTTP response
+    triggering it has time to reach the client first. Delegates to the same,
+    already-tested scripts/restart.sh used by `hr restart` (handles both the
+    systemd and standalone-process cases) rather than duplicating that logic."""
+    script = Path(__file__).resolve().parent / "scripts" / "restart.sh"
+    if not script.exists():
+        log.warning("restart requested but scripts/restart.sh not found — skipping")
+        return
+
+    def _go():
+        try:
+            subprocess.Popen(["/usr/bin/env", "bash", str(script)],
+                              cwd=str(script.parent.parent),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True)
+        except Exception as e:
+            log.error(f"restart trigger failed: {e}")
+
+    threading.Timer(delay_s, _go).start()
 
 # ── Credential pool ────────────────────────────────────────────────────────────
 
@@ -2827,9 +2949,35 @@ tr:hover td{background:rgba(108,140,255,.04)}
 /* ── add-on toggles ── */
 .addon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;padding:12px}
 .addon-card{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px}
+.addon-card.flag{cursor:pointer;transition:border-color .15s}
+.addon-card.flag:hover{border-color:var(--accent)}
+.addon-card.busy{opacity:.5;pointer-events:none}
 .addon-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}
 .addon-name{font-size:12px;font-weight:600}
 .addon-desc{font-size:11px;color:var(--muted);line-height:1.4}
+
+/* ── restart banner ── */
+#restart-banner{display:none;align-items:center;justify-content:space-between;gap:12px;
+  padding:10px 20px;background:rgba(250,204,21,.1);border-bottom:1px solid var(--yellow)}
+#restart-banner.show{display:flex}
+#restart-banner span{font-size:12px;color:var(--yellow)}
+#restart-banner .actions{display:flex;gap:8px}
+
+/* ── config forms ── */
+.config-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:14px}
+@media(max-width:820px){.config-grid{grid-template-columns:1fr}}
+.config-form{display:flex;flex-direction:column;gap:8px}
+.config-form label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.config-form select, .config-form input{
+  background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+  color:var(--text);padding:7px 10px;font-size:12px;font-family:inherit;outline:none}
+.config-form select:focus, .config-form input:focus{border-color:var(--accent)}
+.config-form .row{display:flex;gap:8px}
+.config-form .row > *{flex:1}
+.config-msg{font-size:11px;min-height:16px}
+.config-msg.ok{color:var(--green)}
+.config-msg.err{color:var(--red)}
+.default-hint{font-size:10px;color:var(--muted)}
 
 /* ── log table ── */
 #log-wrap{max-height:340px;overflow-y:auto}
@@ -2868,6 +3016,14 @@ tr:hover td{background:rgba(108,140,255,.04)}
     <button class="btn" onclick="refresh()">↺ Refresh</button>
   </div>
 </header>
+
+<div id="restart-banner">
+  <span>⚠ Config changed — restart the router to apply it.</span>
+  <div class="actions">
+    <button class="btn" onclick="dismissBanner()">Later</button>
+    <button class="btn" onclick="doRestart()" style="border-color:var(--yellow);color:var(--yellow)">↻ Restart Now</button>
+  </div>
+</div>
 
 <main>
   <!-- stat cards row -->
@@ -2964,6 +3120,41 @@ tr:hover td{background:rgba(108,140,255,.04)}
     </div>
 
   </div><!-- /two-col -->
+
+  <!-- configuration -->
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">Configuration</span></div>
+    <div class="config-grid">
+
+      <div class="config-form">
+        <label>Add API key</label>
+        <div class="row">
+          <select id="cfg-key-provider"></select>
+        </div>
+        <input id="cfg-key-value" type="password" placeholder="paste provider API key" autocomplete="off">
+        <div class="row">
+          <button class="btn" onclick="addKey()">+ Add Key</button>
+        </div>
+        <div class="config-msg" id="cfg-key-msg"></div>
+      </div>
+
+      <div class="config-form">
+        <label>Provider model</label>
+        <div class="row">
+          <select id="cfg-model-provider" onchange="onModelProviderChange()"></select>
+        </div>
+        <input id="cfg-model-value" type="text" placeholder="model or model1,model2,...">
+        <div class="default-hint" id="cfg-model-default"></div>
+        <div class="row">
+          <button class="btn" onclick="setModel()">Set</button>
+          <button class="btn" onclick="resetModel()">Reset to default</button>
+        </div>
+        <div class="config-msg" id="cfg-model-msg"></div>
+      </div>
+
+    </div>
+  </div>
+
 </main>
 
 <script>
@@ -2991,7 +3182,7 @@ function submitKey() {
 }
 
 // ── polling ───────────────────────────────────────────────────────────────────
-function start() { stop(); refresh(); timer = setInterval(refresh, INTERVAL); }
+function start() { stop(); refresh(); loadConfigProviders(); timer = setInterval(refresh, INTERVAL); }
 
 async function refresh() {
   try {
@@ -3235,8 +3426,11 @@ function renderAddons() {
   if (!statusData?.features) return;
   const addons = statusData.features.addons || [];
   const grid = document.getElementById('addon-grid');
-  grid.innerHTML = addons.map(a => `
-    <div class="addon-card">
+  grid.innerHTML = addons.map(a => {
+    const clickable = a.kind === 'flag';
+    const attrs = clickable ? `onclick="toggleAddon('${a.name}', ${!a.enabled})" title="Click to ${a.enabled?'disable':'enable'}"` : '';
+    return `
+    <div class="addon-card ${clickable?'flag':''}" id="addon-${a.name}" ${attrs}>
       <div class="addon-top">
         <span class="addon-name">${a.title || a.name}</span>
         <span class="pill ${a.enabled ? 'pill-ok' : 'pill-grey'}">${a.enabled ? 'on' : 'off'}</span>
@@ -3244,7 +3438,133 @@ function renderAddons() {
       <div class="addon-desc">${a.desc || ''}</div>
       ${a.env ? `<div class="mono muted" style="margin-top:5px;font-size:10px">${a.env}</div>` : ''}
     </div>
-  `).join('');
+  `;
+  }).join('');
+}
+
+// ── config: add-ons toggle ───────────────────────────────────────────────────
+async function toggleAddon(name, enable) {
+  const card = document.getElementById('addon-' + name);
+  if (card) card.classList.add('busy');
+  try {
+    const r = await fetch('/v1/config/features/' + name, {
+      method: 'POST',
+      headers: {'Authorization':'Bearer '+apiKey, 'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: enable}),
+    });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error?.message || 'Failed to toggle ' + name); return; }
+    showRestartBanner();
+    await refresh();
+  } catch(e) {
+    alert('Network error: ' + e.message);
+  } finally {
+    if (card) card.classList.remove('busy');
+  }
+}
+
+// ── config: providers / add key / model ──────────────────────────────────────
+let configProviders = null;
+
+async function loadConfigProviders() {
+  try {
+    const r = await fetch('/v1/config/providers', {headers:{'Authorization':'Bearer '+apiKey}});
+    if (!r.ok) return;
+    configProviders = await r.json();
+    const keySel = document.getElementById('cfg-key-provider');
+    keySel.innerHTML = configProviders.key_settable.map(p => `<option value="${p}">${p}</option>`).join('');
+    const modelSel = document.getElementById('cfg-model-provider');
+    modelSel.innerHTML = configProviders.model_settable.map(p => `<option value="${p}">${p}</option>`).join('');
+    onModelProviderChange();
+  } catch(e) { /* dashboard still usable without this */ }
+}
+
+function onModelProviderChange() {
+  if (!configProviders) return;
+  const p = document.getElementById('cfg-model-provider').value;
+  const def = configProviders.defaults[p] || '';
+  document.getElementById('cfg-model-default').textContent = 'default: ' + def;
+  const current = statusData?.providers?.[p]?.model || '';
+  document.getElementById('cfg-model-value').value = (current && current !== def) ? current : '';
+  document.getElementById('cfg-model-value').placeholder = def;
+}
+
+function setMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'config-msg ' + (ok ? 'ok' : 'err');
+}
+
+async function addKey() {
+  const provider = document.getElementById('cfg-key-provider').value;
+  const key = document.getElementById('cfg-key-value').value.trim();
+  if (!key) { setMsg('cfg-key-msg', 'Enter a key first.', false); return; }
+  try {
+    const r = await fetch('/v1/config/keys/' + provider, {
+      method: 'POST',
+      headers: {'Authorization':'Bearer '+apiKey, 'Content-Type':'application/json'},
+      body: JSON.stringify({key}),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('cfg-key-msg', d.error?.message || 'Failed.', false); return; }
+    if (d.duplicate) { setMsg('cfg-key-msg', 'Already stored — no change.', false); return; }
+    document.getElementById('cfg-key-value').value = '';
+    setMsg('cfg-key-msg', `Saved — ${provider} now has ${d.total_keys} key(s).`, true);
+    showRestartBanner();
+  } catch(e) { setMsg('cfg-key-msg', 'Network error: ' + e.message, false); }
+}
+
+async function setModel() {
+  const provider = document.getElementById('cfg-model-provider').value;
+  const model = document.getElementById('cfg-model-value').value.trim();
+  if (!model) { setMsg('cfg-model-msg', 'Enter a model first.', false); return; }
+  try {
+    const r = await fetch('/v1/config/model/' + provider, {
+      method: 'POST',
+      headers: {'Authorization':'Bearer '+apiKey, 'Content-Type':'application/json'},
+      body: JSON.stringify({model}),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('cfg-model-msg', d.error?.message || 'Failed.', false); return; }
+    setMsg('cfg-model-msg', `Set ${provider} → ${model}`, true);
+    showRestartBanner();
+  } catch(e) { setMsg('cfg-model-msg', 'Network error: ' + e.message, false); }
+}
+
+async function resetModel() {
+  const provider = document.getElementById('cfg-model-provider').value;
+  try {
+    const r = await fetch('/v1/config/model/' + provider, {
+      method: 'DELETE',
+      headers: {'Authorization':'Bearer '+apiKey},
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('cfg-model-msg', d.error?.message || 'Failed.', false); return; }
+    document.getElementById('cfg-model-value').value = '';
+    setMsg('cfg-model-msg', `Reset ${provider} to default.`, true);
+    showRestartBanner();
+  } catch(e) { setMsg('cfg-model-msg', 'Network error: ' + e.message, false); }
+}
+
+// ── restart ───────────────────────────────────────────────────────────────────
+function showRestartBanner() { document.getElementById('restart-banner').classList.add('show'); }
+function dismissBanner() { document.getElementById('restart-banner').classList.remove('show'); }
+
+async function doRestart() {
+  if (!confirm('Restart the router now? It will be unreachable for a few seconds.')) return;
+  try {
+    await fetch('/v1/config/restart', {method:'POST', headers:{'Authorization':'Bearer '+apiKey}});
+  } catch(e) { /* the process may already be going down mid-response — expected */ }
+  dismissBanner();
+  setHeader(false, 'restarting…');
+  stop();
+  // Poll /health until it responds again, then resume normal operation.
+  const waitForRestart = setInterval(async () => {
+    try {
+      const r = await fetch('/health');
+      if (r.ok) { clearInterval(waitForRestart); start(); }
+    } catch(e) { /* still down — keep polling */ }
+  }, 1500);
 }
 
 // ── key usage ─────────────────────────────────────────────────────────────────
@@ -3869,6 +4189,111 @@ def _features_snapshot() -> dict:
          "desc": "Browser-based live dashboard at /dashboard — provider health, request log, cache stats, key usage."},
     ]
     return {"core": CORE_FEATURES, "addons": addons}
+
+
+# ── Config-write endpoints (web dashboard) ──────────────────────────────────────
+# These back the dashboard's "Add key" / "Model" / add-on toggle forms. Same
+# proxy-key auth as every other endpoint — whoever can view /v1/status can also
+# change config, matching the existing CLI's trust model (one operator key).
+# Every write is a plain, auditable file edit (.env or auth.json), identical to
+# what `hr auth add` / `hr model set` / `hr features enable` already produce —
+# nothing here is a new mechanism, just an HTTP front-end for the same files.
+# Changes take effect after a restart; the dashboard prompts for one via
+# POST /v1/config/restart.
+
+@app.route("/v1/config/providers")
+def config_providers():
+    """List of providers the dashboard can build add-key / set-model forms for,
+    plus which ones accept a plain key vs. model-only (codex/local)."""
+    err = _auth_check()
+    if err:
+        return err
+    return jsonify({
+        "key_settable": KEY_SETTABLE_PROVIDERS,
+        "model_settable": list(PROVIDER_MODEL_ENV.keys()),
+        "defaults": PROVIDER_MODEL_DEFAULT,
+    })
+
+
+@app.route("/v1/config/keys/<provider>", methods=["POST"])
+def config_add_key(provider):
+    """Add one API key for a provider to auth.json. Body: {"key": "..."}"""
+    err = _auth_check()
+    if err:
+        return err
+    if provider not in KEY_SETTABLE_PROVIDERS:
+        return jsonify({"error": {"message": f"unknown or non-key provider: {provider}",
+                                  "type": "invalid_request_error"}}), 400
+    body = request.get_json(force=True, silent=True) or {}
+    key = (body.get("key") or "").strip()
+    if not key:
+        return jsonify({"error": {"message": "missing 'key'", "type": "invalid_request_error"}}), 400
+    if "\n" in key or "\r" in key:
+        return jsonify({"error": {"message": "key must not contain newlines", "type": "invalid_request_error"}}), 400
+    added, total = _auth_json_add_key(provider, key)
+    return jsonify({"provider": provider, "added": added, "total_keys": total,
+                    "duplicate": not added, "restart_required": added})
+
+
+@app.route("/v1/config/model/<provider>", methods=["POST", "DELETE"])
+def config_model(provider):
+    """POST {"model": "m1,m2"} to override a provider's model(s); DELETE to reset
+    to the built-in default (just removes the .env override line)."""
+    err = _auth_check()
+    if err:
+        return err
+    env_var = PROVIDER_MODEL_ENV.get(provider)
+    if not env_var:
+        return jsonify({"error": {"message": f"unknown provider: {provider}",
+                                  "type": "invalid_request_error"}}), 400
+
+    if request.method == "DELETE":
+        _env_write_line(env_var, None)
+        return jsonify({"provider": provider, "reset": True, "restart_required": True})
+
+    body = request.get_json(force=True, silent=True) or {}
+    model = (body.get("model") or "").strip()
+    if not model:
+        return jsonify({"error": {"message": "missing 'model'", "type": "invalid_request_error"}}), 400
+    if any(c in model for c in "\n\r"):
+        return jsonify({"error": {"message": "model must not contain newlines", "type": "invalid_request_error"}}), 400
+    if not re.fullmatch(r"[A-Za-z0-9._\-:/, ]+", model):
+        return jsonify({"error": {"message": "model contains unsupported characters",
+                                  "type": "invalid_request_error"}}), 400
+    _env_write_line(env_var, model)
+    return jsonify({"provider": provider, "model": model, "restart_required": True})
+
+
+@app.route("/v1/config/features/<name>", methods=["POST"])
+def config_feature(name):
+    """Toggle a flag-kind add-on on/off. Body: {"enabled": true|false}. Config-kind
+    add-ons (per-key budgets, local model) aren't simple flag writes — use their
+    own command (`hr limit`, `hr model set local ...`), matching `hr features`."""
+    err = _auth_check()
+    if err:
+        return err
+    addon = next((a for a in _features_snapshot()["addons"] if a["name"] == name), None)
+    if not addon:
+        return jsonify({"error": {"message": f"unknown add-on: {name}", "type": "invalid_request_error"}}), 404
+    if addon.get("kind") != "flag":
+        return jsonify({"error": {"message": f"'{name}' isn't a simple toggle — manage it with: {addon.get('manage', '(see docs)')}",
+                                  "type": "invalid_request_error"}}), 400
+
+    body = request.get_json(force=True, silent=True) or {}
+    enabled = bool(body.get("enabled"))
+    _env_write_line(addon["env"], addon["on"] if enabled else addon["off"])
+    return jsonify({"name": name, "enabled": enabled, "restart_required": True})
+
+
+@app.route("/v1/config/restart", methods=["POST"])
+def config_restart():
+    """Restart the router so config changes take effect. Responds immediately;
+    the actual restart happens ~1s later so this response reaches the client."""
+    err = _auth_check()
+    if err:
+        return err
+    _trigger_restart()
+    return jsonify({"status": "restarting", "message": "Router restarting — this page will reconnect shortly."})
 
 
 @app.route("/v1/status")
