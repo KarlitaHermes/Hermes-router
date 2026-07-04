@@ -101,5 +101,6 @@ Run it — you just made your first AI call, for free, through hermes-router. �
 **Next:** **[Core Concepts](/concepts/)** — a plain-language glossary of every term you'll meet.
 
 Then keep following the guide in order (it's built to read top-to-bottom):
-**Set It Up** → [Deployment](/deployment/) · [Providers](/providers/) · [Configuration](/configuration/),
-then **Build With It** → [Usage](/usage/) · [Build an Agent](/build-an-agent/).
+**[Routing Features](/routing/)** → how the router picks a provider for chat, tools, vision, and
+embeddings, then **Set It Up** → [Deployment](/deployment/) · [Providers](/providers/) ·
+[Configuration](/configuration/), then **Build With It** → [Usage](/usage/) · [Build an Agent](/build-an-agent/).

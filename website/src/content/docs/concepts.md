@@ -82,4 +82,4 @@ providers so a single outage or rate-limit never reaches your app.
 
 ---
 
-**Next:** [Deployment](/deployment/) — run the router on your OS (Windows, macOS, Linux, Docker, or a free cloud Space).
+**Next:** [Routing Features](/routing/) — plain-language guide to how the router picks a provider for chat, tools, vision, and embeddings.

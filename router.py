@@ -246,7 +246,7 @@ _rr_counter = itertools.count()
 # e.g. ROUTER_BASE_MODEL_PROVIDER=openai  ROUTER_BASE_MODEL=gpt-4o-mini
 KNOWN_MODEL_RATINGS: dict = {
     # 1 — Outstanding
-    "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
+    "gpt-5.3-codex": 1, "gpt-5-codex": 1, "gpt-5.5": 1, "gpt-4o": 1, "o1": 1, "o3": 1,
     "claude-opus-4": 1, "claude-opus": 1, "gemini-2.5-pro": 1,
     "nemotron-3-ultra": 1,
     "gpt-4.5": 1, "claude-3-7": 1, "gemini-2.0-ultra": 1,
@@ -743,6 +743,45 @@ def _model_supports_tools(name: str, model: str) -> bool:
     return bool(_model_caps(name, model).get("supports_tools", True))
 
 
+# Known vision-capable model families, matched by substring (mirrors _rate_model's
+# approach). Unlike tool support — which most modern chat models handle, so
+# _model_supports_tools defaults to True — vision support is the exception rather
+# than the rule among free-tier/small text models. A real cascade test showed 5 of
+# 6 non-vision candidates (mistral, cerebras, groq, huggingface) fail cleanly on an
+# image request before reaching a model that works, wasting real latency. So this
+# defaults to False, but — exactly like enforce_tool — the caller only enforces the
+# filter when at least one matching candidate exists, so an incomplete pattern list
+# can never make routing worse than it is today, only skip predictable failures.
+_VISION_MODEL_PATTERNS = (
+    "gemini", "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "o1", "o3",
+    "claude-3", "claude-opus", "claude-sonnet", "claude-haiku",
+    "pixtral", "llava", "-vl", "vl-", "llama-4", "grok", "vision",
+)
+
+
+def _model_supports_vision(provider: dict, model: str) -> bool:
+    """Whether this specific (provider, model) can accept image input.
+    Anthropic and Codex (GPT-4o/5-family via ChatGPT) are natively multimodal;
+    everything else is matched by known vision-capable family name patterns."""
+    if provider.get("protocol") in ("anthropic", "codex"):
+        return True
+    mn = model.lower()
+    if "embed" in mn:   # e.g. gemini-embedding-001 — matches "gemini" but isn't a chat model
+        return False
+    return any(p in mn for p in _VISION_MODEL_PATTERNS)
+
+
+def _payload_has_image(payload: dict) -> bool:
+    """Whether any message in this OpenAI-format payload carries image content."""
+    for m in payload.get("messages", []):
+        content = m.get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "image_url":
+                    return True
+    return False
+
+
 def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
                          free_only: bool = False) -> str | None:
     try:
@@ -827,11 +866,20 @@ _TOOL_PROBE = [{"type": "function", "function": {
                    "required": ["city"]}}}]
 
 
-def _probe_tools(provider: dict, key: str, model: str) -> bool:
+def _probe_tools(provider: dict, key: str, model: str) -> bool | None:
     """Detect whether a provider's model supports function calling. Sends a tiny
     request that forces a tool call (tool_choice=required, falling back to auto
     for providers that reject 'required') and checks whether the model actually
-    emits one. Anthropic providers always support tools."""
+    emits one. Anthropic providers always support tools.
+
+    Returns True/False on a conclusive (HTTP 200) response, or None when neither
+    attempt got one — network error, timeout, or a non-200 on both (e.g. the
+    provider's free-tier RPM was already spent by earlier probes in this same
+    startup pass). None means "couldn't determine", NOT "doesn't support tools":
+    caching a transient probe failure as a confident False would silently and
+    persistently (for STATE_TTL_HOURS) exclude a capable model from tool-aware
+    routing. Callers should treat None as unknown and keep the optimistic default.
+    """
     if provider.get("protocol") in ("anthropic", "codex"):
         return True   # both support function calling
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
@@ -839,20 +887,22 @@ def _probe_tools(provider: dict, key: str, model: str) -> bool:
             **provider.get("headers", {})}
     base = {"model": model, "max_tokens": 64, "tools": _TOOL_PROBE,
             "messages": [{"role": "user", "content": "What is the weather in Paris? Use the get_weather tool."}]}
+    got_response = False
     for choice in ("required", "auto"):
         try:
             r = _HTTP.post(url, headers=hdrs, json={**base, "tool_choice": choice}, timeout=12)
         except Exception:
-            return False
+            continue   # network hiccup on this attempt — still try the other tool_choice
         if r.status_code != 200:
             continue   # provider may reject tool_choice=required → try auto
+        got_response = True
         try:
             msg = (r.json().get("choices") or [{}])[0].get("message") or {}
             if msg.get("tool_calls"):
                 return True
         except Exception:
-            return False
-    return False
+            continue
+    return False if got_response else None
 
 
 def _probe_reasoning(provider: dict, key: str, model: str) -> bool:
@@ -985,10 +1035,22 @@ def _env_flag(name: str, suffix: str, model: str):
 def _resolve_caps(p: dict, key: str, model: str, ok: bool) -> dict:
     """Capability for one (provider, model): rating (free, pattern-based) plus
     tool/reasoning support. An env override (per-model first, then provider-wide)
-    wins; otherwise probe the model when the provider is reachable."""
+    wins; otherwise probe the model when the provider is reachable.
+
+    _probe_tools returns None when the probe itself was inconclusive (network
+    error / non-200, often a free-tier RPM cap already hit by earlier probes in
+    the same startup pass) — that must NOT be cached as a confident "no tool
+    support", so it falls back to the optimistic default (True) instead.
+    """
     name = p["name"]
     et = _env_flag(name, "SUPPORTS_TOOLS", model)
-    supports_tools = et if et is not None else (_probe_tools(p, key, model) if ok else False)
+    if et is not None:
+        supports_tools = et
+    elif not ok:
+        supports_tools = False   # provider unreachable at boot — genuinely unusable
+    else:
+        probed = _probe_tools(p, key, model)
+        supports_tools = True if probed is None else probed
     er = _env_flag(name, "REASONING", model)
     reasoning = er if er is not None else (_probe_reasoning(p, key, model) if ok else False)
     return {"rating": _rate_model(model), "supports_tools": supports_tools, "reasoning": reasoning}
@@ -1968,14 +2030,25 @@ def _anthropic_request_to_openai(body: dict) -> dict:
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
             continue
-        # List content: text / tool_use (assistant calls) / tool_result (user returns).
-        text_parts, tool_calls, tool_msgs = [], [], []
+        # List content: text / image / tool_use (assistant calls) / tool_result (user returns).
+        text_parts, image_parts, tool_calls, tool_msgs = [], [], [], []
         for b in content:
             if not isinstance(b, dict):
                 continue
             bt = b.get("type")
             if bt == "text":
                 text_parts.append(b.get("text", ""))
+            elif bt == "image":
+                # Anthropic image block → OpenAI image_url block (base64 or url source).
+                # Without this, a vision request from the Anthropic SDK loses its image
+                # silently — the model answers as if only the text part existed.
+                src = b.get("source") or {}
+                if src.get("type") == "base64" and src.get("data"):
+                    media = src.get("media_type", "image/png")
+                    image_parts.append({"type": "image_url",
+                                        "image_url": {"url": f"data:{media};base64,{src['data']}"}})
+                elif src.get("type") == "url" and src.get("url"):
+                    image_parts.append({"type": "image_url", "image_url": {"url": src["url"]}})
             elif bt == "tool_use":
                 tool_calls.append({"id": b.get("id"), "type": "function",
                                    "function": {"name": b.get("name", ""),
@@ -1992,6 +2065,14 @@ def _anthropic_request_to_openai(body: dict) -> dict:
             messages.extend(tool_msgs)
             if any(text_parts):
                 messages.append({"role": role, "content": "".join(text_parts)})
+        elif image_parts:
+            # Images present → OpenAI's multimodal content shape: a list of text/image_url
+            # blocks, not a plain string.
+            parts = [{"type": "text", "text": t} for t in text_parts if t] + image_parts
+            msg = {"role": role, "content": parts}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            messages.append(msg)
         else:
             msg = {"role": role, "content": "".join(text_parts) or None}
             if tool_calls:
@@ -3297,6 +3378,15 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     enforce_tool = needs_tools and any(
         _model_supports_tools(c["provider"]["name"], c["model"]) for c in ordered)
 
+    # Vision-aware routing: when the request carries an image, prefer candidates
+    # whose MODEL is known to accept image input — otherwise the request cascades
+    # through every text-only model's clean 400/403 rejection first, wasting real
+    # latency before reaching one that actually works. SAFETY — same fallback as
+    # tools: only enforce when at least one vision-capable candidate exists.
+    needs_vision  = _payload_has_image(payload)
+    enforce_vision = needs_vision and any(
+        _model_supports_vision(c["provider"], c["model"]) for c in ordered)
+
     # Circuit breaker: skip providers whose breaker is open. SAFETY — if EVERY
     # candidate is open, treat them all as half-open probes (skip none) so we
     # always make forward progress instead of hard-failing while options remain.
@@ -3333,6 +3423,11 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
         # (per-model; another model on the same provider may still qualify).
         if enforce_tool and not _model_supports_tools(name, model):
             log.info(f"⚒ skipping {name}/{model} (no tool support)")
+            continue
+
+        # Vision request → skip candidates whose MODEL isn't known to accept images.
+        if enforce_vision and not _model_supports_vision(provider, model):
+            log.info(f"🖼 skipping {name}/{model} (no vision support)")
             continue
 
         attempts = pool.key_count(name, model) or 1

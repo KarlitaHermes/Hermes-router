@@ -36,6 +36,7 @@ The docs read in order, from zero experience to a running, monitored agent:
 
 - 🚀 **[Getting started](documentation/getting-started.md)** — what this is, key terms, your first message
 - 📖 **[Concepts](documentation/concepts.md)** — plain-language glossary (LLM, token, agent, RAG…)
+- 🧭 **[Routing Features](documentation/routing.md)** — plain-language guide to how requests get routed (chat, tools, vision, embeddings)
 
 **Set it up:**
 

@@ -98,5 +98,6 @@ Run it — you just made your first AI call, for free, through hermes-router. �
 - **Want to build something that *does* things, not just chat?** → **[build-an-agent.md](build-an-agent.md)**
   walks you from a chatbot to a real AI agent, step by step.
 - **Confused by a term?** → **[concepts.md](concepts.md)** is a plain-language glossary.
+- **Curious how it picks a provider for chat, tools, or images?** → **[routing.md](routing.md)**.
 - **Want more providers / more reliability?** → **[providers.md](providers.md)**.
 - **Want to change settings?** → **[configuration.md](configuration.md)**.

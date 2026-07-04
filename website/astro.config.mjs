@@ -22,6 +22,7 @@ export default defineConfig({
 						{ label: 'Introduction', slug: 'index' },
 						{ label: 'Getting Started', slug: 'getting-started' },
 						{ label: 'Core Concepts', slug: 'concepts' },
+						{ label: 'Routing Features', slug: 'routing' },
 					],
 				},
 				{
