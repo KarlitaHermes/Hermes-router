@@ -102,6 +102,12 @@ cooldown state, rating, model, latency, `supports_tools`, `reasoning`, tokens se
 circuit-breaker status, plus cache (incl. semantic + a `persistent` flag), routing, and per-key
 limit/usage config. This is what `hr status` renders.
 
+Each entry in a provider's `keys` array also reports `requests` — how many times that specific
+**provider key** (last 6 chars only) has been handed out since the router started. This is the
+direct evidence that round-robin is actually spreading load evenly: add more keys to a provider
+and each one's `requests` count should climb roughly in step with the others. The built-in web
+dashboard (`/dashboard`) shows this as a tooltip on each key's status dot.
+
 The `rotation` block reports the active key-rotation mode
 (`{"rotation": {"mode": "round-robin"}}`); the `limits` block reports per-key budgets and live
 usage; `hr status` shows both in the footer. See [configuration.md](configuration.md) for details.

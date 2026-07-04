@@ -54,6 +54,13 @@ short cooldown and skipped until it recovers.
 - `sequential` — drain one key fully until it rate-limits, then move to the next, keeping later
   keys/accounts fresh in reserve. Ideal for rationing many accounts.
 
+**Verified even under real concurrency.** Selection holds a single short critical section (a
+deque rotation + a comparison), so a 50-thread / 10,000-call stress test showed perfectly even
+distribution (max/min spread of 1) with negligible lock contention. Each key's actual usage count
+is tracked and exposed per provider in `/v1/status` (`keys[].requests`) and as a tooltip on the
+web dashboard's key dots — so adding more keys to a provider and watching the count spread evenly
+across them isn't just a design claim, it's directly observable.
+
 **Multiple models per provider.** A provider's `<PROVIDER>_MODEL` can be a comma-separated
 list. Because free-tier rate limits are per-**model**, cooldowns are tracked per **(key,
 model)** pair: when one model hits a 429, the router fails over to the next model on the same

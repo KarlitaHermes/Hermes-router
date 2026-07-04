@@ -1160,6 +1160,10 @@ class CredentialPool:
         # key deque so rate-limit cooldowns are tracked per (key, model): a 429 on
         # one model never sidelines the provider's other models (separate quotas).
         self.pools: dict[str, dict[str, deque]] = {}
+        # (provider, key) -> total times this key has been handed out, across all of
+        # the provider's models. Lets /v1/status show whether load is actually
+        # spreading across configured keys, not just that rotation "should" work.
+        self.key_requests: dict = defaultdict(int)
         for p in providers:
             models = list(p.get("models") or [p.get("model", "")])
             if p.get("embed_model"):
@@ -1180,6 +1184,7 @@ class CredentialPool:
                 for _ in range(len(pool)):
                     entry = pool[0]
                     if entry["cool_until"] <= now:
+                        self.key_requests[(provider_name, entry["key"])] += 1
                         return entry["key"]      # do NOT rotate — keep draining this key
                     pool.rotate(-1)
                 return None
@@ -1188,8 +1193,13 @@ class CredentialPool:
                 entry = pool[0]
                 pool.rotate(-1)
                 if entry["cool_until"] <= now:
+                    self.key_requests[(provider_name, entry["key"])] += 1
                     return entry["key"]
             return None
+
+    def key_requests_for(self, provider_name: str, key: str) -> int:
+        """Total times this (provider, key) has been handed out via get_key()."""
+        return self.key_requests.get((provider_name, key), 0)
 
     def key_count(self, provider_name: str, model: str) -> int:
         """How many keys exist for (provider, model) — used to bound retry attempts."""
@@ -3082,7 +3092,8 @@ function keyDots(keys) {
   if (!keys || !keys.length) return '<span class="muted">—</span>';
   return keys.map(k => {
     const cls = k.status === 'cooling' ? 'dot-warn' : 'dot-ok';
-    const title = k.status === 'cooling' ? `cooling (${k.ready_in}s)` : 'ready';
+    const req = k.requests != null ? `${k.requests} req` : '';
+    const title = (k.status === 'cooling' ? `cooling (${k.ready_in}s)` : 'ready') + (req ? ` · ${req}` : '');
     return `<span class="${cls}" title="${title}" style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:2px"></span>`;
   }).join('');
 }
@@ -3880,6 +3891,7 @@ def status():
                     "key_tail": e["key"][-6:],
                     "status":   "cooling" if e["cool_until"] > now else "ready",
                     "ready_in": max(0, round(e["cool_until"] - now)),
+                    "requests": pool.key_requests_for(name, e["key"]),
                 }
                 for e in entries
             ]
