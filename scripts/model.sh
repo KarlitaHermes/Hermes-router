@@ -36,7 +36,7 @@ warn() { printf '\033[1;33m[model]\033[0m %s\n' "$*"; }
 PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral cohere zai naga nvidia huggingface kimi opencode opencode_go openai anthropic codex local"
 
 canonical_provider() {
-  case "${1,,}" in
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     gemini|google)         echo "gemini" ;;
     openrouter|or)         echo "openrouter" ;;
     sambanova|samba)       echo "sambanova" ;;

@@ -41,7 +41,7 @@ PROVIDERS_LIST="gemini openrouter sambanova github_models cerebras groq mistral 
 
 # Normalize a provider name to its canonical form (accepts a couple of aliases).
 canonical_provider() {
-  case "${1,,}" in
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     gemini|google)         echo "gemini" ;;
     openrouter|or)         echo "openrouter" ;;
     sambanova|samba)       echo "sambanova" ;;

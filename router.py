@@ -3798,7 +3798,15 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                     log.warning(f"  {name}/{model} {resp.status_code} model-level — skipping this model: {btxt[:160]}")
                     break
                 # Genuine auth/permission failure — won't work for any model here.
+                # Also count it against the circuit breaker: record_error() alone only
+                # feeds /v1/usage stats, not the breaker (that's record_health-only). A
+                # provider with a permanently bad/unsubscribed key would otherwise be
+                # retried and rejected on every single future request forever, instead
+                # of tripping the breaker and cooling down like any other unhealthy
+                # provider (e.g. a key configured for a paid tier the account never
+                # actually enabled, like OpenCode Go without Go billing turned on).
                 log.error(f"  {name} {resp.status_code} — auth, skipping provider: {btxt[:200]}")
+                stats.record_health(name, False)
                 skip_providers.add(name)
                 break
 

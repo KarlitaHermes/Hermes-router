@@ -108,6 +108,12 @@ hr auth add opencode_go      # paste the same OpenCode key
 hr restart
 ```
 
+> **Only do this after you've actually enabled Go billing.** Adding an `opencode_go` key is the
+> router's *only* signal that you've subscribed — it doesn't verify it. A key added without Go
+> billing enabled will fail on every request with an auth error (the router backs off after
+> repeated failures instead of retrying forever, but it will never succeed). If you haven't
+> subscribed, skip this section — OpenCode Zen above already covers the free tier.
+
 Defaults to `https://opencode.ai/zen/go/v1` with `deepseek-v4-flash,minimax-m3`; override with
 `OPENCODE_GO_MODEL`. (Go models: Kimi K2.7/K2.6, GLM-5.2/5.1, MiniMax M3/M2.7, Qwen3.7, DeepSeek
 V4 Pro/Flash, MiMo…)

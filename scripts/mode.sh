@@ -36,7 +36,7 @@ ENV_KEY="ROTATION_MODE"
 
 # Normalize a mode name (accepts a couple of friendly aliases).
 canonical_mode() {
-  case "${1,,}" in
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     round-robin|roundrobin|round_robin|rr) echo "round-robin" ;;
     sequential|seq|drain)                  echo "sequential" ;;
     *)                                     echo "" ;;
