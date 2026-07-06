@@ -77,6 +77,93 @@ Point Prometheus/Grafana at it to track per-provider traffic and the cache over 
 | `hermes_router_cost_usd_total` | counter | `provider` | Estimated USD cost served per provider |
 | `hermes_router_key_requests_total` | counter | `key` | Requests per proxy key (key tail) |
 
+## Alerting (Prometheus + Alertmanager)
+
+`/metrics` is already native Prometheus format, so you can wire up **real alerts** — "notify me
+when spend spikes" or "tell me when a provider goes down" — with just config, no extra gateway
+or proxy in front of the router.
+
+> **Don't stack another LLM gateway in front of Hermes just for this.** If you're running
+> something like LiteLLM between your app and Hermes purely to get usage/cost visibility, and
+> Hermes only sees *one* key pointed at that gateway, you're losing Hermes's whole reason to
+> exist: rotating across **many real provider keys** with per-provider rating and failover. Give
+> Hermes your real provider keys directly (`hr auth add <provider>`) and point Prometheus at
+> Hermes's own `/metrics` — no middleman needed.
+
+**1. Scrape it** — add Hermes as a target in `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: hermes-router
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["localhost:8319"]
+    metrics_path: /metrics
+```
+
+If you've set `METRICS_REQUIRE_AUTH=1`, add your proxy key as a bearer token:
+
+```yaml
+    authorization:
+      credentials: sk-router-1
+```
+
+**2. Alert on it** — an example rules file covering the failure modes that actually matter
+(spend, dead providers, error spikes, latency), using the metrics from the table above:
+
+```yaml
+groups:
+  - name: hermes-router
+    rules:
+      - alert: HermesRouterProviderDown
+        expr: hermes_router_circuit_breaker_open == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.provider }}'s circuit breaker has been open for 5+ minutes"
+
+      - alert: HermesRouterHighErrorRate
+        expr: |
+          rate(hermes_router_errors_total[5m])
+            / clamp_min(rate(hermes_router_requests_total[5m]), 1e-9) > 0.5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.provider }} error rate above 50% over 5m"
+
+      - alert: HermesRouterDailySpendHigh
+        # cost_usd_total is cumulative since the last restart, not a daily counter —
+        # increase() over 24h approximates "spend today" (skews only right after a restart).
+        expr: increase(hermes_router_cost_usd_total[24h]) > 5
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.provider }} has cost an estimated ${{ $value }} in the last 24h"
+
+      - alert: HermesRouterSlow
+        expr: hermes_router_avg_latency_ms > 5000
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.provider }} average latency above 5s for 10m"
+
+      - alert: HermesRouterUnreachable
+        expr: up{job="hermes-router"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Prometheus can't scrape hermes-router — it may be down"
+```
+
+Adjust the thresholds (`> 5` for daily spend, `0.5` for error rate, etc.) to your own budget and
+tolerance — these are starting points, not fixed rules. Wire the resulting alerts into whatever
+Alertmanager already sends to (Slack, PagerDuty, email, …); nothing else on the Hermes side needs
+to change.
+
+**For per-key budget enforcement** (as opposed to alerting after the fact), see
+[Configuration → Per-key budgets & rate limits](configuration.md#per-key-budgets--rate-limits) —
+`hr limit set <key> --cost-day 5` rejects a caller's requests with `429` before they're ever sent
+to a provider, once its daily spend crosses the limit.
+
 ## Usage analytics (`/v1/usage`)
 
 `GET /v1/usage` (proxy key required) returns a JSON summary for dashboards and billing:
