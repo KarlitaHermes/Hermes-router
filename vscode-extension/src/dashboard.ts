@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { RouterClient, RouterStatus } from "./client";
+import { isDocker, isLocal } from "./cli";
 
 export class DashboardProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "hermesRouter.dashboard";
@@ -35,6 +36,10 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
   }
 
   private shell(): string {
+    const canRunDoctor = isDocker() || isLocal();
+    const doctorButton = canRunDoctor
+      ? `<button class="secondary" onclick="cmd('hermesRouter.doctor')">Run doctor</button>`
+      : `<button class="secondary" onclick="cmd('hermesRouter.doctor')">Doctor info</button>`;
     // Compact control center. The browser dashboard remains the single place for
     // configuration writes; this panel makes the current state understandable in
     // VS Code without forcing users to read a dense provider table first.
@@ -144,14 +149,14 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
 
     el.innerHTML = '<div class="stack">' +
       '<section class="hero"><span class="state '+stateCls+'">'+stateText+'</span><h2>'+headline+'</h2><p>'+detail+'</p></section>' +
-      '<div class="actions"><button onclick="cmd(\\'hermesRouter.openWebDashboard\\')">Open dashboard</button><button class="secondary" onclick="cmd(\\'hermesRouter.restart\\')">Restart</button></div>' +
+      '<div class="actions"><button onclick="cmd(\\'hermesRouter.openWebDashboard\\')">Open web dashboard</button><button class="secondary" onclick="cmd(\\'hermesRouter.restart\\')">Restart router</button></div>' +
       '<div class="metrics"><div class="metric"><div class="label">Ready keys</div><div class="value">'+readyKeys+'/'+totalKeys+'</div></div>' +
       '<div class="metric"><div class="label">Errors</div><div class="value">'+errRate.toFixed(1)+'%</div></div>' +
       '<div class="metric"><div class="label">Tokens</div><div class="value">'+tok(totalTokens)+'</div></div>' +
       '<div class="metric"><div class="label">Spend</div><div class="value">'+usd(totalCost)+'</div></div></div>' +
       '<div class="card"><h3>Router</h3><p>Rotation: <span class="pill">'+esc(mode)+'</span> Cache: <span class="pill">'+(cache.enabled ? Math.round((cache.hit_rate||0)*100)+'%' : 'off')+'</span>'+(sem.enabled ? ' <span class="pill">semantic</span>' : '')+'</p></div>' +
       '<div><h3>Providers needing attention first</h3><div class="list">'+(items.map(i=>i.html).join('') || '<p>No providers configured.</p>')+'</div></div>' +
-      '<div class="actions"><button class="secondary" onclick="send(\\'refresh\\')">Refresh</button><button class="secondary" onclick="cmd(\\'hermesRouter.doctor\\')">Run doctor</button></div>' +
+      '<div class="actions"><button class="secondary" onclick="send(\\'refresh\\')">Refresh</button>${doctorButton}</div>' +
       '</div>';
   });
 

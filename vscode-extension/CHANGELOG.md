@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.3
+
+- **Fix remote control buttons.** Restart now uses the router HTTP restart endpoint for remote
+  routers, and Doctor clearly explains when it must be run on the host/container instead of
+  appearing broken.
+- **Simpler web dashboard.** Setup is now near the top, provider health is card-based, and
+  dense tables/logs/cache/key details are collapsed under advanced sections.
+
 ## 0.9.2
 
 - **Friendlier dashboard for non-technical users.** The VS Code sidebar now opens with a

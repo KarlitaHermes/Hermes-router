@@ -3,7 +3,7 @@ import { RouterClient } from "./client";
 import { StatusBar } from "./statusBar";
 import { DashboardProvider } from "./dashboard";
 import { HermesChatModelProvider } from "./lmProvider";
-import { runHr, runHrTerminal, isDocker } from "./cli";
+import { runHr, runHrTerminal, isDocker, isLocal } from "./cli";
 
 function makeClient(): RouterClient {
   const cfg = vscode.workspace.getConfiguration("hermesRouter");
@@ -69,10 +69,31 @@ export function activate(context: vscode.ExtensionContext) {
   reg("hermesRouter.refresh", refresh);
 
   reg("hermesRouter.restart", async () => {
-    await runHr(out, ["restart"]);
+    if (!isDocker() && !isLocal()) {
+      try {
+        await makeClient().restart();
+        vscode.window.showInformationMessage("Restart requested. Hermes Router will reconnect in a few seconds.");
+      } catch (e: any) {
+        vscode.window.showWarningMessage(e?.message || "Could not restart the remote router.");
+      }
+    } else {
+      await runHr(out, ["restart"]);
+    }
     await refresh();
   });
-  reg("hermesRouter.doctor", () => runHr(out, ["doctor"]));
+  reg("hermesRouter.doctor", async () => {
+    if (!isDocker() && !isLocal()) {
+      const pick = await vscode.window.showInformationMessage(
+        "Doctor runs on the machine or Docker container that hosts Hermes Router. This extension is connected to a remote URL.",
+        "Open web dashboard"
+      );
+      if (pick === "Open web dashboard") {
+        await vscode.env.openExternal(vscode.Uri.parse(makeClient().dashboardUrl()));
+      }
+      return;
+    }
+    await runHr(out, ["doctor"]);
+  });
   reg("hermesRouter.update", async () => {
     if (isDocker()) {
       vscode.window.showInformationMessage(

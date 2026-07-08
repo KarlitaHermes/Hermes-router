@@ -3050,7 +3050,7 @@ header h1 span{color:var(--accent)}
   background:var(--surface2);color:var(--text);transition:.15s}
 .btn:hover{border-color:var(--accent);color:var(--accent)}
 
-main{padding:18px 20px;display:grid;gap:16px}
+main{padding:18px 20px;display:grid;gap:16px;max-width:1180px;margin:0 auto}
 
 /* ── key input overlay ── */
 #key-gate{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;
@@ -3099,7 +3099,7 @@ main{padding:18px 20px;display:grid;gap:16px}
 .setup-step.done .step-dot{background:var(--green);box-shadow:0 0 6px var(--green)}
 .setup-step.warn .step-dot{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
 .setup-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
-.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px;padding:12px}
 .provider-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px}
 .provider-card.bad{border-color:rgba(248,113,113,.45)}
 .provider-card.warn{border-color:rgba(250,204,21,.45)}
@@ -3120,6 +3120,7 @@ main{padding:18px 20px;display:grid;gap:16px}
 .panel-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;
   color:var(--muted)}
 .panel-body{overflow-x:auto}
+.panel-body.pad{padding:12px}
 
 /* ── tables ── */
 table{width:100%;border-collapse:collapse;font-size:12px}
@@ -3181,6 +3182,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
 /* ── config forms ── */
 .config-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:14px}
 @media(max-width:820px){.config-grid{grid-template-columns:1fr}}
+.config-intro{padding:12px 14px 0;color:var(--muted);line-height:1.45}
 .config-form{display:flex;flex-direction:column;gap:8px}
 .config-form label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
 .config-form select, .config-form input{
@@ -3283,17 +3285,73 @@ tr:hover td{background:rgba(108,140,255,.04)}
     </div>
   </section>
 
-  <!-- stat cards row -->
-  <div class="stat-row" id="stat-row">
-    <div class="stat-card"><div class="label">Providers</div><div class="value" id="s-providers">—</div><div class="sub" id="s-providers-sub"></div></div>
-    <div class="stat-card"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div><div class="sub">since last restart</div></div>
-    <div class="stat-card"><div class="label">Total Requests</div><div class="value" id="s-requests">—</div><div class="sub" id="s-requests-sub"></div></div>
-    <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="s-tokens">—</div><div class="sub" id="s-cost"></div></div>
-    <div class="stat-card"><div class="label">Cache Hit Rate</div><div class="value" id="s-hitrate">—</div><div class="sub" id="s-cache-sub"></div></div>
-    <div class="stat-card"><div class="label">Error Rate</div><div class="value" id="s-errrate">—</div><div class="sub" id="s-errrate-sub"></div></div>
+  <!-- simple setup/configuration -->
+  <div class="panel" id="config-panel">
+    <div class="panel-header"><span class="panel-title">Setup</span></div>
+    <div class="config-intro">Most users only need this section: add a provider key, choose a model if you want, then restart.</div>
+    <div class="config-grid">
+
+      <div class="config-form">
+        <label>Add API key</label>
+        <div class="row">
+          <select id="cfg-key-provider"></select>
+        </div>
+        <input id="cfg-key-value" type="password" placeholder="paste provider API key" autocomplete="off">
+        <div class="row">
+          <button class="btn" onclick="addKey()">Add key</button>
+        </div>
+        <div class="config-msg" id="cfg-key-msg"></div>
+      </div>
+
+      <div class="config-form">
+        <label>Provider model</label>
+        <div class="row">
+          <select id="cfg-model-provider" onchange="onModelProviderChange()"></select>
+        </div>
+        <input id="cfg-model-value" type="text" placeholder="model or model1,model2,...">
+        <div class="default-hint" id="cfg-model-default"></div>
+        <div class="row">
+          <button class="btn" onclick="setModel()">Save model</button>
+          <button class="btn" onclick="resetModel()">Reset</button>
+        </div>
+        <div class="config-msg" id="cfg-model-msg"></div>
+      </div>
+
+      <div class="config-form">
+        <label>Key rotation</label>
+        <select id="cfg-rotation-value">
+          <option value="round-robin">Spread requests across keys</option>
+          <option value="sequential">Use one key before the next</option>
+        </select>
+        <div class="row">
+          <button class="btn" onclick="setRotation()">Save rotation mode</button>
+        </div>
+        <div class="default-hint">Round-robin is best for most users because it spreads load across keys.</div>
+        <div class="config-msg" id="cfg-rotation-msg"></div>
+      </div>
+
+    </div>
   </div>
 
-  <div class="provider-grid" id="provider-card-grid"></div>
+  <!-- stat cards row -->
+  <details class="panel advanced-panel">
+    <summary class="panel-header"><span class="panel-title">Usage Summary</span></summary>
+    <div class="panel-body pad">
+      <div class="stat-row" id="stat-row">
+        <div class="stat-card"><div class="label">Providers</div><div class="value" id="s-providers">—</div><div class="sub" id="s-providers-sub"></div></div>
+        <div class="stat-card"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div><div class="sub">since last restart</div></div>
+        <div class="stat-card"><div class="label">Total Requests</div><div class="value" id="s-requests">—</div><div class="sub" id="s-requests-sub"></div></div>
+        <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="s-tokens">—</div><div class="sub" id="s-cost"></div></div>
+        <div class="stat-card"><div class="label">Cache Hit Rate</div><div class="value" id="s-hitrate">—</div><div class="sub" id="s-cache-sub"></div></div>
+        <div class="stat-card"><div class="label">Error Rate</div><div class="value" id="s-errrate">—</div><div class="sub" id="s-errrate-sub"></div></div>
+      </div>
+    </div>
+  </details>
+
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">Provider Health</span><span class="muted">attention first</span></div>
+    <div class="provider-grid" id="provider-card-grid"></div>
+  </div>
 
   <!-- provider health table -->
   <details class="panel advanced-panel">
@@ -3344,8 +3402,11 @@ tr:hover td{background:rgba(108,140,255,.04)}
     </div>
   </details>
 
-  <!-- bottom two-col: cache+features | key usage -->
-  <div class="two-col">
+  <!-- bottom advanced: cache+features | key usage -->
+  <details class="panel advanced-panel">
+    <summary class="panel-header"><span class="panel-title">Advanced Cache, Features & Key Usage</span></summary>
+    <div class="panel-body pad">
+      <div class="two-col">
 
     <!-- cache stats + add-ons -->
     <div style="display:grid;gap:16px">
@@ -3378,54 +3439,9 @@ tr:hover td{background:rgba(108,140,255,.04)}
       </div>
     </div>
 
-  </div><!-- /two-col -->
-
-  <!-- configuration -->
-  <div class="panel" id="config-panel">
-    <div class="panel-header"><span class="panel-title">Configuration</span></div>
-    <div class="config-grid">
-
-      <div class="config-form">
-        <label>Add API key</label>
-        <div class="row">
-          <select id="cfg-key-provider"></select>
-        </div>
-        <input id="cfg-key-value" type="password" placeholder="paste provider API key" autocomplete="off">
-        <div class="row">
-          <button class="btn" onclick="addKey()">+ Add Key</button>
-        </div>
-        <div class="config-msg" id="cfg-key-msg"></div>
-      </div>
-
-      <div class="config-form">
-        <label>Provider model</label>
-        <div class="row">
-          <select id="cfg-model-provider" onchange="onModelProviderChange()"></select>
-        </div>
-        <input id="cfg-model-value" type="text" placeholder="model or model1,model2,...">
-        <div class="default-hint" id="cfg-model-default"></div>
-        <div class="row">
-          <button class="btn" onclick="setModel()">Set</button>
-          <button class="btn" onclick="resetModel()">Reset to default</button>
-        </div>
-        <div class="config-msg" id="cfg-model-msg"></div>
-      </div>
-
-      <div class="config-form">
-        <label>Key rotation</label>
-        <select id="cfg-rotation-value">
-          <option value="round-robin">Spread requests across keys</option>
-          <option value="sequential">Use one key before the next</option>
-        </select>
-        <div class="row">
-          <button class="btn" onclick="setRotation()">Save rotation mode</button>
-        </div>
-        <div class="default-hint">Current mode controls how keys are picked inside each provider.</div>
-        <div class="config-msg" id="cfg-rotation-msg"></div>
-      </div>
-
+      </div><!-- /two-col -->
     </div>
-  </div>
+  </details>
 
 </main>
 
@@ -4006,6 +4022,11 @@ def dashboard():
     Polls /v1/status, /v1/usage, and /v1/logs every 5 seconds.
     Prompts for the proxy API key on first load (stored in localStorage)."""
     return Response(_DASHBOARD_HTML, content_type="text/html; charset=utf-8")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return Response(status=204)
 
 
 @app.route("/health")

@@ -28,7 +28,13 @@ export interface Health {
   providers: string[];
 }
 
-function get(urlStr: string, headers: Record<string, string>, timeoutMs = 6000): Promise<{ code: number; body: string }> {
+function request(
+  urlStr: string,
+  method: "GET" | "POST",
+  headers: Record<string, string>,
+  body?: string,
+  timeoutMs = 6000
+): Promise<{ code: number; body: string }> {
   return new Promise((resolve, reject) => {
     let url: URL;
     try {
@@ -39,7 +45,7 @@ function get(urlStr: string, headers: Record<string, string>, timeoutMs = 6000):
     const lib = url.protocol === "https:" ? https : http;
     const req = lib.request(
       url,
-      { method: "GET", headers, timeout: timeoutMs },
+      { method, headers, timeout: timeoutMs },
       (res) => {
         let data = "";
         res.on("data", (c) => (data += c));
@@ -48,8 +54,17 @@ function get(urlStr: string, headers: Record<string, string>, timeoutMs = 6000):
     );
     req.on("timeout", () => req.destroy(new Error("request timed out")));
     req.on("error", reject);
+    if (body) req.write(body);
     req.end();
   });
+}
+
+function get(urlStr: string, headers: Record<string, string>, timeoutMs = 6000): Promise<{ code: number; body: string }> {
+  return request(urlStr, "GET", headers, undefined, timeoutMs);
+}
+
+function post(urlStr: string, headers: Record<string, string>, body?: string, timeoutMs = 6000): Promise<{ code: number; body: string }> {
+  return request(urlStr, "POST", headers, body, timeoutMs);
 }
 
 export class RouterClient {
@@ -83,6 +98,18 @@ export class RouterClient {
       throw new Error(`status HTTP ${code}`);
     }
     return JSON.parse(body) as RouterStatus;
+  }
+
+  async restart(): Promise<void> {
+    const { code, body } = await post(`${this.base()}/v1/config/restart`, {
+      Authorization: `Bearer ${this.apiKey}`,
+    });
+    if (code === 401) {
+      throw new Error("unauthorized — check hermesRouter.apiKey");
+    }
+    if (code < 200 || code >= 300) {
+      throw new Error(`restart HTTP ${code}: ${body.slice(0, 200)}`);
+    }
   }
 
   /**
