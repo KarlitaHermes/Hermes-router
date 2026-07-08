@@ -34,6 +34,7 @@ hr restart                            # apply
 | `semantic_cache` | `SEMANTIC_CACHE` | off | Also serve cached answers for *similar* prompts |
 | `persistent_cache` | `CACHE_PERSIST` | off | Mirror the cache to SQLite so it survives restarts |
 | `fast_routing` | `FAST_ROUTE_THRESHOLD` | off | Short requests prefer low-latency providers on ties |
+| `model_discovery` | `AUTO_DISCOVER_MODELS` | off | Refresh provider model lists from `/models` at startup |
 | `metrics_auth` | `METRICS_REQUIRE_AUTH` | off | Require the proxy key on `/metrics` |
 | `cost_currency` | `COST_FX_RATE` | off | Show a second currency (e.g. ₹) alongside USD spend |
 | `key_budgets` | `auth.json` / `PROXY_LIMIT_*` | off | Per-key RPM / daily request / token / cost ceilings — manage with `hr limit` |
@@ -92,6 +93,8 @@ Sensible defaults — most users never touch these.
 | `SEMANTIC_CACHE` | `0` | If `1`, also serve cached answers for *similar* prompts (needs an embedding provider; falls back to exact match otherwise) |
 | `SEMANTIC_CACHE_THRESHOLD` | `0.95` | Cosine-similarity cutoff for a semantic hit (`1.0` = identical; lower = looser matching) |
 | `FAST_ROUTE_THRESHOLD` | `0` | If >0, requests under this many tokens prefer low-latency providers first (`0` disables) |
+| `AUTO_DISCOVER_MODELS` | `0` | If `1`, fetch configured providers' `/models` lists at startup, prune listed models that disappeared, and append the best discovered models |
+| `AUTO_DISCOVER_MODEL_LIMIT` | `8` | Max models kept per provider when `AUTO_DISCOVER_MODELS=1` |
 | `ROUTER_MODEL_ID` | `hermes-router` | The model name clients send (the router maps it to each provider's real model) |
 | `ROUTER_STATE_FILE` | `./router_state.json` | Where provider ratings/capabilities are cached between restarts (use `/tmp/...` on read-only hosts like HF Spaces) |
 | `ROUTER_STATE_TTL_HOURS` | `24` | How long the cached probe state is trusted before re-probing (`0` = re-probe every start) |
@@ -217,8 +220,8 @@ on the same key** before cascading to the next provider — multiplying free thr
 new axis (keys × models × providers), with no extra signups. Each model is **also a first-class
 routing candidate**, scored on its own rating and capability — so the router can pick the right
 model in the list for each request (e.g. a stronger model for a hard or tool-using turn), not just
-fall over to it. Within equal ratings, the **listed order** is preserved, so list them in
-preference order (cheapest/fastest first).
+fall over to it. Within equal cost/capability buckets, the router prefers known stronger model
+families, then falls back to your listed order.
 
 > **Mixing model classes is fine.** Tool-calling and reasoning are detected **per model** at
 > startup, so you can safely list models of different classes (e.g.
@@ -226,6 +229,18 @@ preference order (cheapest/fastest first).
 > result per model with `<PROVIDER>_<MODEL>_SUPPORTS_TOOLS` / `_REASONING` (model id upper-cased,
 > non-alphanumerics → `_`, e.g. `GEMINI_GEMINI_2_5_PRO_SUPPORTS_TOOLS=1`); the provider-wide
 > `<PROVIDER>_SUPPORTS_TOOLS` / `_REASONING` still applies as the default for all its models.
+
+### Auto model discovery
+
+Enable `AUTO_DISCOVER_MODELS=1` (or `hr features enable model_discovery`) to have the
+router query configured providers' OpenAI-compatible `/models` endpoints at startup. It
+keeps the configured models that still exist, appends the best discovered models up to
+`AUTO_DISCOVER_MODEL_LIMIT`, and updates the in-memory routing pool for that run.
+
+This is opt-in because some gateways expose paid or very large catalogs. Known mixed
+free/paid gateways are filtered to free model ids where possible, and very large/special
+providers such as Hugging Face are skipped unless you opt in per provider with
+`HUGGINGFACE_AUTO_DISCOVER_MODELS=1`.
 
 ## Key rotation mode
 

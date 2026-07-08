@@ -77,6 +77,10 @@ CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
 CACHE_PERSIST     = os.environ.get("CACHE_PERSIST", "0").strip().lower() not in ("0", "", "false", "no", "off")
 CACHE_DB_PATH     = os.environ.get("CACHE_DB_PATH", "./cache.db")
 FAST_ROUTE_TOKENS = int(os.environ.get("FAST_ROUTE_THRESHOLD", 0))  # 0 = disabled
+# Optional startup model discovery. Kept opt-in because some gateways list paid
+# models alongside free ones, and some expose very large catalogs.
+AUTO_DISCOVER_MODELS = os.environ.get("AUTO_DISCOVER_MODELS", "0").strip().lower() not in ("0", "", "false", "no", "off")
+AUTO_DISCOVER_MODEL_LIMIT = max(1, int(os.environ.get("AUTO_DISCOVER_MODEL_LIMIT", "8")))
 # Semantic cache: serve a cached answer for a *similar* (not just identical) prompt,
 # by embedding prompts and comparing cosine similarity. Opt-in (needs an embedding
 # provider); falls back to exact match when off or unavailable.
@@ -256,6 +260,7 @@ KNOWN_MODEL_RATINGS: dict = {
     "llama-3.3-70b": 2, "llama-3.1-70b": 2,
     "mistral-large": 2, "mistral-medium": 2,
     "command-r-plus": 2, "command-a": 2, "nvidia/nemotron-3-super": 2, "nemotron": 2,
+    "big-pickle": 2,
     "deepseek-v4-flash": 2, "deepseek-v4": 2,  # capable but slow cold-start → "best", not first-choice
     "deepseek-v3": 2, "deepseek-v2": 2,
     "claude-sonnet": 2, "claude-3-5": 2, "grok-2": 2,
@@ -312,6 +317,28 @@ MODEL_PRICES: dict = {
     "command-r-plus":   (2.50, 10.00),
     "command-r":        (0.15, 0.60),
     "kimi-k2":          (0.60, 2.50),
+}
+
+# Tie-breakers for equally priced/capable models. Lower is better. Ratings still
+# carry the broad capability class; this table nudges known strong model families
+# ahead when multiple candidates cost the same (common for free/subscription pools).
+MODEL_QUALITY_RANKS: dict = {
+    "big-pickle": 5,
+    "gpt-5": 10, "gpt-4o": 15, "o3": 15, "o1": 20,
+    "claude-opus": 10, "claude-sonnet": 20,
+    "gemini-2.5-pro": 15, "gemini-2.5-flash": 35,
+    "nemotron-3-ultra": 20, "nemotron-3-super": 35,
+    "deepseek-v4": 30, "deepseek-v3": 40,
+    "llama-4": 35, "llama-3.3-70b": 45,
+    "mistral-large": 40, "mistral-medium": 55,
+    "command-a": 45, "gpt-oss-120b": 55,
+}
+PROVIDER_QUALITY_RANKS: dict = {
+    "opencode": 10, "codex": 15, "openai": 20, "anthropic": 25,
+    "gemini": 30, "openrouter": 35, "cerebras": 40, "nvidia": 45,
+    "groq": 50, "mistral": 55, "cohere": 60, "sambanova": 65,
+    "kimi": 70, "zai": 75, "naga": 80, "github_models": 85,
+    "huggingface": 90, "local": 95,
 }
 _provider_state: dict = {}   # populated at startup by _initialize_ratings()
 # Per-(provider, model) capability — rating + tool/reasoning support. Keyed by
@@ -658,7 +685,13 @@ PROVIDERS = _build_providers()
 # Providers whose /models endpoint mixes paid models in with the free ones.
 # When auto-discovering a replacement model for these, restrict to :free ids so
 # a probe can never silently promote the router onto a paid model.
-_FREE_ONLY_DISCOVERY = {"openrouter", "naga"}
+_FREE_ONLY_DISCOVERY = {"openrouter", "naga", "opencode"}
+_MODEL_DISCOVERY_SKIP = {"anthropic", "codex", "local", "huggingface"}
+
+
+def _is_free_model_id(model: str) -> bool:
+    m = (model or "").lower()
+    return m.endswith(":free") or m.endswith("-free") or "/free" in m
 
 # ── Config-write support (web dashboard "Add key" / "Set model" / add-on toggles) ──
 # Mirrors the canonical provider lists + env-var mappings already used by the `hr`
@@ -824,6 +857,23 @@ def _price_model(model: str) -> tuple:
     return (0.0, 0.0)
 
 
+def _price_rank(model: str) -> float:
+    """Single sortable price estimate. Unknown/free/subscription models are 0."""
+    pin, pout = _price_model(model)
+    return float(pin or 0.0) + float(pout or 0.0)
+
+
+def _quality_rank(provider_name: str, model: str) -> int:
+    """Lower is better. Used only after cost/tier tie-breaks, so it never makes a
+    known-expensive model beat a cheaper capable one."""
+    mn = (model or "").lower()
+    for key in sorted(MODEL_QUALITY_RANKS, key=len, reverse=True):
+        if key in mn:
+            return MODEL_QUALITY_RANKS[key]
+    # Fall back to capability rating, then provider rank for stable same-price ties.
+    return _rate_model(model) * 100 + PROVIDER_QUALITY_RANKS.get(provider_name, 99)
+
+
 def _cost(model: str, prompt_toks, completion_toks) -> float:
     """Estimated USD cost of one response from its token usage. Free/unpriced = 0."""
     pin, pout = _price_model(model)
@@ -913,10 +963,86 @@ def _discover_best_model(base_url: str, key: str, extra_headers: dict = None,
             return None
         models = [m["id"] for m in r.json().get("data", []) if isinstance(m.get("id"), str)]
         if free_only:
-            models = [m for m in models if m.endswith(":free")]
+            models = [m for m in models if _is_free_model_id(m)]
         return min(models, key=_rate_model) if models else None
     except Exception:
         return None
+
+
+def _discover_models(provider: dict, key: str, free_only: bool = False) -> list[str]:
+    """Fetch provider models from an OpenAI-compatible /models endpoint.
+
+    Returns a bounded, quality-sorted list. Fail-soft: any provider quirk simply
+    disables discovery for that provider on this start.
+    """
+    try:
+        hdrs = {"Authorization": f"Bearer {key}", **provider.get("headers", {})}
+        r = _HTTP.get(f"{provider['base_url'].rstrip('/')}/models", headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            return []
+        models = []
+        for item in r.json().get("data", []):
+            mid = item.get("id") if isinstance(item, dict) else None
+            if isinstance(mid, str) and mid.strip():
+                models.append(mid.strip())
+        if free_only:
+            models = [m for m in models if _is_free_model_id(m)]
+        models = list(dict.fromkeys(models))
+        models.sort(key=lambda m: (_price_rank(m), _quality_rank(provider["name"], m), m.lower()))
+        return models[:AUTO_DISCOVER_MODEL_LIMIT]
+    except Exception as e:
+        log.debug(f"[ratings]   {provider['name']}: model discovery skipped: {e}")
+        return []
+
+
+def _provider_model_discovery_enabled(provider: dict) -> bool:
+    name = provider["name"].upper()
+    val = os.environ.get(f"{name}_AUTO_DISCOVER_MODELS")
+    if val is None:
+        return AUTO_DISCOVER_MODELS
+    return val.strip().lower() not in ("0", "", "false", "no", "off")
+
+
+def _refresh_discovered_models(provider: dict, key: str, pool_ref) -> None:
+    """Opt-in model refresh: prune configured models not reported by /models and
+    append the best discovered models up to AUTO_DISCOVER_MODEL_LIMIT.
+
+    This is deliberately conservative: unsupported protocols and huge/mixed
+    catalogs are skipped unless a per-provider env flag explicitly enables them.
+    """
+    if not _provider_model_discovery_enabled(provider):
+        return
+    name = provider["name"]
+    if name in _MODEL_DISCOVERY_SKIP and os.environ.get(f"{name.upper()}_AUTO_DISCOVER_MODELS") is None:
+        log.info(f"[ratings]   {name}: model discovery skipped by default")
+        return
+    free_only = name in _FREE_ONLY_DISCOVERY
+    discovered = _discover_models(provider, key, free_only=free_only)
+    if not discovered:
+        return
+
+    configured = list(provider.get("models") or [provider["model"]])
+    discovered_set = set(discovered)
+    # Prune only when doing so still leaves a configured model; otherwise the
+    # existing invalid-model repair path can try to recover a primary model.
+    kept = [m for m in configured if m in discovered_set]
+    if not kept:
+        kept = discovered[:1]
+    refreshed = list(dict.fromkeys(kept + discovered))[:AUTO_DISCOVER_MODEL_LIMIT]
+    if refreshed == configured:
+        return
+
+    provider["models"] = refreshed
+    old_primary = provider["model"]
+    provider["model"] = refreshed[0]
+    for m in refreshed:
+        try:
+            pool_ref.ensure_model(name, m, provider["keys"])
+        except AttributeError:
+            pass
+    if old_primary != provider["model"]:
+        pool_ref.rename_model(name, old_primary, provider["model"])
+    log.info(f"[ratings]   {name}: discovered models → {', '.join(refreshed)}")
 
 
 def _probe_anthropic(provider: dict, key: str) -> tuple:
@@ -928,15 +1054,17 @@ def _probe_anthropic(provider: dict, key: str) -> tuple:
     try:
         r = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
         latency = (time.time() - t0) * 1000
-        return r.status_code == 200, latency, provider["model"]
+        if r.status_code == 200:
+            return True, latency, provider["model"], "ok"
+        return False, latency, provider["model"], ("auth" if r.status_code in (401, 403) else "http")
     except requests.exceptions.ReadTimeout:
-        return True, (time.time() - t0) * 1000, provider["model"]
+        return True, (time.time() - t0) * 1000, provider["model"], "timeout"
     except Exception:
-        return False, (time.time() - t0) * 1000, provider["model"]
+        return False, (time.time() - t0) * 1000, provider["model"], "network"
 
 
 def _probe_provider(provider: dict, key: str) -> tuple:
-    """Returns (success, latency_ms, model_used). Auto-discovers alt model on 400/404.
+    """Returns (success, latency_ms, model_used, status). Auto-discovers alt model on 400/404.
 
     A read-timeout means the provider accepted the request and is still
     generating — alive but slow. Large MoE models can cold-start for 30–60s,
@@ -950,7 +1078,7 @@ def _probe_provider(provider: dict, key: str) -> tuple:
         # "available" means we can mint a valid access token for the account.
         t0 = time.time()
         ok = bool(codex_creds.get_access_token(key))
-        return ok, (time.time() - t0) * 1000, provider["model"]
+        return ok, (time.time() - t0) * 1000, provider["model"], ("ok" if ok else "auth")
 
     url  = provider["base_url"].rstrip("/") + "/chat/completions"
     hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
@@ -962,7 +1090,11 @@ def _probe_provider(provider: dict, key: str) -> tuple:
         r = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
         latency = (time.time() - t0) * 1000
         if r.status_code == 200:
-            return True, latency, provider["model"]
+            return True, latency, provider["model"], "ok"
+        if r.status_code == 429:
+            return False, latency, provider["model"], "rate_limited"
+        if r.status_code in (401, 403):
+            return False, latency, provider["model"], "auth"
         if r.status_code in (400, 404):
             # Providers that list paid models alongside free ones — never let
             # auto-discovery silently pick something that costs credits.
@@ -973,13 +1105,13 @@ def _probe_provider(provider: dict, key: str) -> tuple:
                 t0 = time.time()
                 r2 = _HTTP.post(url, headers=hdrs, json=body, timeout=12)
                 if r2.status_code == 200:
-                    return True, (time.time() - t0) * 1000, alt
-        return False, (time.time() - t0) * 1000, provider["model"]
+                    return True, (time.time() - t0) * 1000, alt, "ok"
+        return False, (time.time() - t0) * 1000, provider["model"], "http"
     except requests.exceptions.ReadTimeout:
         # Connected, still generating — alive, just slow (cold MoE start).
-        return True, (time.time() - t0) * 1000, provider["model"]
+        return True, (time.time() - t0) * 1000, provider["model"], "timeout"
     except Exception:
-        return False, (time.time() - t0) * 1000, provider["model"]
+        return False, (time.time() - t0) * 1000, provider["model"], "network"
 
 
 _TOOL_PROBE = [{"type": "function", "function": {
@@ -1087,7 +1219,7 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
                        prefer_local: bool = False) -> list:
     """
     Rank every configured (provider, model) for this complexity: cheapest capable
-    model first, then overkill, then too-weak as last resort. Never blocks. Returns
+    model first, then better same-price models, then too-weak as last resort. Never blocks. Returns
     a flat list of candidate dicts {"provider": <provider>, "model": <model str>}.
 
     Each model in a provider's comma-separated list is its own candidate, scored on
@@ -1121,6 +1253,8 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
         # are constant (0), leaving the existing round-robin/tie order untouched.
         breaker_open = 1 if stats.breaker_open(name) else 0  # open breakers sink within tier
         health       = stats.health_bucket(name)             # 0 healthy / 1 degraded / 2 bad
+        price   = _price_rank(model)
+        quality = _quality_rank(name, model)
         if rating <= complexity:
             tier        = 0
             sort_within = complexity - rating   # 0 = perfect match, larger = overkill
@@ -1130,7 +1264,7 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
         # local_first leads the key so a preferred local model sorts ahead of all
         # others on easy turns; it's a constant 1 otherwise, leaving order unchanged.
         # list_index trails so a provider's listed model order breaks rating ties.
-        return (local_first, tier, sort_within, breaker_open, health,
+        return (local_first, tier, price, quality, sort_within, breaker_open, health,
                 0 if avail else 1, fast, cand["list_index"])
 
     n = len(providers)
@@ -1198,7 +1332,9 @@ def _initialize_ratings(providers: list, pool_ref):
             age = time.time() - cached_doc.get("last_updated_ts", 0)
             models_covered = all((p["name"], m) in _model_state
                                  for p in providers for m in (p.get("models") or [p["model"]]))
-            if (STATE_TTL_HOURS > 0 and age < STATE_TTL_HOURS * 3600
+            discovery_requested = any(_provider_model_discovery_enabled(p) for p in providers)
+            if (not discovery_requested
+                    and STATE_TTL_HOURS > 0 and age < STATE_TTL_HOURS * 3600
                     and all(p["name"] in _provider_state for p in providers)
                     and models_covered):
                 for p in providers:
@@ -1229,7 +1365,12 @@ def _initialize_ratings(providers: list, pool_ref):
                 new_model_state[(name, m)] = {"rating": _rate_model(m),
                                               "supports_tools": False, "reasoning": False}
             continue
-        ok, latency, actual = _probe_provider(p, key)
+        _refresh_discovered_models(p, key, pool_ref)
+        ok, latency, actual, probe_status = _probe_provider(p, key)
+        # A primary model can be rate-limited, missing tools, or otherwise rejected
+        # while the provider/key is still usable for other configured models.
+        # Only auth/network failures confidently make every model unusable.
+        caps_probe_ok = ok or probe_status not in ("auth", "network")
         original   = p["model"]
         overridden = actual != original
         if overridden:
@@ -1237,22 +1378,25 @@ def _initialize_ratings(providers: list, pool_ref):
             p["model"] = actual
             if p.get("models"):
                 p["models"][0] = actual
+                p["models"] = list(dict.fromkeys(p["models"]))
             pool_ref.rename_model(name, original, actual)
         # Per-model capabilities for the whole list (primary = models[0] = actual).
         # Reuse a cached entry when present so adding one model doesn't re-probe all.
         for m in (p.get("models") or [actual]):
-            caps = cached_models.get((name, m)) or _resolve_caps(p, key, m, ok)
+            caps = cached_models.get((name, m)) or _resolve_caps(p, key, m, caps_probe_ok)
             new_model_state[(name, m)] = caps
             log.info(f"[ratings]   {name}/{m}: rating={caps['rating']} "
                      f"tools={'yes' if caps['supports_tools'] else 'no'} "
                      f"reasoning={'yes' if caps['reasoning'] else 'no'}")
         # Provider-level fields mirror the primary model's caps (back-compat).
         prim = new_model_state[(name, actual)]
-        log.info(f"[ratings]   {name}: {'✓' if ok else '✗'} model={actual} {latency:.0f}ms")
-        new_state[name] = {"rating": prim["rating"], "model": actual, "available": ok,
+        available = ok or probe_status in ("rate_limited", "http", "timeout")
+        log.info(f"[ratings]   {name}: {'✓' if available else '✗'} model={actual} {latency:.0f}ms "
+                 f"status={probe_status}")
+        new_state[name] = {"rating": prim["rating"], "model": actual, "available": available,
                             "latency_ms": round(latency, 1), "overridden": overridden,
                             "original_model": original, "supports_tools": prim["supports_tools"],
-                            "reasoning": prim["reasoning"]}
+                            "reasoning": prim["reasoning"], "probe_status": probe_status}
     _provider_state = new_state
     _model_state = new_model_state
     try:
@@ -1362,6 +1506,13 @@ class CredentialPool:
             prov = self.pools.get(provider_name)
             if prov and old in prov and old != new:
                 prov[new] = prov.pop(old)
+
+    def ensure_model(self, provider_name: str, model: str, keys: list[str]):
+        """Ensure the pool has a bucket for a newly discovered model."""
+        with self.lock:
+            prov = self.pools.setdefault(provider_name, {})
+            if model not in prov:
+                prov[model] = deque({"key": k, "cool_until": 0.0} for k in keys)
 
 
 pool = CredentialPool(PROVIDERS)
@@ -1858,6 +2009,31 @@ def _strip_response(data: dict):
     for choice in data.get("choices", []):
         if "message" in choice:
             _strip_message(choice["message"])
+
+
+def _choice_has_output(choice: dict) -> bool:
+    """True when a chat-completion choice contains user-visible output or a tool
+    call. Empty assistant messages are treated as unusable so failover can try
+    another provider instead of caching a blank answer."""
+    msg = choice.get("message") or {}
+    if msg.get("tool_calls"):
+        return True
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text") or part.get("content")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
+def _completion_has_output(data: dict) -> bool:
+    choices = data.get("choices")
+    return isinstance(choices, list) and any(_choice_has_output(c) for c in choices)
 
 
 def _streaming_generator(resp: requests.Response):
@@ -3860,6 +4036,12 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                             try: events.append(json.loads(ds))
                             except Exception: pass
                 data = _from_codex_response(events)
+                if not _completion_has_output(data):
+                    stats.record_error(name)
+                    stats.record_health(name, False)
+                    log.warning(f"  {name}/{model} empty completion — cascading")
+                    pool.mark_rate_limited(name, key, model, retry_after=30)
+                    break
                 _add_provider_tokens(name, data, model)
                 cache.set(payload, data, ns, query_emb)
                 return ("json", data)
@@ -3898,6 +4080,12 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                         "rate limit", "too many requests", "quota", "overloaded"))
                     (log.debug if _transient else log.warning)(
                         f"  {name}/{model} 2xx without choices — cascading: {str(emsg)[:140]}")
+                    pool.mark_rate_limited(name, key, model, retry_after=30)
+                    break
+                if not _completion_has_output(data):
+                    stats.record_error(name)
+                    stats.record_health(name, False)
+                    log.warning(f"  {name}/{model} empty completion — cascading")
                     pool.mark_rate_limited(name, key, model, retry_after=30)
                     break
                 if not is_anthropic:
@@ -4177,6 +4365,9 @@ def _features_snapshot() -> dict:
         {"name": "fast_routing", "title": "Fast routing", "kind": "flag",
          "enabled": FAST_ROUTE_TOKENS > 0, "env": "FAST_ROUTE_THRESHOLD", "on": "200", "off": "0",
          "desc": "Short requests prefer low-latency providers on ties."},
+        {"name": "model_discovery", "title": "Model discovery", "kind": "flag",
+         "enabled": AUTO_DISCOVER_MODELS, "env": "AUTO_DISCOVER_MODELS", "on": "1", "off": "0",
+         "desc": "Refresh configured provider model lists from /models at startup, bounded by AUTO_DISCOVER_MODEL_LIMIT."},
         {"name": "metrics_auth", "title": "Metrics auth", "kind": "flag",
          "enabled": bool(_int_env("METRICS_REQUIRE_AUTH", 0)), "env": "METRICS_REQUIRE_AUTH",
          "on": "1", "off": "0", "desc": "Require the proxy key on /metrics."},
