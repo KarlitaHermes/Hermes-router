@@ -11,6 +11,13 @@
 #     shafiq735/hermes-router:cli
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.title="Hermes Router CLI" \
+      org.opencontainers.image.description="Hermes Router with bundled hr CLI for Docker-managed installs" \
+      org.opencontainers.image.source="https://github.com/Shaf2665/Hermes-router" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONUNBUFFERED=1
+
 # bash (the hr scripts) + curl (hr status/doctor health checks).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends bash curl \
@@ -40,4 +47,8 @@ VOLUME ["/app/data"]
 # Port 8319 serves the API (/v1/*), /health, /metrics, and the built-in
 # monitoring dashboard (open http://localhost:8319/ in a browser).
 EXPOSE 8319
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT','8319'), timeout=4)"
+
 CMD ["python", "router.py"]

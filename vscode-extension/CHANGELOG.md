@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.1
+## 0.9.2
 
 - **Friendlier dashboard for non-technical users.** The VS Code sidebar now opens with a
   plain health summary, quick actions, key/error/token/spend cards, and a provider attention
