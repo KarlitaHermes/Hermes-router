@@ -73,7 +73,7 @@ subscription) logins are stored separately under `codex_accounts` (via
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 | `METRICS_REQUIRE_AUTH` | `0` | Require the proxy key on `/metrics` (`1` to enable) |
 | `REASONING_TOKEN_RESERVE` | `4096` | Extra output budget added for reasoning models so hidden chain-of-thought doesn't eat the answer (`0` disables) |
-| `ROTATION_MODE` | `round-robin` | How keys are picked within a provider (set via `hr mode`) — `round-robin` or `sequential` |
+| `ROTATION_MODE` | `round-robin` | How keys are picked within a provider (set in the dashboard or via `hr mode`) — `round-robin` or `sequential` |
 
 ### Advanced settings
 
@@ -241,7 +241,7 @@ providers such as Hugging Face are skipped unless you opt in per provider with
 ## Key rotation mode
 
 When a provider holds several keys (or several accounts), `ROTATION_MODE` decides how the
-router picks among them:
+router picks among them. Set it in the dashboard's Configuration panel or with:
 
 ```bash
 hr mode                # show the current mode

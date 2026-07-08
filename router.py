@@ -3074,6 +3074,45 @@ main{padding:18px 20px;display:grid;gap:16px}
 .stat-card .value{font-size:22px;font-weight:700;color:var(--text)}
 .stat-card .sub{font-size:11px;color:var(--muted);margin-top:3px}
 
+/* ── simple overview ── */
+.overview-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr);gap:14px}
+@media(max-width:900px){.overview-grid{grid-template-columns:1fr}}
+.hero{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px}
+.hero-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.hero h2{font-size:20px;line-height:1.2;margin-bottom:6px}
+.hero-copy{color:var(--muted);line-height:1.45;max-width:760px}
+.hero-state{font-size:12px;padding:5px 10px;border-radius:999px;white-space:nowrap}
+.hero-state.good{background:rgba(74,222,128,.12);color:var(--green)}
+.hero-state.warn{background:rgba(250,204,21,.12);color:var(--yellow)}
+.hero-state.bad{background:rgba(248,113,113,.12);color:var(--red)}
+.quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:16px}
+.quick-card{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px}
+.quick-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-bottom:5px}
+.quick-value{font-size:15px;font-weight:700}
+.quick-sub{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.4}
+.setup-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px}
+.setup-card h3{font-size:14px;margin-bottom:10px}
+.setup-list{display:grid;gap:8px}
+.setup-step{display:flex;align-items:center;gap:8px;color:var(--muted)}
+.setup-step strong{color:var(--text);font-weight:600}
+.step-dot{width:9px;height:9px;border-radius:50%;background:var(--border);flex:0 0 auto}
+.setup-step.done .step-dot{background:var(--green);box-shadow:0 0 6px var(--green)}
+.setup-step.warn .step-dot{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+.setup-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.provider-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px}
+.provider-card.bad{border-color:rgba(248,113,113,.45)}
+.provider-card.warn{border-color:rgba(250,204,21,.45)}
+.provider-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}
+.provider-name{font-weight:700}
+.provider-model{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-meta{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:11px;color:var(--muted)}
+.advanced-panel summary{cursor:pointer;list-style:none}
+.advanced-panel summary::-webkit-details-marker{display:none}
+.advanced-panel .panel-header:after{content:"show";font-size:11px;color:var(--muted)}
+.advanced-panel[open] .panel-header:after{content:"hide"}
+.advanced-panel:not([open]) .panel-body{display:none}
+
 /* ── panels ── */
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .panel-header{display:flex;align-items:center;justify-content:space-between;
@@ -3202,6 +3241,48 @@ tr:hover td{background:rgba(108,140,255,.04)}
 </div>
 
 <main>
+  <section class="overview-grid">
+    <div class="hero">
+      <div class="hero-top">
+        <div>
+          <h2 id="plain-title">Checking router...</h2>
+          <div class="hero-copy" id="plain-message">Loading status from Hermes Router.</div>
+        </div>
+        <div class="hero-state warn" id="plain-state">checking</div>
+      </div>
+      <div class="quick-grid">
+        <div class="quick-card">
+          <div class="quick-label">API endpoint</div>
+          <div class="quick-value mono" id="quick-endpoint">/v1</div>
+          <div class="quick-sub">Use this as the OpenAI base URL.</div>
+        </div>
+        <div class="quick-card">
+          <div class="quick-label">Model name</div>
+          <div class="quick-value mono" id="quick-model">hermes-router</div>
+          <div class="quick-sub">Send this model from your app.</div>
+        </div>
+        <div class="quick-card">
+          <div class="quick-label">Spend</div>
+          <div class="quick-value" id="quick-spend">-</div>
+          <div class="quick-sub">Estimated since last restart.</div>
+        </div>
+      </div>
+    </div>
+    <div class="setup-card">
+      <h3>Setup checklist</h3>
+      <div class="setup-list">
+        <div class="setup-step" id="step-key"><span class="step-dot"></span><strong>Provider key</strong><span id="step-key-text">checking</span></div>
+        <div class="setup-step" id="step-health"><span class="step-dot"></span><strong>Provider health</strong><span id="step-health-text">checking</span></div>
+        <div class="setup-step" id="step-restart"><span class="step-dot"></span><strong>Restart</strong><span id="step-restart-text">not needed</span></div>
+      </div>
+      <div class="setup-actions">
+        <button class="btn" onclick="scrollToConfig()">Add key</button>
+        <button class="btn" onclick="doRestart()">Restart</button>
+        <button class="btn" onclick="refresh()">Refresh</button>
+      </div>
+    </div>
+  </section>
+
   <!-- stat cards row -->
   <div class="stat-row" id="stat-row">
     <div class="stat-card"><div class="label">Providers</div><div class="value" id="s-providers">—</div><div class="sub" id="s-providers-sub"></div></div>
@@ -3212,9 +3293,11 @@ tr:hover td{background:rgba(108,140,255,.04)}
     <div class="stat-card"><div class="label">Error Rate</div><div class="value" id="s-errrate">—</div><div class="sub" id="s-errrate-sub"></div></div>
   </div>
 
+  <div class="provider-grid" id="provider-card-grid"></div>
+
   <!-- provider health table -->
-  <div class="panel">
-    <div class="panel-header"><span class="panel-title">Provider Health</span></div>
+  <details class="panel advanced-panel">
+    <summary class="panel-header"><span class="panel-title">Advanced Provider Details</span></summary>
     <div class="panel-body">
       <table>
         <thead><tr>
@@ -3227,11 +3310,11 @@ tr:hover td{background:rgba(108,140,255,.04)}
         <tbody id="provider-tbody"></tbody>
       </table>
     </div>
-  </div>
+  </details>
 
   <!-- live request log -->
-  <div class="panel">
-    <div class="panel-header">
+  <details class="panel advanced-panel">
+    <summary class="panel-header">
       <span class="panel-title">Live Request Log</span>
       <div style="display:flex;gap:8px;align-items:center">
         <select id="log-filter-status" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
@@ -3247,7 +3330,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
           <option value="embeddings">embeddings</option>
         </select>
       </div>
-    </div>
+    </summary>
     <div class="panel-body" id="log-wrap">
       <table>
         <thead><tr>
@@ -3259,7 +3342,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
         <tbody id="log-tbody"></tbody>
       </table>
     </div>
-  </div>
+  </details>
 
   <!-- bottom two-col: cache+features | key usage -->
   <div class="two-col">
@@ -3298,7 +3381,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
   </div><!-- /two-col -->
 
   <!-- configuration -->
-  <div class="panel">
+  <div class="panel" id="config-panel">
     <div class="panel-header"><span class="panel-title">Configuration</span></div>
     <div class="config-grid">
 
@@ -3326,6 +3409,19 @@ tr:hover td{background:rgba(108,140,255,.04)}
           <button class="btn" onclick="resetModel()">Reset to default</button>
         </div>
         <div class="config-msg" id="cfg-model-msg"></div>
+      </div>
+
+      <div class="config-form">
+        <label>Key rotation</label>
+        <select id="cfg-rotation-value">
+          <option value="round-robin">Spread requests across keys</option>
+          <option value="sequential">Use one key before the next</option>
+        </select>
+        <div class="row">
+          <button class="btn" onclick="setRotation()">Save rotation mode</button>
+        </div>
+        <div class="default-hint">Current mode controls how keys are picked inside each provider.</div>
+        <div class="config-msg" id="cfg-rotation-msg"></div>
       </div>
 
     </div>
@@ -3467,12 +3563,103 @@ function keyDots(keys) {
 
 // ── render all ────────────────────────────────────────────────────────────────
 function renderAll() {
+  renderPlainOverview();
+  renderRotationForm();
   renderStats();
+  renderProviderCards();
   renderProviders();
   renderLogs();
   renderCache();
   renderAddons();
   renderKeys();
+}
+
+function renderRotationForm() {
+  const sel = document.getElementById('cfg-rotation-value');
+  if (sel && statusData?.rotation?.mode) sel.value = statusData.rotation.mode;
+}
+
+function renderPlainOverview() {
+  if (!statusData || !usageData) return;
+  const prov = statusData.providers || {};
+  const vals = Object.values(prov);
+  const keyCount = vals.reduce((a,p) => a + ((p.keys || []).length), 0);
+  const readyKeys = vals.reduce((a,p) => a + ((p.keys || []).filter(k => k.status === 'ready').length), 0);
+  const openBreakers = vals.filter(p => p.breaker?.open).length;
+  const active = vals.filter(p => (p.stats?.total_requests || 0) > 0).length;
+  const totalReq = vals.reduce((a,p) => a + (p.stats?.total_requests || 0), 0);
+  const totalErr = vals.reduce((a,p) => a + (p.stats?.errors || 0), 0);
+  const errRate = totalReq ? totalErr / totalReq * 100 : 0;
+
+  const state = document.getElementById('plain-state');
+  const title = document.getElementById('plain-title');
+  const msg = document.getElementById('plain-message');
+  state.className = 'hero-state';
+  if (!keyCount) {
+    state.classList.add('bad');
+    state.textContent = 'needs a key';
+    title.textContent = 'Add one provider key to start routing';
+    msg.textContent = 'Choose a provider below, paste its API key, then restart Hermes Router.';
+  } else if (openBreakers || errRate > 25) {
+    state.classList.add('warn');
+    state.textContent = 'needs attention';
+    title.textContent = 'Hermes is running, but some providers are failing';
+    msg.textContent = 'Requests can still fall back to healthy providers. Add more keys or check providers with high errors.';
+  } else {
+    state.classList.add('good');
+    state.textContent = 'ready';
+    title.textContent = 'Hermes Router is ready';
+    msg.textContent = active ? 'Traffic is flowing through your provider pool.' : 'No requests yet. Point your app at the endpoint below.';
+  }
+
+  document.getElementById('quick-endpoint').textContent = location.origin + '/v1';
+  document.getElementById('quick-model').textContent = 'hermes-router';
+  document.getElementById('quick-spend').textContent = fmt.usd(usageData.totals?.cost?.usd);
+  setStep('step-key', keyCount > 0, `${readyKeys}/${keyCount} keys ready`);
+  setStep('step-health', !openBreakers && errRate <= 25, openBreakers ? `${openBreakers} breaker open` : (errRate ? `${fmt.pct(errRate)} errors` : 'ok'));
+}
+
+function setStep(id, done, text) {
+  const el = document.getElementById(id);
+  el.className = 'setup-step ' + (done ? 'done' : 'warn');
+  const label = document.getElementById(id + '-text');
+  if (label) label.textContent = text;
+}
+
+function scrollToConfig() {
+  document.getElementById('config-panel')?.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function renderProviderCards() {
+  if (!statusData) return;
+  const prov = statusData.providers || {};
+  const grid = document.getElementById('provider-card-grid');
+  const entries = Object.entries(prov).sort(([an,a],[bn,b]) => {
+    const badA = (a.breaker?.open ? 2 : 0) + ((a.stats?.errors || 0) > 0 ? 1 : 0);
+    const badB = (b.breaker?.open ? 2 : 0) + ((b.stats?.errors || 0) > 0 ? 1 : 0);
+    return badB - badA || an.localeCompare(bn);
+  }).slice(0, 8);
+  if (!entries.length) {
+    grid.innerHTML = '<div class="provider-card bad"><div class="provider-name">No providers configured</div><div class="provider-model">Add an API key below.</div></div>';
+    return;
+  }
+  grid.innerHTML = entries.map(([name,p]) => {
+    const req = p.stats?.total_requests || 0;
+    const err = p.stats?.errors || 0;
+    const erp = req ? err / req * 100 : 0;
+    const ready = (p.keys || []).filter(k => k.status === 'ready').length;
+    const brk = p.breaker?.open;
+    const cls = brk || erp > 25 ? 'bad' : erp > 5 ? 'warn' : '';
+    const pill = brk ? '<span class="pill pill-err">paused</span>' :
+      erp > 25 ? '<span class="pill pill-err">check</span>' :
+      erp > 5 ? '<span class="pill pill-warn">watch</span>' :
+      '<span class="pill pill-ok">ready</span>';
+    return `<div class="provider-card ${cls}">
+      <div class="provider-head"><span class="provider-name">${name}</span>${pill}</div>
+      <div class="provider-model" title="${p.model || ''}">${p.model || 'no model'}</div>
+      <div class="provider-meta"><span>${ready} ready key${ready===1?'':'s'}</span><span>${fmt.ms(p.stats?.avg_latency_ms)}</span></div>
+    </div>`;
+  }).join('');
 }
 
 // ── stat cards ────────────────────────────────────────────────────────────────
@@ -3722,8 +3909,26 @@ async function resetModel() {
   } catch(e) { setMsg('cfg-model-msg', 'Network error: ' + e.message, false); }
 }
 
+async function setRotation() {
+  const mode = document.getElementById('cfg-rotation-value').value;
+  try {
+    const r = await fetch('/v1/config/rotation', {
+      method: 'POST',
+      headers: {'Authorization':'Bearer '+apiKey, 'Content-Type':'application/json'},
+      body: JSON.stringify({mode}),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('cfg-rotation-msg', d.error?.message || 'Failed.', false); return; }
+    setMsg('cfg-rotation-msg', 'Saved rotation mode.', true);
+    showRestartBanner();
+  } catch(e) { setMsg('cfg-rotation-msg', 'Network error: ' + e.message, false); }
+}
+
 // ── restart ───────────────────────────────────────────────────────────────────
-function showRestartBanner() { document.getElementById('restart-banner').classList.add('show'); }
+function showRestartBanner() {
+  document.getElementById('restart-banner').classList.add('show');
+  setStep('step-restart', false, 'needed');
+}
 function dismissBanner() { document.getElementById('restart-banner').classList.remove('show'); }
 
 async function doRestart() {
@@ -3732,6 +3937,7 @@ async function doRestart() {
     await fetch('/v1/config/restart', {method:'POST', headers:{'Authorization':'Bearer '+apiKey}});
   } catch(e) { /* the process may already be going down mid-response — expected */ }
   dismissBanner();
+  setStep('step-restart', true, 'restarting');
   setHeader(false, 'restarting…');
   stop();
   // Poll /health until it responds again, then resume normal operation.
@@ -4482,6 +4688,24 @@ def config_feature(name):
     enabled = bool(body.get("enabled"))
     _env_write_line(addon["env"], addon["on"] if enabled else addon["off"])
     return jsonify({"name": name, "enabled": enabled, "restart_required": True})
+
+
+@app.route("/v1/config/rotation", methods=["POST"])
+def config_rotation():
+    """Set key rotation mode from the dashboard. Body: {"mode": "round-robin"|"sequential"}."""
+    err = _auth_check()
+    if err:
+        return err
+    body = request.get_json(force=True, silent=True) or {}
+    mode = (body.get("mode") or "").strip().lower()
+    aliases = {"roundrobin": "round-robin", "round_robin": "round-robin", "rr": "round-robin",
+               "seq": "sequential"}
+    mode = aliases.get(mode, mode)
+    if mode not in ("round-robin", "sequential"):
+        return jsonify({"error": {"message": "mode must be 'round-robin' or 'sequential'",
+                                  "type": "invalid_request_error"}}), 400
+    _env_write_line("ROTATION_MODE", mode)
+    return jsonify({"mode": mode, "restart_required": True})
 
 
 @app.route("/v1/config/restart", methods=["POST"])

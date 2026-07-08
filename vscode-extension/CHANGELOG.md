@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.1
+
+- **Friendlier dashboard for non-technical users.** The VS Code sidebar now opens with a
+  plain health summary, quick actions, key/error/token/spend cards, and a provider attention
+  list instead of a dense table.
+- Keeps advanced configuration in the browser dashboard while making the in-editor panel easier
+  to understand at a glance.
+
 ## 0.9.0
 
 - **Simplified the extension — all configuration moved to the web dashboard.** The in-editor

@@ -10,14 +10,16 @@ export interface ProviderStatus {
   models?: string[];
   supports_tools?: boolean;
   reasoning?: boolean;
-  keys?: { key_tail: string; status: string; ready_in: number }[];
+  cost_usd?: number;
+  tokens?: number;
+  keys?: { key_tail: string; status: string; ready_in: number; requests?: number }[];
   breaker?: { open?: boolean };
-  stats?: { total_requests?: number; error_rate?: number; errors?: number };
+  stats?: { total_requests?: number; error_rate?: number; errors?: number; avg_latency_ms?: number };
 }
 
 export interface RouterStatus {
   providers: Record<string, ProviderStatus>;
-  cache?: { enabled?: boolean; hit_rate?: number; size?: number; max_size?: number };
+  cache?: { enabled?: boolean; hit_rate?: number; size?: number; max_size?: number; semantic?: { enabled?: boolean; hits?: number } };
   rotation?: { mode?: string };
 }
 
