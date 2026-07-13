@@ -67,7 +67,7 @@ subscription) logins are stored separately under `codex_accounts` (via
 |---|---|---|
 | `PORT` | `8319` | Port to listen on |
 | `HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` to listen on localhost only (recommended on a shared/VPS host — reach it via localhost or an SSH tunnel). Keep `0.0.0.0` for Docker. |
-| `PROXY_API_KEYS` | `sk-router-1` | Comma-separated keys your app uses to authenticate |
+| `PROXY_API_KEYS` | *(auto-generated)* | Comma-separated keys your app uses to authenticate — and the key needed to open the web dashboard. If left unset (or on the `.env.example` placeholder), the router generates a real random key on first boot and saves it back to `.env`, logging it once. Add more from the dashboard's **Access Keys** page, or set your own here. |
 | `ROUTER_AUTH_FILE` | `./auth.json` | Where keys are stored |
 | `CACHE_TTL_SECONDS` | `300` | Response cache lifetime (`0` disables). Entries are namespaced per API key, so different `PROXY_API_KEYS` never share a cached answer — safe for multi-tenant use |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |

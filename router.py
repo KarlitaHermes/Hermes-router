@@ -22,7 +22,7 @@ Quick start:
   python router.py
 """
 
-import json, os, time, threading, logging, hashlib, hmac, itertools, re, sqlite3, subprocess
+import json, os, time, threading, logging, hashlib, hmac, itertools, re, sqlite3, subprocess, secrets
 from pathlib import Path
 from collections import deque, OrderedDict, defaultdict
 from flask import Flask, request, jsonify, Response, stream_with_context, redirect
@@ -67,7 +67,48 @@ PORT              = int(os.environ.get("PORT", 8319))
 # to expose the router to localhost only — recommended on a shared/VPS host where
 # you reach it via localhost or an SSH tunnel rather than a public port.
 HOST              = os.environ.get("HOST", "0.0.0.0")
-PROXY_API_KEYS    = [k.strip() for k in os.environ.get("PROXY_API_KEYS", "sk-router-1").split(",") if k.strip()]
+
+# Well-known placeholder values shipped in .env.example / the old hardcoded
+# fallback. PROXY_API_KEYS now gates real config-write power (add provider keys,
+# mint/revoke access keys, restart) via the dashboard, not just chat — so an
+# install left on one of these would share a publicly-documented credential with
+# every other install that never edited it. See _ensure_real_proxy_key below.
+_KNOWN_DEFAULT_PROXY_KEYS = {"sk-router-1", "sk-my-router-key-1"}
+
+
+def _ensure_real_proxy_key(env_path: str = ".env") -> list[str]:
+    """If no PROXY_API_KEYS is set, or it's still one of the placeholder values
+    above, generate a real random key and persist it to .env — so every install
+    gets a unique dashboard/API secret on first boot without the operator needing
+    to remember to change it. A no-op once a real key is in place."""
+    raw = os.environ.get("PROXY_API_KEYS", "").strip()
+    current = [k.strip() for k in raw.split(",") if k.strip()]
+    if current and not all(k in _KNOWN_DEFAULT_PROXY_KEYS for k in current):
+        return current   # already a real, user-set key (or keys) — leave it alone
+
+    new_key = "sk-router-" + secrets.token_urlsafe(24)
+    p = Path(env_path)
+    lines = p.read_text().splitlines() if p.exists() else []
+    found, out = False, []
+    for line in lines:
+        if line.strip().startswith("PROXY_API_KEYS="):
+            out.append(f"PROXY_API_KEYS={new_key}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"PROXY_API_KEYS={new_key}")
+    p.write_text("\n".join(out) + "\n")
+    os.environ["PROXY_API_KEYS"] = new_key
+    log.warning("=" * 72)
+    log.warning("No unique proxy API key was configured — generated one and saved")
+    log.warning(f"it to {env_path}. Use this to access the dashboard and the API:")
+    log.warning(f"    {new_key}")
+    log.warning("=" * 72)
+    return [new_key]
+
+
+PROXY_API_KEYS    = _ensure_real_proxy_key()
 ROUTER_MODEL      = os.environ.get("ROUTER_MODEL_ID", "hermes-router")
 CACHE_TTL         = int(os.environ.get("CACHE_TTL_SECONDS", 300))   # 0 = disabled
 CACHE_MAX_SIZE    = int(os.environ.get("CACHE_MAX_SIZE", 100))
@@ -792,6 +833,88 @@ def _auth_json_add_key(provider: str, key: str) -> tuple[bool, int]:
     except OSError:
         pass
     return True, len(keys)
+
+
+# ── Proxy (access) key management ───────────────────────────────────────────────
+# "Proxy keys" are the credential CALLERS use to authenticate to the router
+# itself (PROXY_API_KEYS) — distinct from provider keys above, which the router
+# uses to authenticate to upstream providers. Lets the dashboard mint new keys
+# for teammates/other apps, with optional per-key budgets, without hand-editing
+# .env/auth.json. Same proxy-key auth as every other /v1/config/* endpoint —
+# this project has one flat admin tier, not per-key permission levels.
+
+def _generate_proxy_key() -> str:
+    """A new, cryptographically random proxy key. Shown once at creation time —
+    only its last-6-char tail is ever displayed again, matching every other key
+    in this codebase."""
+    return "sk-router-" + secrets.token_urlsafe(24)
+
+
+def _read_proxy_api_keys_live() -> list[str]:
+    """Fresh-read PROXY_API_KEYS from .env (not the process's stale in-memory
+    PROXY_API_KEYS global), so a just-created/revoked key is reflected in the
+    dashboard immediately, before a restart makes it actually active."""
+    raw = _env_read_line("PROXY_API_KEYS")
+    if raw is None:
+        return list(PROXY_API_KEYS)   # .env has no override line — use the running default
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    return keys or list(PROXY_API_KEYS)
+
+
+def _read_proxy_keys_meta() -> dict:
+    """Fresh-read auth.json's proxy_keys metadata (name + limits per key)."""
+    if not AUTH_FILE.exists():
+        return {}
+    try:
+        doc = json.loads(AUTH_FILE.read_text())
+    except Exception:
+        return {}
+    pk = doc.get("proxy_keys", {})
+    return pk if isinstance(pk, dict) else {}
+
+
+def _write_proxy_key_meta(key: str, patch: dict) -> None:
+    """Merge `patch` into auth.json's proxy_keys[key] (creating it if absent)."""
+    doc = {}
+    if AUTH_FILE.exists():
+        try:
+            doc = json.loads(AUTH_FILE.read_text())
+        except Exception:
+            doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    pk = doc.setdefault("proxy_keys", {})
+    spec = pk.get(key, {})
+    spec.update(patch)
+    pk[key] = spec
+    AUTH_FILE.write_text(json.dumps(doc, indent=2) + "\n")
+    try:
+        os.chmod(AUTH_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _delete_proxy_key_meta(key: str) -> None:
+    if not AUTH_FILE.exists():
+        return
+    try:
+        doc = json.loads(AUTH_FILE.read_text())
+    except Exception:
+        return
+    if not isinstance(doc, dict):
+        return
+    pk = doc.get("proxy_keys")
+    if isinstance(pk, dict) and pk.pop(key, None) is not None:
+        AUTH_FILE.write_text(json.dumps(doc, indent=2) + "\n")
+        try:
+            os.chmod(AUTH_FILE, 0o600)
+        except OSError:
+            pass
+
+
+def _resolve_proxy_key_by_tail(tail: str, keys: list[str]) -> str | None:
+    matches = [k for k in keys if k[-6:] == tail]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _trigger_restart(delay_s: float = 1.2) -> None:
@@ -1876,6 +1999,30 @@ def _load_key_limits() -> dict:
 
 KEY_LIMITS    = _load_key_limits()
 KEY_LIMITS_ON = any(any(v.values()) for v in KEY_LIMITS.values())
+
+
+def _load_key_provider_scope() -> dict:
+    """Per-key provider allow-list (auth.json's proxy_keys[key].allowed_providers),
+    set from the dashboard's Access Keys page. None = unrestricted (the default —
+    backward compatible with every key that predates this feature); a set means
+    that key's requests may only route through those providers."""
+    per_key = {}
+    if AUTH_FILE.exists():
+        try:
+            doc = json.loads(AUTH_FILE.read_text())
+            pk = doc.get("proxy_keys", {})
+            if isinstance(pk, dict):
+                per_key = pk
+        except Exception:
+            pass
+    scope = {}
+    for k in PROXY_API_KEYS:
+        allowed = (per_key.get(k) or {}).get("allowed_providers")
+        scope[k] = set(allowed) if isinstance(allowed, list) and allowed else None
+    return scope
+
+
+KEY_PROVIDER_SCOPE = _load_key_provider_scope()
 
 
 def _utc_day() -> str:
@@ -3050,7 +3197,36 @@ header h1 span{color:var(--accent)}
   background:var(--surface2);color:var(--text);transition:.15s}
 .btn:hover{border-color:var(--accent);color:var(--accent)}
 
-main{padding:18px 20px;display:grid;gap:16px;max-width:1180px;margin:0 auto}
+/* ── app shell / sidebar ── */
+.app-shell{display:flex;align-items:stretch;min-height:100vh}
+.sidebar{width:200px;flex:0 0 auto;background:var(--surface);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:16px 0;position:sticky;top:0;align-self:flex-start;
+  height:100vh}
+.sidebar-brand{padding:0 16px 14px;font-size:15px;font-weight:600;letter-spacing:.3px;
+  border-bottom:1px solid var(--border);margin-bottom:12px}
+.sidebar-brand span{color:var(--accent)}
+.sidebar-nav{display:flex;flex-direction:column;gap:2px;padding:0 8px}
+.nav-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;
+  text-align:left;padding:9px 10px;border-radius:7px;border:none;background:transparent;
+  color:var(--muted);font-size:12.5px;font-family:inherit;cursor:pointer;transition:.15s}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{background:var(--surface2);color:var(--accent);font-weight:600}
+.nav-item .nav-dot{width:6px;height:6px;border-radius:50%;background:var(--border);flex:0 0 auto}
+.nav-item .nav-dot.warn{background:var(--yellow);box-shadow:0 0 4px var(--yellow)}
+.nav-item .nav-dot.bad{background:var(--red);box-shadow:0 0 4px var(--red)}
+.app-main{flex:1;min-width:0;display:flex;flex-direction:column}
+@media(max-width:760px){
+  .app-shell{flex-direction:column}
+  .sidebar{width:100%;height:auto;position:static;flex-direction:row;overflow-x:auto;padding:10px 8px}
+  .sidebar-brand{display:none}
+  .sidebar-nav{flex-direction:row}
+  .nav-item{white-space:nowrap}
+}
+
+main{padding:18px 20px;display:grid;gap:16px;max-width:1180px;margin:0 auto;width:100%}
+.page{display:none}
+.page.active{display:grid;gap:16px}
+.page-intro{color:var(--muted);line-height:1.45}
 
 /* ── key input overlay ── */
 #key-gate{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;
@@ -3172,6 +3348,14 @@ tr:hover td{background:rgba(108,140,255,.04)}
 .addon-name{font-size:12px;font-weight:600}
 .addon-desc{font-size:11px;color:var(--muted);line-height:1.4}
 
+/* ── provider scope picker ── */
+.scope-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px;
+  margin:6px 0}
+.scope-item{display:flex;align-items:center;gap:6px;font-size:12px;padding:5px 8px;
+  border:1px solid var(--border);border-radius:6px;background:var(--surface2);cursor:pointer}
+.scope-item input{margin:0}
+.scope-item .cnt{color:var(--muted);font-size:10px;margin-left:auto}
+
 /* ── restart banner ── */
 #restart-banner{display:none;align-items:center;justify-content:space-between;gap:12px;
   padding:10px 20px;background:rgba(250,204,21,.1);border-bottom:1px solid var(--yellow)}
@@ -3182,6 +3366,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
 /* ── config forms ── */
 .config-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:14px}
 @media(max-width:820px){.config-grid{grid-template-columns:1fr}}
+.config-grid.narrow{grid-template-columns:1fr;max-width:440px}
 .config-intro{padding:12px 14px 0;color:var(--muted);line-height:1.45}
 .config-form{display:flex;flex-direction:column;gap:8px}
 .config-form label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
@@ -3225,235 +3410,344 @@ tr:hover td{background:rgba(108,140,255,.04)}
   </div>
 </div>
 
-<header>
-  <h1><span>Hermes</span> Router &mdash; Dashboard</h1>
-  <div class="header-right">
-    <div class="badge"><div class="dot" id="hdr-dot"></div><span id="hdr-status">connecting</span></div>
-    <span id="last-update"></span>
-    <button class="btn" onclick="refresh()">↺ Refresh</button>
-  </div>
-</header>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span>Hermes</span> Router</div>
+    <nav class="sidebar-nav" id="sidebar-nav">
+      <button class="nav-item active" data-page="overview" onclick="showPage('overview')">Overview</button>
+      <button class="nav-item" data-page="providers" onclick="showPage('providers')"><span>Providers</span><span class="nav-dot" id="nav-dot-providers"></span></button>
+      <button class="nav-item" data-page="keys" onclick="showPage('keys')">Provider Keys</button>
+      <button class="nav-item" data-page="access" onclick="showPage('access')">Access Keys</button>
+      <button class="nav-item" data-page="models" onclick="showPage('models')">Models</button>
+      <button class="nav-item" data-page="addons" onclick="showPage('addons')">Add-ons</button>
+      <button class="nav-item" data-page="logs" onclick="showPage('logs')">Request Log</button>
+    </nav>
+  </aside>
 
-<div id="restart-banner">
-  <span>⚠ Config changed — restart the router to apply it.</span>
-  <div class="actions">
-    <button class="btn" onclick="dismissBanner()">Later</button>
-    <button class="btn" onclick="doRestart()" style="border-color:var(--yellow);color:var(--yellow)">↻ Restart Now</button>
+  <div class="app-main">
+    <header>
+      <h1><span>Hermes</span> Router &mdash; Dashboard</h1>
+      <div class="header-right">
+        <div class="badge"><div class="dot" id="hdr-dot"></div><span id="hdr-status">connecting</span></div>
+        <span id="last-update"></span>
+        <button class="btn" onclick="refresh()">↺ Refresh</button>
+      </div>
+    </header>
+
+    <div id="restart-banner">
+      <span>⚠ Config changed — restart the router to apply it.</span>
+      <div class="actions">
+        <button class="btn" onclick="dismissBanner()">Later</button>
+        <button class="btn" onclick="doRestart()" style="border-color:var(--yellow);color:var(--yellow)">↻ Restart Now</button>
+      </div>
+    </div>
+
+    <main>
+
+      <!-- ── Overview ─────────────────────────────────────────────────────── -->
+      <section class="page active" id="page-overview">
+        <section class="overview-grid">
+          <div class="hero">
+            <div class="hero-top">
+              <div>
+                <h2 id="plain-title">Checking router...</h2>
+                <div class="hero-copy" id="plain-message">Loading status from Hermes Router.</div>
+              </div>
+              <div class="hero-state warn" id="plain-state">checking</div>
+            </div>
+            <div class="quick-grid">
+              <div class="quick-card">
+                <div class="quick-label">API endpoint</div>
+                <div class="quick-value mono" id="quick-endpoint">/v1</div>
+                <div class="quick-sub">Use this as the OpenAI base URL.</div>
+              </div>
+              <div class="quick-card">
+                <div class="quick-label">Model name</div>
+                <div class="quick-value mono" id="quick-model">hermes-router</div>
+                <div class="quick-sub">Send this model from your app.</div>
+              </div>
+              <div class="quick-card">
+                <div class="quick-label">Spend</div>
+                <div class="quick-value" id="quick-spend">-</div>
+                <div class="quick-sub">Estimated since last restart.</div>
+              </div>
+            </div>
+          </div>
+          <div class="setup-card">
+            <h3>Setup checklist</h3>
+            <div class="setup-list">
+              <div class="setup-step" id="step-key"><span class="step-dot"></span><strong>Provider key</strong><span id="step-key-text">checking</span></div>
+              <div class="setup-step" id="step-health"><span class="step-dot"></span><strong>Provider health</strong><span id="step-health-text">checking</span></div>
+              <div class="setup-step" id="step-restart"><span class="step-dot"></span><strong>Restart</strong><span id="step-restart-text">not needed</span></div>
+            </div>
+            <div class="setup-actions">
+              <button class="btn" onclick="showPage('keys')">Add key</button>
+              <button class="btn" onclick="doRestart()">Restart</button>
+              <button class="btn" onclick="refresh()">Refresh</button>
+            </div>
+          </div>
+        </section>
+
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Usage Summary</span></div>
+          <div class="panel-body pad">
+            <div class="stat-row" id="stat-row">
+              <div class="stat-card"><div class="label">Providers</div><div class="value" id="s-providers">—</div><div class="sub" id="s-providers-sub"></div></div>
+              <div class="stat-card"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div><div class="sub">since last restart</div></div>
+              <div class="stat-card"><div class="label">Total Requests</div><div class="value" id="s-requests">—</div><div class="sub" id="s-requests-sub"></div></div>
+              <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="s-tokens">—</div><div class="sub" id="s-cost"></div></div>
+              <div class="stat-card"><div class="label">Cache Hit Rate</div><div class="value" id="s-hitrate">—</div><div class="sub" id="s-cache-sub"></div></div>
+              <div class="stat-card"><div class="label">Error Rate</div><div class="value" id="s-errrate">—</div><div class="sub" id="s-errrate-sub"></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Providers ────────────────────────────────────────────────────── -->
+      <section class="page" id="page-providers">
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Provider Health</span><span class="muted">attention first</span></div>
+          <div class="provider-grid" id="provider-card-grid"></div>
+        </div>
+
+        <details class="panel advanced-panel">
+          <summary class="panel-header"><span class="panel-title">Advanced Provider Details</span></summary>
+          <div class="panel-body">
+            <table>
+              <thead><tr>
+                <th>Provider</th><th>Model</th><th>Rating</th>
+                <th class="right">Requests</th><th class="right">Errors</th>
+                <th class="right">Err %</th><th class="right">Avg Latency</th>
+                <th class="right">Tokens</th><th class="right">Cost (USD)</th>
+                <th>Keys</th><th>Breaker</th><th>Status</th>
+              </tr></thead>
+              <tbody id="provider-tbody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
+      <!-- ── Provider Keys ────────────────────────────────────────────────── -->
+      <section class="page" id="page-keys">
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Provider Key Setup</span></div>
+          <div class="page-intro" style="padding:12px 14px 0">Keys the router uses to call upstream providers (Gemini, OpenAI, …) — not the keys your own apps use to call the router (see Access Keys for that).</div>
+          <div class="config-grid">
+            <div class="config-form">
+              <label>Add API key</label>
+              <div class="row">
+                <select id="cfg-key-provider"></select>
+              </div>
+              <input id="cfg-key-value" type="password" placeholder="paste provider API key" autocomplete="off">
+              <div class="row">
+                <button class="btn" onclick="addKey()">Add key</button>
+              </div>
+              <div class="config-msg" id="cfg-key-msg"></div>
+            </div>
+
+            <div class="config-form">
+              <label>Key rotation</label>
+              <select id="cfg-rotation-value">
+                <option value="round-robin">Spread requests across keys</option>
+                <option value="sequential">Use one key before the next</option>
+              </select>
+              <div class="row">
+                <button class="btn" onclick="setRotation()">Save rotation mode</button>
+              </div>
+              <div class="default-hint">Round-robin is best for most users because it spreads load across keys.</div>
+              <div class="config-msg" id="cfg-rotation-msg"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Key & Budget Usage</span></div>
+          <div class="panel-body">
+            <table>
+              <thead><tr>
+                <th>Key</th><th class="right">Requests</th>
+                <th class="right">Tokens (day)</th><th class="right">Cost (day)</th>
+                <th>RPM used</th>
+              </tr></thead>
+              <tbody id="keys-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Access Keys ──────────────────────────────────────────────────── -->
+      <section class="page" id="page-access">
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Create Access Key</span></div>
+          <div class="page-intro" style="padding:12px 14px 0">Generate a key for a teammate or another app to call this router with — separate from your own key, with its own optional usage caps.</div>
+          <div class="config-grid narrow">
+            <div class="config-form">
+              <label>Name (optional)</label>
+              <input id="ak-name" type="text" placeholder="e.g. Bob, CI pipeline">
+              <label style="margin-top:4px">Limits (optional — blank means unlimited)</label>
+              <div class="row">
+                <input id="ak-rpm" type="number" min="0" placeholder="requests / min">
+                <input id="ak-reqday" type="number" min="0" placeholder="requests / day">
+              </div>
+              <div class="row">
+                <input id="ak-tokday" type="number" min="0" placeholder="tokens / day">
+                <input id="ak-costday" type="number" min="0" step="0.01" placeholder="cost / day ($)">
+              </div>
+              <label style="margin-top:4px">Providers this key may use (none checked = all)</label>
+              <div class="scope-grid" id="ak-provider-scope"></div>
+              <div class="row">
+                <button class="btn" onclick="createAccessKey()">Create key</button>
+              </div>
+              <div class="config-msg" id="ak-create-msg"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" id="new-key-panel" style="display:none">
+          <div class="panel-header"><span class="panel-title">New Key — copy it now</span></div>
+          <div class="panel-body pad">
+            <p class="muted" style="margin-bottom:8px">This is the only time the full key is shown. It needs a router restart before it can be used.</p>
+            <div class="config-form">
+              <div class="row">
+                <input id="new-key-value" type="text" readonly class="mono" style="flex:1">
+                <button class="btn" onclick="copyNewKey()" style="flex:0 0 auto">Copy</button>
+                <button class="btn" onclick="dismissNewKey()" style="flex:0 0 auto">Done</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Access Keys</span></div>
+          <div class="panel-body">
+            <table>
+              <thead><tr>
+                <th>Name</th><th>Key</th><th class="right">RPM</th><th class="right">Req/day</th>
+                <th class="right">Tokens/day</th><th class="right">Cost/day</th>
+                <th class="right">Used today</th><th>Providers</th><th>Status</th><th></th>
+              </tr></thead>
+              <tbody id="access-keys-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Models ───────────────────────────────────────────────────────── -->
+      <section class="page" id="page-models">
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Provider Model</span></div>
+          <div class="page-intro" style="padding:12px 14px 0">Override which model a provider uses — comma-separate several models for per-model failover.</div>
+          <div class="config-grid narrow">
+            <div class="config-form">
+              <div class="row">
+                <select id="cfg-model-provider" onchange="onModelProviderChange()"></select>
+              </div>
+              <input id="cfg-model-value" type="text" placeholder="model or model1,model2,...">
+              <div class="default-hint" id="cfg-model-default"></div>
+              <div class="row">
+                <button class="btn" onclick="setModel()">Save model</button>
+                <button class="btn" onclick="resetModel()">Reset</button>
+              </div>
+              <div class="config-msg" id="cfg-model-msg"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Model Capabilities</span></div>
+          <div class="panel-body">
+            <table>
+              <thead><tr>
+                <th>Provider</th><th>Model</th><th>Rating</th><th>Tools</th><th>Reasoning</th>
+              </tr></thead>
+              <tbody id="model-caps-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Add-ons ──────────────────────────────────────────────────────── -->
+      <section class="page" id="page-addons">
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Feature Add-ons</span></div>
+          <div class="addon-grid" id="addon-grid"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header"><span class="panel-title">Cache</span></div>
+          <div class="panel-body">
+            <table>
+              <tbody id="cache-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Request Log ──────────────────────────────────────────────────── -->
+      <section class="page" id="page-logs">
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Live Request Log</span>
+            <div style="display:flex;gap:8px;align-items:center">
+              <select id="log-filter-status" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
+                <option value="">All statuses</option>
+                <option value="success">success</option>
+                <option value="error">error</option>
+                <option value="cache_hit">cache_hit</option>
+              </select>
+              <select id="log-filter-endpoint" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
+                <option value="">All endpoints</option>
+                <option value="chat">chat</option>
+                <option value="messages">messages</option>
+                <option value="embeddings">embeddings</option>
+              </select>
+            </div>
+          </div>
+          <div class="panel-body" id="log-wrap">
+            <table>
+              <thead><tr>
+                <th>Time</th><th>Endpoint</th><th>Provider</th><th>Model</th>
+                <th class="right">Latency</th><th class="right">Complexity</th>
+                <th class="right">Cascades</th><th class="right">Prompt tok</th>
+                <th class="right">Compl tok</th><th>Status</th>
+              </tr></thead>
+              <tbody id="log-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
   </div>
 </div>
-
-<main>
-  <section class="overview-grid">
-    <div class="hero">
-      <div class="hero-top">
-        <div>
-          <h2 id="plain-title">Checking router...</h2>
-          <div class="hero-copy" id="plain-message">Loading status from Hermes Router.</div>
-        </div>
-        <div class="hero-state warn" id="plain-state">checking</div>
-      </div>
-      <div class="quick-grid">
-        <div class="quick-card">
-          <div class="quick-label">API endpoint</div>
-          <div class="quick-value mono" id="quick-endpoint">/v1</div>
-          <div class="quick-sub">Use this as the OpenAI base URL.</div>
-        </div>
-        <div class="quick-card">
-          <div class="quick-label">Model name</div>
-          <div class="quick-value mono" id="quick-model">hermes-router</div>
-          <div class="quick-sub">Send this model from your app.</div>
-        </div>
-        <div class="quick-card">
-          <div class="quick-label">Spend</div>
-          <div class="quick-value" id="quick-spend">-</div>
-          <div class="quick-sub">Estimated since last restart.</div>
-        </div>
-      </div>
-    </div>
-    <div class="setup-card">
-      <h3>Setup checklist</h3>
-      <div class="setup-list">
-        <div class="setup-step" id="step-key"><span class="step-dot"></span><strong>Provider key</strong><span id="step-key-text">checking</span></div>
-        <div class="setup-step" id="step-health"><span class="step-dot"></span><strong>Provider health</strong><span id="step-health-text">checking</span></div>
-        <div class="setup-step" id="step-restart"><span class="step-dot"></span><strong>Restart</strong><span id="step-restart-text">not needed</span></div>
-      </div>
-      <div class="setup-actions">
-        <button class="btn" onclick="scrollToConfig()">Add key</button>
-        <button class="btn" onclick="doRestart()">Restart</button>
-        <button class="btn" onclick="refresh()">Refresh</button>
-      </div>
-    </div>
-  </section>
-
-  <!-- simple setup/configuration -->
-  <div class="panel" id="config-panel">
-    <div class="panel-header"><span class="panel-title">Setup</span></div>
-    <div class="config-intro">Most users only need this section: add a provider key, choose a model if you want, then restart.</div>
-    <div class="config-grid">
-
-      <div class="config-form">
-        <label>Add API key</label>
-        <div class="row">
-          <select id="cfg-key-provider"></select>
-        </div>
-        <input id="cfg-key-value" type="password" placeholder="paste provider API key" autocomplete="off">
-        <div class="row">
-          <button class="btn" onclick="addKey()">Add key</button>
-        </div>
-        <div class="config-msg" id="cfg-key-msg"></div>
-      </div>
-
-      <div class="config-form">
-        <label>Provider model</label>
-        <div class="row">
-          <select id="cfg-model-provider" onchange="onModelProviderChange()"></select>
-        </div>
-        <input id="cfg-model-value" type="text" placeholder="model or model1,model2,...">
-        <div class="default-hint" id="cfg-model-default"></div>
-        <div class="row">
-          <button class="btn" onclick="setModel()">Save model</button>
-          <button class="btn" onclick="resetModel()">Reset</button>
-        </div>
-        <div class="config-msg" id="cfg-model-msg"></div>
-      </div>
-
-      <div class="config-form">
-        <label>Key rotation</label>
-        <select id="cfg-rotation-value">
-          <option value="round-robin">Spread requests across keys</option>
-          <option value="sequential">Use one key before the next</option>
-        </select>
-        <div class="row">
-          <button class="btn" onclick="setRotation()">Save rotation mode</button>
-        </div>
-        <div class="default-hint">Round-robin is best for most users because it spreads load across keys.</div>
-        <div class="config-msg" id="cfg-rotation-msg"></div>
-      </div>
-
-    </div>
-  </div>
-
-  <!-- stat cards row -->
-  <details class="panel advanced-panel">
-    <summary class="panel-header"><span class="panel-title">Usage Summary</span></summary>
-    <div class="panel-body pad">
-      <div class="stat-row" id="stat-row">
-        <div class="stat-card"><div class="label">Providers</div><div class="value" id="s-providers">—</div><div class="sub" id="s-providers-sub"></div></div>
-        <div class="stat-card"><div class="label">Uptime</div><div class="value" id="s-uptime">—</div><div class="sub">since last restart</div></div>
-        <div class="stat-card"><div class="label">Total Requests</div><div class="value" id="s-requests">—</div><div class="sub" id="s-requests-sub"></div></div>
-        <div class="stat-card"><div class="label">Total Tokens</div><div class="value" id="s-tokens">—</div><div class="sub" id="s-cost"></div></div>
-        <div class="stat-card"><div class="label">Cache Hit Rate</div><div class="value" id="s-hitrate">—</div><div class="sub" id="s-cache-sub"></div></div>
-        <div class="stat-card"><div class="label">Error Rate</div><div class="value" id="s-errrate">—</div><div class="sub" id="s-errrate-sub"></div></div>
-      </div>
-    </div>
-  </details>
-
-  <div class="panel">
-    <div class="panel-header"><span class="panel-title">Provider Health</span><span class="muted">attention first</span></div>
-    <div class="provider-grid" id="provider-card-grid"></div>
-  </div>
-
-  <!-- provider health table -->
-  <details class="panel advanced-panel">
-    <summary class="panel-header"><span class="panel-title">Advanced Provider Details</span></summary>
-    <div class="panel-body">
-      <table>
-        <thead><tr>
-          <th>Provider</th><th>Model</th><th>Rating</th>
-          <th class="right">Requests</th><th class="right">Errors</th>
-          <th class="right">Err %</th><th class="right">Avg Latency</th>
-          <th class="right">Tokens</th><th class="right">Cost (USD)</th>
-          <th>Keys</th><th>Breaker</th><th>Status</th>
-        </tr></thead>
-        <tbody id="provider-tbody"></tbody>
-      </table>
-    </div>
-  </details>
-
-  <!-- live request log -->
-  <details class="panel advanced-panel">
-    <summary class="panel-header">
-      <span class="panel-title">Live Request Log</span>
-      <div style="display:flex;gap:8px;align-items:center">
-        <select id="log-filter-status" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
-          <option value="">All statuses</option>
-          <option value="success">success</option>
-          <option value="error">error</option>
-          <option value="cache_hit">cache_hit</option>
-        </select>
-        <select id="log-filter-endpoint" style="background:var(--surface);color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:2px 6px;font-size:11px">
-          <option value="">All endpoints</option>
-          <option value="chat">chat</option>
-          <option value="messages">messages</option>
-          <option value="embeddings">embeddings</option>
-        </select>
-      </div>
-    </summary>
-    <div class="panel-body" id="log-wrap">
-      <table>
-        <thead><tr>
-          <th>Time</th><th>Endpoint</th><th>Provider</th><th>Model</th>
-          <th class="right">Latency</th><th class="right">Complexity</th>
-          <th class="right">Cascades</th><th class="right">Prompt tok</th>
-          <th class="right">Compl tok</th><th>Status</th>
-        </tr></thead>
-        <tbody id="log-tbody"></tbody>
-      </table>
-    </div>
-  </details>
-
-  <!-- bottom advanced: cache+features | key usage -->
-  <details class="panel advanced-panel">
-    <summary class="panel-header"><span class="panel-title">Advanced Cache, Features & Key Usage</span></summary>
-    <div class="panel-body pad">
-      <div class="two-col">
-
-    <!-- cache stats + add-ons -->
-    <div style="display:grid;gap:16px">
-      <div class="panel">
-        <div class="panel-header"><span class="panel-title">Cache</span></div>
-        <div class="panel-body">
-          <table>
-            <tbody id="cache-tbody"></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="panel">
-        <div class="panel-header"><span class="panel-title">Feature Add-ons</span></div>
-        <div class="addon-grid" id="addon-grid"></div>
-      </div>
-    </div>
-
-    <!-- key usage -->
-    <div class="panel">
-      <div class="panel-header"><span class="panel-title">Key & Budget Usage</span></div>
-      <div class="panel-body">
-        <table>
-          <thead><tr>
-            <th>Key</th><th class="right">Requests</th>
-            <th class="right">Tokens (day)</th><th class="right">Cost (day)</th>
-            <th>RPM used</th>
-          </tr></thead>
-          <tbody id="keys-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-
-      </div><!-- /two-col -->
-    </div>
-  </details>
-
-</main>
 
 <script>
 // ── state ──────────────────────────────────────────────────────────────────────
 let apiKey = localStorage.getItem('hermes_dash_key') || '';
-let statusData = null, usageData = null, logsData = [];
+let statusData = null, usageData = null, logsData = [], accessKeysData = [];
+let editingKeyTail = null;
 let INTERVAL = 5000;
 let timer = null;
 
+// ── sidebar navigation ───────────────────────────────────────────────────────
+const PAGES = ['overview', 'providers', 'keys', 'access', 'models', 'addons', 'logs'];
+
+function showPage(name) {
+  if (!PAGES.includes(name)) name = 'overview';
+  document.querySelectorAll('.page').forEach(el => el.classList.toggle('active', el.id === 'page-' + name));
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.page === name));
+  location.hash = name;
+  window.scrollTo({top: 0});
+}
+
 // ── key gate ──────────────────────────────────────────────────────────────────
 (function init() {
+  const initial = (location.hash || '').replace('#', '');
+  if (PAGES.includes(initial)) showPage(initial);
+  window.addEventListener('hashchange', () => {
+    const h = (location.hash || '').replace('#', '');
+    if (PAGES.includes(h)) showPage(h);
+  });
   if (apiKey) { document.getElementById('key-gate').classList.add('hidden'); start(); }
   document.getElementById('key-input').addEventListener('keydown', e => { if (e.key==='Enter') submitKey(); });
 })();
@@ -3485,6 +3779,7 @@ async function refresh() {
       fetch('/v1/status', {headers:h}),
       fetch('/v1/usage',  {headers:h}),
       fetch(logUrl,       {headers:h}),
+      fetch('/v1/config/proxy-keys', {headers:h}),
     ]);
     // fetch() only rejects on network errors, not on HTTP 4xx/5xx — so a bad key
     // (401) would otherwise parse to an error body and render as all-zeros. Detect
@@ -3498,8 +3793,8 @@ async function refresh() {
     }
     if (resps.some(r => !r.ok)) { setHeader(false, 'HTTP ' + (resps.find(r=>!r.ok)||{}).status); return; }
 
-    const [s, u, l] = await Promise.all(resps.map(r => r.json()));
-    statusData = s; usageData = u; logsData = l.entries || [];
+    const [s, u, l, ak] = await Promise.all(resps.map(r => r.json()));
+    statusData = s; usageData = u; logsData = l.entries || []; accessKeysData = ak.keys || [];
     renderAll();
     setHeader(true);
   } catch(e) {
@@ -3532,6 +3827,8 @@ function setHeader(ok, detail) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+function esc(s){ return String(s==null?'':s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function attr(s){ return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 const fmt = {
   num:  n => n == null ? '—' : Number(n).toLocaleString(),
   tok:  n => { if (n==null||n===0) return '0'; if (n>=1e9) return (n/1e9).toFixed(1)+'B'; if (n>=1e6) return (n/1e6).toFixed(1)+'M'; if (n>=1e3) return (n/1e3).toFixed(1)+'K'; return String(n); },
@@ -3580,6 +3877,7 @@ function keyDots(keys) {
 // ── render all ────────────────────────────────────────────────────────────────
 function renderAll() {
   renderPlainOverview();
+  renderNavHealth();
   renderRotationForm();
   renderStats();
   renderProviderCards();
@@ -3588,6 +3886,19 @@ function renderAll() {
   renderCache();
   renderAddons();
   renderKeys();
+  renderAccessKeys();
+  renderModelCaps();
+}
+
+function renderNavHealth() {
+  const dot = document.getElementById('nav-dot-providers');
+  if (!dot || !statusData) return;
+  const vals = Object.values(statusData.providers || {});
+  const openBreakers = vals.filter(p => p.breaker?.open).length;
+  const totalReq = vals.reduce((a,p) => a + (p.stats?.total_requests || 0), 0);
+  const totalErr = vals.reduce((a,p) => a + (p.stats?.errors || 0), 0);
+  const errRate = totalReq ? totalErr / totalReq * 100 : 0;
+  dot.className = 'nav-dot' + (openBreakers ? ' bad' : errRate > 5 ? ' warn' : '');
 }
 
 function renderRotationForm() {
@@ -3640,10 +3951,6 @@ function setStep(id, done, text) {
   el.className = 'setup-step ' + (done ? 'done' : 'warn');
   const label = document.getElementById(id + '-text');
   if (label) label.textContent = text;
-}
-
-function scrollToConfig() {
-  document.getElementById('config-panel')?.scrollIntoView({behavior:'smooth', block:'start'});
 }
 
 function renderProviderCards() {
@@ -3855,7 +4162,25 @@ async function loadConfigProviders() {
     const modelSel = document.getElementById('cfg-model-provider');
     modelSel.innerHTML = configProviders.model_settable.map(p => `<option value="${p}">${p}</option>`).join('');
     onModelProviderChange();
+    renderProviderScopePicker();
+    renderAccessKeys();   // re-render now that provider names/counts are known
   } catch(e) { /* dashboard still usable without this */ }
+}
+
+// Providers a caller might sensibly scope an access key to — anything with a
+// live key count, or already model-settable (covers keyless "local"). Sorted
+// with the most-provisioned providers first, since those are the likely picks.
+function scopeableProviders() {
+  if (!configProviders) return [];
+  const counts = configProviders.key_counts || {};
+  const names = new Set([...Object.keys(counts), ...configProviders.model_settable]);
+  return [...names].sort((a,b) => (counts[b]||0) - (counts[a]||0) || a.localeCompare(b));
+}
+
+function renderProviderScopePicker() {
+  const grid = document.getElementById('ak-provider-scope');
+  if (!grid) return;
+  grid.innerHTML = renderScopeCheckboxes([]);
 }
 
 function onModelProviderChange() {
@@ -4002,6 +4327,174 @@ function renderKeys() {
     </tr>`;
   }).join('');
 }
+
+// ── access keys (proxy keys others use to call the router) ───────────────────
+function renderAccessKeys() {
+  const tbody = document.getElementById('access-keys-tbody');
+  if (!tbody) return;
+  if (!accessKeysData.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:18px">No access keys yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = accessKeysData.map(k => {
+    const tail = k.key_tail;
+    const lim = k.limits || {};
+    const used = k.usage || {};
+    const allowed = k.allowed_providers || [];
+    const statusPill = k.pending_restart
+      ? '<span class="pill pill-warn">pending restart</span>'
+      : '<span class="pill pill-ok">active</span>';
+
+    if (editingKeyTail === tail) {
+      return `<tr>
+        <td><input id="edit-name-${tail}" type="text" value="${attr(k.name||'')}" style="width:110px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px"></td>
+        <td class="mono muted">...${esc(tail)}</td>
+        <td class="right"><input id="edit-rpm-${tail}" type="number" min="0" value="${lim.rpm||''}" placeholder="∞" style="width:55px;text-align:right;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px"></td>
+        <td class="right"><input id="edit-reqday-${tail}" type="number" min="0" value="${lim.req_per_day||''}" placeholder="∞" style="width:65px;text-align:right;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px"></td>
+        <td class="right"><input id="edit-tokday-${tail}" type="number" min="0" value="${lim.tokens_per_day||''}" placeholder="∞" style="width:75px;text-align:right;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px"></td>
+        <td class="right"><input id="edit-costday-${tail}" type="number" min="0" step="0.01" value="${lim.cost_per_day||''}" placeholder="∞" style="width:65px;text-align:right;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 6px;font-size:11px"></td>
+        <td class="right muted">${fmt.num(used.req_today)}</td>
+        <td><div class="scope-grid" id="edit-scope-${tail}" style="min-width:180px">${renderScopeCheckboxes(allowed)}</div></td>
+        <td>${statusPill}</td>
+        <td style="white-space:nowrap"><button class="btn" onclick="saveEditAccessKey('${tail}')">Save</button> <button class="btn" onclick="cancelEditAccessKey()">Cancel</button></td>
+      </tr>`;
+    }
+    return `<tr>
+      <td>${esc(k.name || '—')}</td>
+      <td class="mono muted">...${esc(tail)}</td>
+      <td class="right">${lim.rpm || '∞'}</td>
+      <td class="right">${lim.req_per_day || '∞'}</td>
+      <td class="right">${lim.tokens_per_day ? fmt.tok(lim.tokens_per_day) : '∞'}</td>
+      <td class="right">${lim.cost_per_day ? fmt.usd(lim.cost_per_day) : '∞'}</td>
+      <td class="right muted">${fmt.num(used.req_today)}</td>
+      <td class="muted">${allowed.length ? esc(allowed.join(', ')) : 'all'}</td>
+      <td>${statusPill}</td>
+      <td style="white-space:nowrap"><button class="btn" onclick="startEditAccessKey('${tail}')">Edit</button> <button class="btn" onclick="revokeAccessKey('${tail}')">Revoke</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderScopeCheckboxes(selected) {
+  const sel = new Set(selected || []);
+  return scopeableProviders().map(name => {
+    const n = (configProviders && configProviders.key_counts || {})[name];
+    const cnt = n != null ? `<span class="cnt">${n} key${n===1?'':'s'}</span>` : '';
+    const checked = sel.has(name) ? ' checked' : '';
+    return `<label class="scope-item"><input type="checkbox" value="${attr(name)}"${checked}> ${esc(name)}${cnt}</label>`;
+  }).join('');
+}
+
+function startEditAccessKey(tail) { editingKeyTail = tail; renderAccessKeys(); }
+function cancelEditAccessKey() { editingKeyTail = null; renderAccessKeys(); }
+
+async function saveEditAccessKey(tail) {
+  const scopeEl = document.getElementById(`edit-scope-${tail}`);
+  const allowedProviders = scopeEl ? [...scopeEl.querySelectorAll('input:checked')].map(el => el.value) : [];
+  const body = {
+    name: document.getElementById(`edit-name-${tail}`).value,
+    rpm: document.getElementById(`edit-rpm-${tail}`).value,
+    req_per_day: document.getElementById(`edit-reqday-${tail}`).value,
+    tokens_per_day: document.getElementById(`edit-tokday-${tail}`).value,
+    cost_per_day: document.getElementById(`edit-costday-${tail}`).value,
+    allowed_providers: allowedProviders,
+  };
+  try {
+    const r = await fetch('/v1/config/proxy-keys/' + tail, {
+      method: 'POST',
+      headers: {'Authorization':'Bearer '+apiKey, 'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error?.message || 'Failed to save.'); return; }
+    editingKeyTail = null;
+    showRestartBanner();
+    await refresh();
+  } catch(e) { alert('Network error: ' + e.message); }
+}
+
+async function revokeAccessKey(tail) {
+  if (!confirm('Revoke access key ...' + tail + '? Anyone using it will lose access after the next restart.')) return;
+  try {
+    const r = await fetch('/v1/config/proxy-keys/' + tail, {
+      method: 'DELETE',
+      headers: {'Authorization':'Bearer '+apiKey},
+    });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error?.message || 'Failed to revoke.'); return; }
+    showRestartBanner();
+    await refresh();
+  } catch(e) { alert('Network error: ' + e.message); }
+}
+
+async function createAccessKey() {
+  const checked = [...document.querySelectorAll('#ak-provider-scope input:checked')].map(el => el.value);
+  const body = {
+    name: document.getElementById('ak-name').value,
+    rpm: document.getElementById('ak-rpm').value,
+    req_per_day: document.getElementById('ak-reqday').value,
+    tokens_per_day: document.getElementById('ak-tokday').value,
+    cost_per_day: document.getElementById('ak-costday').value,
+    allowed_providers: checked,
+  };
+  try {
+    const r = await fetch('/v1/config/proxy-keys', {
+      method: 'POST',
+      headers: {'Authorization':'Bearer '+apiKey, 'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { setMsg('ak-create-msg', d.error?.message || 'Failed to create key.', false); return; }
+    ['ak-name','ak-rpm','ak-reqday','ak-tokday','ak-costday'].forEach(id => document.getElementById(id).value = '');
+    document.querySelectorAll('#ak-provider-scope input:checked').forEach(el => el.checked = false);
+    setMsg('ak-create-msg', 'Key created.', true);
+    document.getElementById('new-key-value').value = d.key;
+    document.getElementById('new-key-panel').style.display = 'block';
+    document.getElementById('new-key-panel').scrollIntoView({behavior:'smooth', block:'nearest'});
+    showRestartBanner();
+    await refresh();
+  } catch(e) { setMsg('ak-create-msg', 'Network error: ' + e.message, false); }
+}
+
+function copyNewKey() {
+  const el = document.getElementById('new-key-value');
+  el.select();
+  navigator.clipboard?.writeText(el.value).catch(() => document.execCommand('copy'));
+}
+
+function dismissNewKey() {
+  document.getElementById('new-key-panel').style.display = 'none';
+  document.getElementById('new-key-value').value = '';
+}
+
+// ── model capabilities (per-provider, per-model rating/tools/reasoning) ──────
+function renderModelCaps() {
+  const tbody = document.getElementById('model-caps-tbody');
+  if (!tbody || !statusData) return;
+  const prov = statusData.providers || {};
+  const rows = [];
+  Object.entries(prov).forEach(([name, p]) => {
+    const caps = p.model_caps;
+    if (caps && caps.length) {
+      caps.forEach(mc => rows.push({provider: name, model: mc.model, rating: mc.rating,
+        tools: mc.supports_tools, reasoning: mc.reasoning}));
+    } else if (p.model) {
+      rows.push({provider: name, model: p.model, rating: p.rating,
+        tools: p.supports_tools, reasoning: p.reasoning});
+    }
+  });
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">No providers configured</td></tr>';
+    return;
+  }
+  rows.sort((a,b) => a.provider.localeCompare(b.provider) || (a.rating||9) - (b.rating||9));
+  tbody.innerHTML = rows.map(r => `<tr>
+    <td>${esc(r.provider)}</td>
+    <td class="mono muted">${esc(r.model||'—')}</td>
+    <td>${ratingPips(r.rating)}</td>
+    <td>${r.tools ? '<span class="pill pill-ok">yes</span>' : '<span class="pill pill-grey">no</span>'}</td>
+    <td>${r.reasoning ? '<span class="pill pill-ok">yes</span>' : '<span class="pill pill-grey">no</span>'}</td>
+  </tr>`).join('');
+}
 </script>
 </body>
 </html>
@@ -4121,6 +4614,18 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     enforce_vision = needs_vision and any(
         _model_supports_vision(c["provider"], c["model"]) for c in ordered)
 
+    # Provider scoping: an access key can be restricted to specific providers
+    # from the dashboard's Access Keys page. Unlike tool/vision detection above,
+    # this is an explicit admin restriction, not a heuristic — so there is
+    # deliberately NO safety-net fallback. If none of the caller's allowed
+    # providers are viable right now, the request should fail rather than
+    # silently route through a provider it was scoped away from.
+    caller_providers = None
+    try:
+        caller_providers = KEY_PROVIDER_SCOPE.get(_caller_token())
+    except RuntimeError:
+        pass  # called outside a request context (e.g. tests)
+
     # Circuit breaker: skip providers whose breaker is open. SAFETY — if EVERY
     # candidate is open, treat them all as half-open probes (skip none) so we
     # always make forward progress instead of hard-failing while options remain.
@@ -4137,6 +4642,11 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
         model    = cand["model"]
 
         if name in skip_providers:
+            continue
+
+        # Caller's access key is scoped to specific providers — skip anything else.
+        if caller_providers is not None and name not in caller_providers:
+            skip_providers.add(name)
             continue
 
         # Breaker open → skip the whole provider (unless all are open, then probe).
@@ -4638,6 +5148,10 @@ def config_providers():
         "key_settable": KEY_SETTABLE_PROVIDERS,
         "model_settable": list(PROVIDER_MODEL_ENV.keys()),
         "defaults": PROVIDER_MODEL_DEFAULT,
+        # Live key count per currently-configured provider, e.g. {"gemini": 6} —
+        # informational context for the Access Keys page's provider picker, not
+        # an enforced quota split (see monitoring docs on provider scoping).
+        "key_counts": {p["name"]: len(p.get("keys", [])) for p in PROVIDERS},
     })
 
 
@@ -4738,6 +5252,178 @@ def config_restart():
         return err
     _trigger_restart()
     return jsonify({"status": "restarting", "message": "Router restarting — this page will reconnect shortly."})
+
+
+def _parse_limit_fields(body: dict) -> tuple[dict, str | None]:
+    """Validate rpm/req_per_day/tokens_per_day/cost_per_day from a request body.
+    Returns (limits, error) — only includes fields the caller actually sent, so a
+    partial update doesn't zero out fields left unset (0 itself is a valid,
+    meaningful 'unlimited' value and is kept distinct from 'not provided')."""
+    out: dict = {}
+    for f in ("rpm", "req_per_day", "tokens_per_day"):
+        if f in body and body[f] not in (None, ""):
+            try:
+                v = int(body[f])
+            except (TypeError, ValueError):
+                return {}, f"'{f}' must be a whole number"
+            if v < 0:
+                return {}, f"'{f}' must not be negative"
+            out[f] = v
+    if "cost_per_day" in body and body["cost_per_day"] not in (None, ""):
+        try:
+            v = float(body["cost_per_day"])
+        except (TypeError, ValueError):
+            return {}, "'cost_per_day' must be a number"
+        if v < 0:
+            return {}, "'cost_per_day' must not be negative"
+        out["cost_per_day"] = v
+    return out, None
+
+
+def _parse_allowed_providers(body: dict) -> tuple[dict, str | None]:
+    """Validate 'allowed_providers' from a request body. Returns a patch dict
+    (empty if the field wasn't sent at all — leaves any existing value untouched
+    on an update) and an error message or None. An explicit empty list / null
+    means 'unrestricted', matching KEY_PROVIDER_SCOPE's loader semantics."""
+    if "allowed_providers" not in body:
+        return {}, None
+    val = body["allowed_providers"] or []
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        return {}, "'allowed_providers' must be a list of provider names"
+    known = set(PROVIDER_MODEL_ENV.keys())
+    unknown = [x for x in val if x not in known]
+    if unknown:
+        return {}, f"unknown provider(s): {', '.join(unknown)}"
+    return {"allowed_providers": val}, None
+
+
+@app.route("/v1/config/proxy-keys")
+def config_list_proxy_keys():
+    """List every proxy (access) key — the credential CALLERS use to authenticate
+    to this router, distinct from the provider keys under /v1/config/keys. Shows
+    tail, optional name, limits, and live usage. Reads fresh from .env/auth.json
+    (not the process's own stale PROXY_API_KEYS) so a just-created or just-revoked
+    key shows immediately, flagged pending until a restart actually applies it."""
+    err = _auth_check()
+    if err:
+        return err
+    live_keys = _read_proxy_api_keys_live()
+    meta = _read_proxy_keys_meta()
+    active_now = set(PROXY_API_KEYS)
+    out = []
+    for k in live_keys:
+        spec = meta.get(k, {})
+        out.append({
+            "key_tail": k[-6:],
+            "name": spec.get("name", ""),
+            "limits": {
+                "rpm":            spec.get("rpm", 0) or 0,
+                "req_per_day":    spec.get("req_per_day", 0) or 0,
+                "tokens_per_day": spec.get("tokens_per_day", 0) or 0,
+                "cost_per_day":   spec.get("cost_per_day", 0) or 0,
+            },
+            "allowed_providers": spec.get("allowed_providers") or [],
+            "usage": key_usage.snapshot(k),
+            "pending_restart": k not in active_now,
+        })
+    return jsonify({"keys": out})
+
+
+@app.route("/v1/config/proxy-keys", methods=["POST"])
+def config_create_proxy_key():
+    """Mint a new proxy key for a teammate/other app to call the router with.
+    Body: {"name": "...", "rpm": N, "req_per_day": N, "tokens_per_day": N,
+    "cost_per_day": N, "allowed_providers": ["gemini",...]} — all optional;
+    omitted limits fall back to the PROXY_LIMIT_* env defaults (0/unset =
+    unlimited); an empty/omitted allowed_providers means unrestricted (can use
+    any configured provider). Returns the plaintext key ONCE — like every other
+    key in this codebase, only its tail is shown again."""
+    err = _auth_check()
+    if err:
+        return err
+    body = request.get_json(force=True, silent=True) or {}
+    name = str(body.get("name") or "").strip()[:80]
+    if "\n" in name or "\r" in name:
+        return jsonify({"error": {"message": "name must not contain newlines", "type": "invalid_request_error"}}), 400
+    limits, verr = _parse_limit_fields(body)
+    if verr:
+        return jsonify({"error": {"message": verr, "type": "invalid_request_error"}}), 400
+    scope, serr = _parse_allowed_providers(body)
+    if serr:
+        return jsonify({"error": {"message": serr, "type": "invalid_request_error"}}), 400
+
+    live_keys = _read_proxy_api_keys_live()
+    new_key = _generate_proxy_key()
+    while new_key in live_keys:   # astronomically unlikely; stay correct anyway
+        new_key = _generate_proxy_key()
+    live_keys.append(new_key)
+    _env_write_line("PROXY_API_KEYS", ",".join(live_keys))
+
+    patch = {**limits, **scope}
+    if name:
+        patch["name"] = name
+    if patch:
+        _write_proxy_key_meta(new_key, patch)
+
+    return jsonify({"key": new_key, "key_tail": new_key[-6:], "name": name,
+                    "limits": limits, "allowed_providers": scope.get("allowed_providers", []),
+                    "restart_required": True})
+
+
+@app.route("/v1/config/proxy-keys/<tail>", methods=["POST"])
+def config_update_proxy_key(tail):
+    """Update the name/limits of an existing proxy key, found by its last-6-char
+    tail. Body: same shape as create. Only fields present in the body change —
+    others keep their current value."""
+    err = _auth_check()
+    if err:
+        return err
+    live_keys = _read_proxy_api_keys_live()
+    key = _resolve_proxy_key_by_tail(tail, live_keys)
+    if not key:
+        return jsonify({"error": {"message": f"no proxy key ending in '{tail}'",
+                                  "type": "invalid_request_error"}}), 404
+
+    body = request.get_json(force=True, silent=True) or {}
+    limits, verr = _parse_limit_fields(body)
+    if verr:
+        return jsonify({"error": {"message": verr, "type": "invalid_request_error"}}), 400
+    scope, serr = _parse_allowed_providers(body)
+    if serr:
+        return jsonify({"error": {"message": serr, "type": "invalid_request_error"}}), 400
+
+    patch = {**limits, **scope}
+    if "name" in body:
+        name = str(body.get("name") or "").strip()[:80]
+        if "\n" in name or "\r" in name:
+            return jsonify({"error": {"message": "name must not contain newlines",
+                                      "type": "invalid_request_error"}}), 400
+        patch["name"] = name
+    if patch:
+        _write_proxy_key_meta(key, patch)
+    return jsonify({"key_tail": tail, "restart_required": True})
+
+
+@app.route("/v1/config/proxy-keys/<tail>", methods=["DELETE"])
+def config_delete_proxy_key(tail):
+    """Revoke a proxy key so it can no longer authenticate to the router.
+    Refuses to remove the last remaining key — that would lock everyone out,
+    including whoever is using the dashboard right now."""
+    err = _auth_check()
+    if err:
+        return err
+    live_keys = _read_proxy_api_keys_live()
+    key = _resolve_proxy_key_by_tail(tail, live_keys)
+    if not key:
+        return jsonify({"error": {"message": f"no proxy key ending in '{tail}'",
+                                  "type": "invalid_request_error"}}), 404
+    if len(live_keys) <= 1:
+        return jsonify({"error": {"message": "can't delete the last proxy key — you'd lock yourself out",
+                                  "type": "invalid_request_error"}}), 400
+    live_keys.remove(key)
+    _env_write_line("PROXY_API_KEYS", ",".join(live_keys))
+    _delete_proxy_key_meta(key)
+    return jsonify({"key_tail": tail, "revoked": True, "restart_required": True})
 
 
 @app.route("/v1/status")

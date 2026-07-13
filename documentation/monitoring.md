@@ -11,22 +11,32 @@ http://localhost:8319/          # redirects to the dashboard
 http://localhost:8319/dashboard
 ```
 
-On first load it asks for your proxy API key (one of `PROXY_API_KEYS`) and remembers it in
-the browser's local storage. The page then auto-refreshes every 5 seconds and shows:
+On first load it asks for your proxy API key (one of `PROXY_API_KEYS` — see
+[below](#proxy-api-keys--the-dashboard-key) if you don't have one yet) and remembers it in the
+browser's local storage. It's a full control panel, not just a read-only view — a left sidebar
+splits it into pages, refreshed every 5 seconds:
 
-- **Summary cards** — providers online, uptime, total requests, tokens + estimated spend,
-  cache hit-rate, and live error rate
-- **Provider health** — per-provider requests, errors, error %, latency, tokens, cost,
-  key pool (ready/cooling), circuit-breaker state, and a health pill
-- **Live request log** — the last requests (endpoint, provider, model, latency, complexity
-  score, cascade count, tokens, status), filterable by status and endpoint
-- **Cache & add-ons** — hit/miss counts, semantic cache, persistence, and which optional
-  features are on
-- **Key & budget usage** — per-key requests, daily tokens/cost, and RPM headroom
+- **Overview** — a plain-language status card, the endpoint/model to point your app at, a
+  setup checklist, and summary stats (requests, tokens, spend, cache hit-rate, error rate)
+- **Providers** — health cards (worst-first) plus a detailed table (rating, latency, keys,
+  breaker state, cost)
+- **Provider Keys** — add a key for any provider, set the key-rotation mode, and see live
+  per-key request counts and daily budget usage
+- **Access Keys** — mint new `PROXY_API_KEYS` for teammates/other apps, with optional rate/
+  budget limits, and revoke them — see
+  [below](#proxy-api-keys--the-dashboard-key)
+- **Models** — override a provider's model(s), and a capability table (rating, tool support,
+  reasoning) for every configured model
+- **Add-ons** — toggle optional features on/off, plus live cache stats
+- **Request Log** — the last requests (endpoint, provider, model, latency, complexity score,
+  cascade count, tokens, status), filterable by status and endpoint
 
-It's pure HTML/JS (no framework, no external CDN, ~25 KB) and reads only the existing
-`/v1/status`, `/v1/usage`, and `/v1/logs` endpoints — so it adds essentially no memory or CPU
-to the router itself.
+Every write (add a key, change a model, toggle an add-on, mint/revoke an access key) shows a
+"Restart Required" banner — click it to restart the router in place; the page reconnects
+automatically once it's back.
+
+It's pure HTML/JS (no framework, no external CDN) and reads/writes only the router's own
+`/v1/*` endpoints — so it adds essentially no memory or CPU to the router itself.
 
 > **Accessing it remotely.** By default the router binds to `0.0.0.0` (all interfaces). If you
 > set `HOST=127.0.0.1` (localhost-only, recommended on a shared/VPS host), reach the dashboard
@@ -36,6 +46,26 @@ to the router itself.
 
 From **VS Code**, the extension's dashboard panel has a **⬈ Web dashboard** button (and a globe
 icon in the panel header) that opens this page in your browser.
+
+## Proxy API keys & the dashboard key
+
+`PROXY_API_KEYS` is the credential your app uses to call the router **and** the key that unlocks
+the web dashboard — there's only one tier, no separate "admin" vs. "chat" key. If you never set
+one, the router generates a real random key on first boot and saves it to `.env`, logging it once
+so you can copy it (this also replaces the placeholder value `.env.example` ships with, so
+copying that file verbatim doesn't leave every install on the same public default). Once you have
+one real key, it's left alone — nothing regenerates it out from under you.
+
+**Adding more keys** — for a teammate, a CI pipeline, or another app — is done from the
+dashboard's **Access Keys** page: give it an optional name and optional limits (requests/min,
+requests/day, tokens/day, cost/day — blank means unlimited), and it generates a new key. **The
+full key is shown exactly once**, in a copy box — after that, only its last 6 characters are ever
+displayed again, matching every other key in this project. A key needs a restart (the dashboard
+prompts for one) before it can actually authenticate.
+
+Existing access keys can have their name/limits edited in place, or be revoked — revoking removes
+it from `PROXY_API_KEYS` so it can no longer authenticate. You can't revoke the last remaining
+key; that would lock out the dashboard itself.
 
 ## Terminal dashboard (`hr status`)
 

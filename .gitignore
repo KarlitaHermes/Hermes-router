@@ -5,6 +5,10 @@ auth.json
 # Runtime state (probe results / ratings cache) — regenerated on start
 router_state.json
 
+# Persistent response cache (CACHE_PERSIST=1) — can contain real prompt/response
+# content, never commit it
+cache.db
+
 # Python
 __pycache__/
 *.py[cod]
