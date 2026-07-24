@@ -1,0 +1,17 @@
+[Unit]
+Description=hermes-router — free-tier AI load balancer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=karla
+WorkingDirectory=/home/karla/.hermes/repos/Hermes-router
+ExecStart=/home/karla/.hermes/repos/Hermes-router/venv/bin/python /home/karla/.hermes/repos/Hermes-router/router.py
+Restart=always
+RestartSec=5
+Environment="HOME=/home/karla"
+Environment="PORT=8319"
+
+[Install]
+WantedBy=multi-user.target

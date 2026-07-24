@@ -1339,7 +1339,7 @@ def classify_complexity(messages: list) -> int:
 
 
 def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
-                       prefer_local: bool = False) -> list:
+                       prefer_local: bool = False, prefer_main: bool = False) -> list:
     """
     Rank every configured (provider, model) for this complexity: cheapest capable
     model first, then better same-price models, then too-weak as last resort. Never blocks. Returns
@@ -1369,7 +1369,11 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
         avail  = _provider_state.get(name, {}).get("available", True)
         fast   = 0 if (fast_first and name in _FAST_PROVIDERS) else 1
         # `:fast` profile: a short/casual turn prefers the local model first.
-        local_first = 0 if (prefer_local and name == "local" and complexity >= 3) else 1
+        local_first = 0 if (prefer_local and name == "local") else 1
+        # `:main` profile: prefer OpenRouter models (laguna → deepseek cascade)
+        main_first = 0 if (prefer_main and name == "openrouter") else 1
+        # Within OpenRouter, preserve list order so laguna is tried before deepseek
+        model_rank = cand["list_index"] if prefer_main and name == "openrouter" else 0
         # Health-aware terms — tier/sort_within stay FIRST so capability matching
         # is never overridden by health (a healthy weak model must not outrank the
         # correct-capability one). When every candidate is healthy these two terms
@@ -1387,7 +1391,7 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
         # local_first leads the key so a preferred local model sorts ahead of all
         # others on easy turns; it's a constant 1 otherwise, leaving order unchanged.
         # list_index trails so a provider's listed model order breaks rating ties.
-        return (local_first, tier, price, quality, sort_within, breaker_open, health,
+        return (local_first, main_first, model_rank, tier, price, quality, sort_within, breaker_open, health,
                 0 if avail else 1, fast, cand["list_index"])
 
     n = len(providers)
@@ -1566,7 +1570,16 @@ class CredentialPool:
     def get_key(self, provider_name: str, model: str) -> str | None:
         """Return a ready key for (provider, model) per the active mode, or None."""
         with self.lock:
-            pool = self.pools.get(provider_name, {}).get(model, deque())
+            pool = self.pools.get(provider_name, {}).get(model)
+            if pool is None:
+                # Model not registered (e.g. profile-swapped model name) — fall back
+                # to the first model's keys for this provider. Since keys are shared
+                # across models (same API key for different model strings), any model's
+                # deque will do.
+                fallback = next(iter(self.pools.get(provider_name, {}).values()), None)
+                if fallback is None:
+                    return None
+                pool = fallback
             now  = time.time()
             if self.mode == "sequential":
                 # Stay on the current key until it cools; only advance past cooling ones.
@@ -2751,7 +2764,9 @@ def _estimated_tokens(messages: list) -> int:
     return sum(len(_message_text(m)) for m in messages) // 4
 
 
-def _ordered_providers(payload: dict, prefer_local: bool = False) -> list[dict]:
+def _ordered_providers(payload: dict, prefer_local: bool = False,
+                       prefer_main: bool = False,
+                       providers_override: list[dict] | None = None) -> list[dict]:
     """
     Smart complexity-aware ordering: use cheapest capable model for simple
     tasks, best model for complex ones. With FAST_ROUTE_THRESHOLD set,
@@ -2759,8 +2774,10 @@ def _ordered_providers(payload: dict, prefer_local: bool = False) -> list[dict]:
     prefer_local (the `:fast` profile), a local model leads on easy turns.
     """
     messages   = payload.get("messages", [])
+    providers  = providers_override if providers_override is not None else PROVIDERS
     complexity = classify_complexity(messages)
-    ordered    = _get_smart_ordered(PROVIDERS, complexity, _estimated_tokens(messages), prefer_local)
+    ordered    = _get_smart_ordered(providers, complexity, _estimated_tokens(messages),
+                                    prefer_local, prefer_main=prefer_main)
     log.info(f"→ complexity={complexity} ({_COMPLEXITY_LABELS[complexity]}) "
              f"order={[c['provider']['name'] + '/' + c['model'] for c in ordered]}")
     return ordered
@@ -4538,6 +4555,8 @@ def models():
     # since that's what it routes short turns to.
     if any(p["name"] == "local" for p in PROVIDERS):
         data.append({"id": f"{ROUTER_MODEL}:fast", "object": "model", "owned_by": "hermes-router"})
+    # Always advertise :main profile (laguna → deepseek cascade)
+    data.append({"id": f"{ROUTER_MODEL}:main", "object": "model", "owned_by": "hermes-router"})
     return jsonify({"object": "list", "data": data})
 
 
@@ -4561,14 +4580,24 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     # prefers a local model for short/casual turns, with cloud as fallback. We
     # normalize the model back to the router id so the cache and upstream model
     # selection behave exactly like a default request.
+    # Routing profile: `hermes-router:main` uses the MAIN model list
+    # (laguna → deepseek cascade via OPENROUTER_MAIN_MODEL env var).
     prefer_local = False
-    if str(payload.get("model") or "").endswith(":fast"):
+    prefer_main = False
+    model_suffix = str(payload.get("model") or "").split(":")[-1]
+    if model_suffix == "fast":
         prefer_local = True
+        payload = {**payload, "model": ROUTER_MODEL}
+    elif model_suffix == "main":
+        prefer_main = True
         payload = {**payload, "model": ROUTER_MODEL}
     else:
         try:
-            if request.headers.get("X-Hermes-Profile", "").strip().lower() == "fast":
+            profile = request.headers.get("X-Hermes-Profile", "").strip().lower()
+            if profile == "fast":
                 prefer_local = True
+            elif profile == "main":
+                prefer_main = True
         except RuntimeError:
             pass  # called outside a request context (e.g. tests)
 
@@ -4594,7 +4623,25 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                     return ("json", hit)
 
     est_tokens = _estimated_tokens(messages)
-    ordered    = _ordered_providers(payload, prefer_local)
+
+    # `:main` profile: swap OpenRouter model to prio laguna then deepseek
+    if prefer_main:
+        main_models = os.environ.get("OPENROUTER_MAIN_MODEL",
+                                     "poolside/laguna-s-2.1:free,deepseek/deepseek-v4-flash")
+        log.info(f"[main profile] using models: {main_models}")
+        # Build a patched provider list with the main models for OpenRouter
+        patched = []
+        for p in PROVIDERS:
+            if p["name"] == "openrouter":
+                # Properly build models list from the comma-separated model string
+                main_models_list = [m.strip() for m in main_models.split(",") if m.strip()]
+                new_p = {**p, "model": main_models_list[0], "models": main_models_list}
+                patched.append(new_p)
+            else:
+                patched.append(p)
+        ordered = _ordered_providers(payload, prefer_local=False, prefer_main=True, providers_override=patched)
+    else:
+        ordered = _ordered_providers(payload, prefer_local)
 
     # Tool-aware routing: when the request carries tools, prefer (provider, model)
     # candidates whose MODEL actually supports function calling — otherwise a model
