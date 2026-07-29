@@ -370,6 +370,7 @@ MODEL_QUALITY_RANKS: dict = {
     "gemini-2.5-pro": 15, "gemini-2.5-flash": 35,
     "nemotron-3-ultra": 20, "nemotron-3-super": 35,
     "deepseek-v4": 30, "deepseek-v3": 40,
+    "ling-3.0": 35, "gemma-4-31b": 35,
     "llama-4": 35, "llama-3.3-70b": 45,
     "mistral-large": 40, "mistral-medium": 55,
     "command-a": 45, "gpt-oss-120b": 55,
@@ -468,6 +469,7 @@ def _build_providers() -> list[dict]:
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
             "model":    os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite"),
             "keys":     gemini_keys,
+            "context_window": 1048576,  # 1M tokens for Gemini
         })
 
     openrouter_keys = _keys_for("openrouter", "OPENROUTER_API_KEYS")
@@ -481,6 +483,7 @@ def _build_providers() -> list[dict]:
                 "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "https://github.com/Shaf2665/hermes-router"),
                 "X-Title":      os.environ.get("OPENROUTER_APP_NAME", "hermes-router"),
             },
+            "context_window": 262144,  # free tier limit for OpenRouter
         })
 
     sambanova_keys = _keys_for("sambanova", "SAMBANOVA_API_KEYS")
@@ -499,6 +502,7 @@ def _build_providers() -> list[dict]:
             "base_url": "https://models.inference.ai.azure.com",
             "model":    os.environ.get("GITHUB_MODELS_MODEL", "gpt-4o"),
             "keys":     github_keys,
+            "context_window": 128000,  # 128k for GitHub Models (GPT-4o)
         })
 
     cerebras_keys = _keys_for("cerebras", "CEREBRAS_API_KEYS")
@@ -508,6 +512,7 @@ def _build_providers() -> list[dict]:
             "base_url": "https://api.cerebras.ai/v1",
             "model":    os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b"),
             "keys":     cerebras_keys,
+            "context_window": 131072,  # 128k for Cerebras
         })
 
     groq_keys = _keys_for("groq", "GROQ_API_KEYS")
@@ -576,6 +581,7 @@ def _build_providers() -> list[dict]:
             "base_url": "https://router.huggingface.co/v1",
             "model":    os.environ.get("HUGGINGFACE_MODEL", "openai/gpt-oss-120b:cheapest"),
             "keys":     huggingface_keys,
+            "context_window": 131072,  # 128k for Hugging Face Router
         })
 
     # Kimi (Moonshot) — the "Kimi coding plan" subscription exposes an
@@ -1360,6 +1366,9 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
     stable, so equal-keyed candidates keep their (rotated) relative order.
     """
     fast_first = FAST_ROUTE_TOKENS > 0 and 0 < est_tokens < FAST_ROUTE_TOKENS
+    # Capture for nested _key — assigning to est_tokens inside _key would shadow
+    # this parameter and raise UnboundLocalError on every sort.
+    tok_count = est_tokens or 0
 
     def _key(cand):
         p      = cand["provider"]
@@ -1374,6 +1383,10 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
         main_first = 0 if (prefer_main and name == "openrouter") else 1
         # Within OpenRouter, preserve list order so laguna is tried before deepseek
         model_rank = cand["list_index"] if prefer_main and name == "openrouter" else 0
+        # Context window check: skip models that can't handle the estimated token count
+        context_window = p.get("context_window", 0)
+        if context_window > 0 and tok_count > context_window:
+            return (999,)  # Push to end — can't handle this context size
         # Health-aware terms — tier/sort_within stay FIRST so capability matching
         # is never overridden by health (a healthy weak model must not outrank the
         # correct-capability one). When every candidate is healthy these two terms
