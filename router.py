@@ -2209,6 +2209,64 @@ def _completion_has_output(data: dict) -> bool:
     return isinstance(choices, list) and any(_choice_has_output(c) for c in choices)
 
 
+def _sse_chunk_has_output(event: dict) -> bool:
+    """True when an OpenAI-format SSE chunk has user-visible content or a tool call.
+    Role-only / empty-content / finish_reason-only chunks (ling's common empty
+    reply shape) return False so the router can cascade before the client sees them."""
+    if not isinstance(event, dict):
+        return False
+    for choice in event.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") or {}
+        if not isinstance(delta, dict):
+            continue
+        if delta.get("tool_calls") or delta.get("function_call"):
+            return True
+        content = delta.get("content")
+        if isinstance(content, str) and content.strip():
+            return True
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str) and text.strip():
+                    return True
+    return False
+
+
+def _prepare_stream_with_output(gen):
+    """Peek an OpenAI-SSE generator until the first usable delta, or EOF.
+
+    Returns (True, replay_gen) when there is output — replay_gen yields the
+    buffered prefix then the rest of the upstream stream. Returns (False, None)
+    when the stream ends with no content/tool_calls (empty reply). The caller
+    must cascade in that case and must not forward anything to the client.
+    """
+    buffered = []
+    for chunk in gen:
+        buffered.append(chunk)
+        text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:") or line == "data: [DONE]":
+                continue
+            payload = line[5:].lstrip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except Exception:
+                continue
+            if _sse_chunk_has_output(event):
+                def _replay(_buf=buffered, _gen=gen):
+                    yield from _buf
+                    yield from _gen
+                return True, _replay()
+    return False, None
+
+
 def _streaming_generator(resp: requests.Response):
     """
     Yield SSE chunks with thinking fields stripped from delta objects.
@@ -4648,6 +4706,12 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
             if p["name"] == "openrouter":
                 # Properly build models list from the comma-separated model string
                 main_models_list = [m.strip() for m in main_models.split(",") if m.strip()]
+                # Profile models need their own pool buckets. Without this,
+                # get_key() falls back to another model's deque — a 429 that
+                # cools that bucket silently starves every later cascade entry
+                # (no "→ Trying" log, jumps straight to local / 503).
+                for m in main_models_list:
+                    pool.ensure_model("openrouter", m, p.get("keys") or [])
                 new_p = {**p, "model": main_models_list[0], "models": main_models_list}
                 patched.append(new_p)
             else:
@@ -4710,10 +4774,15 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
             continue
 
         # Breaker open → skip the whole provider (unless all are open, then probe).
+        # Exception: :main walks several OpenRouter models and ends on a paid one
+        # (deepseek). Free-tier 429/empty must not open-circuit away that fallback.
         if any_closed and stats.breaker_open(name):
-            log.info(f"⨂ skipping {name} (circuit open)")
-            skip_providers.add(name)
-            continue
+            if prefer_main and name == "openrouter":
+                log.info(f"⚠ {name} circuit open — still walking :main model list")
+            else:
+                log.info(f"⨂ skipping {name} (circuit open)")
+                skip_providers.add(name)
+                continue
 
         # Skip providers whose payload ceiling this request would exceed
         # (e.g. Groq's free TPM) — avoids a guaranteed 413 round-trip. Provider-wide.
@@ -4738,7 +4807,10 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
         for _ in range(attempts):
             key = pool.get_key(name, model)
             if not key:
-                break   # all keys for this (provider, model) are cooling → next candidate
+                # Next candidate — but log it. Silent break hid :main cascade
+                # bugs where unregistered profile models shared a cooled bucket.
+                log.info(f"⨂ skipping {name}/{model} (no ready keys)")
+                break
 
             log.info(f"→ Trying {name}/{model} ...{key[-6:]}")
             _req_ctx.attempts += 1
@@ -4809,18 +4881,19 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 skip_providers.add(name)
                 break
 
-            # Success
-            stats.record_success(name, elapsed)
-            stats.record_health(name, True)        # 2xx = healthy (half-open recovery)
-            log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
-            _req_ctx.provider = name
-            _req_ctx.model    = model
+            # 2xx — validate body/stream before committing success. Empty
+            # completions (ling especially) must cascade, not reach Hermes.
             is_anthropic = provider.get("protocol") == "anthropic"
             is_codex     = provider.get("protocol") == "codex"
             if is_codex:
                 # Codex backend always streams SSE. Stream it through, or
                 # aggregate it into one response for non-streaming clients.
                 if streaming:
+                    stats.record_success(name, elapsed)
+                    stats.record_health(name, True)
+                    log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+                    _req_ctx.provider = name
+                    _req_ctx.model    = model
                     return ("stream", _with_cleanup(resp, _codex_streaming_generator(resp)), name)
                 events = []
                 for raw in resp.iter_lines():
@@ -4835,17 +4908,36 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 data = _from_codex_response(events)
                 if not _completion_has_output(data):
                     stats.record_error(name)
-                    stats.record_health(name, False)
+                    # Model-level empty — same as 429: cool this model, try next.
+                    # Do NOT trip the provider breaker (would skip paid deepseek).
                     log.warning(f"  {name}/{model} empty completion — cascading")
                     pool.mark_rate_limited(name, key, model, retry_after=30)
                     break
+                stats.record_success(name, elapsed)
+                stats.record_health(name, True)
+                log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+                _req_ctx.provider = name
+                _req_ctx.model    = model
                 _add_provider_tokens(name, data, model)
                 cache.set(payload, data, ns, query_emb)
                 return ("json", data)
             if streaming:
                 gen = (_anthropic_streaming_generator(resp) if is_anthropic
                        else _streaming_generator(resp))
-                wrapped = _streaming_with_usage(_with_cleanup(resp, gen), name, model)
+                ok, peeked = _prepare_stream_with_output(gen)
+                if not ok:
+                    stats.record_error(name)
+                    # Empty stream (ling etc.) is model-level, not provider-down.
+                    log.warning(f"  {name}/{model} empty stream — cascading")
+                    pool.mark_rate_limited(name, key, model, retry_after=30)
+                    resp.close()
+                    break
+                stats.record_success(name, elapsed)
+                stats.record_health(name, True)
+                log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+                _req_ctx.provider = name
+                _req_ctx.model    = model
+                wrapped = _streaming_with_usage(_with_cleanup(resp, peeked), name, model)
                 return ("stream", wrapped, name)
             else:
                 try:
@@ -4861,7 +4953,6 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 # treat it as a provider failure, cool this (key,model), and cascade.
                 if not isinstance(data, dict) or not data.get("choices"):
                     stats.record_error(name)
-                    stats.record_health(name, False)
                     err = data.get("error") if isinstance(data, dict) else None
                     emsg = (err.get("message", "") if isinstance(err, dict)
                             else err if isinstance(err, str)
@@ -4870,7 +4961,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                     # resource-exhaustion error in an HTTP-200 body. That's expected under
                     # load and is fully handled here (cascade + per-key cooldown), so log it
                     # at debug to keep it out of the logs; only a genuinely unexpected empty
-                    # 2xx body warns.
+                    # 2xx body warns. Never trip the provider breaker here — :main must
+                    # still reach paid deepseek after free-tier empties.
                     _emsg_l = str(emsg).lower()
                     _transient = any(s in _emsg_l for s in (
                         "resourceexhausted", "resource exhausted", "request limit reached",
@@ -4881,10 +4973,14 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                     break
                 if not _completion_has_output(data):
                     stats.record_error(name)
-                    stats.record_health(name, False)
                     log.warning(f"  {name}/{model} empty completion — cascading")
                     pool.mark_rate_limited(name, key, model, retry_after=30)
                     break
+                stats.record_success(name, elapsed)
+                stats.record_health(name, True)
+                log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
+                _req_ctx.provider = name
+                _req_ctx.model    = model
                 if not is_anthropic:
                     _strip_response(data)
                 _add_provider_tokens(name, data, model)
