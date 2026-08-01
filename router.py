@@ -145,6 +145,11 @@ AUTH_FILE         = Path(os.environ.get("ROUTER_AUTH_FILE", "./auth.json"))  # r
 # writes. Set REQUEST_LOG_SIZE=0 to disable. Exposed via GET /v1/logs.
 REQUEST_LOG_SIZE  = max(0, int(os.environ.get("REQUEST_LOG_SIZE", "500")))
 
+# Upstream completion read timeout in seconds. Local/thinking models can take
+# minutes on a generation; default to 600s (10 min) so long local runs don't trip.
+# ponytail: single knob replaces three hardcoded (10,120) spots below.
+UPSTREAM_TIMEOUT  = int(os.environ.get("UPSTREAM_TIMEOUT", "600"))
+
 
 def _load_auth_json() -> dict[str, list[str]]:
     """Load provider API keys from auth.json — the router's own credential store,
@@ -1358,8 +1363,8 @@ def _get_smart_ordered(providers: list, complexity: int, est_tokens: int = 0,
     (list_index tie-break), so cheapest-first ordering still holds.
 
     When FAST_ROUTE_THRESHOLD is set and the request is shorter than it, low-latency
-    providers win ties. With prefer_local (the `:fast` profile), a configured local
-    model leads on easy turns (complexity ≥ 3), with cloud as fallback.
+    providers win ties. With prefer_local (the `:fast` profile), callers pass a
+    local-only provider list — ranking still prefers `local` first.
 
     Round-robin: the PROVIDER list is rotated by a per-request counter before
     flattening, so providers that tie on every criterion spread load; the sort is
@@ -2164,12 +2169,57 @@ def _add_provider_tokens(name: str, data: dict, model: str | None = None):
 # Some providers (e.g. Gemini 2.5) emit reasoning/thinking fields in responses.
 # These fields cause 400 errors on other providers (Groq, Cerebras, OpenRouter).
 # We strip them from both outgoing requests and incoming responses.
+# Gemma thinking renderers put the answer in `reasoning` with empty `content` —
+# promote that into content before stripping so the client still gets the reply.
+
+
+def _content_is_empty(content) -> bool:
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str) and text.strip():
+                    return False
+            elif isinstance(part, str) and part.strip():
+                return False
+        return True
+    return True
+
+
+def _reasoning_text(msg: dict) -> str:
+    """Pull visible answer text from reasoning/thinking fields (Gemma-style)."""
+    for field in ("reasoning", "reasoning_content", "thinking"):
+        r = msg.get(field)
+        if isinstance(r, str) and r.strip():
+            return r
+    rd = msg.get("reasoning_details")
+    if isinstance(rd, list):
+        parts = [b["text"] for b in rd
+                 if isinstance(b, dict) and isinstance(b.get("text"), str) and b["text"].strip()]
+        if parts:
+            return "\n".join(parts)
+    return ""
+
 
 def _strip_message(msg: dict):
-    """Remove thinking fields from a message dict in-place."""
+    """Remove thinking fields from a message dict in-place.
+
+    If content is empty but reasoning has text (Gemma), copy reasoning into
+    content first so upstream still receives the answer.
+    """
+    if _content_is_empty(msg.get("content")):
+        r = _reasoning_text(msg)
+        if r:
+            msg["content"] = r
     msg.pop("reasoning_content", None)
     msg.pop("reasoning", None)
+    msg.pop("thinking", None)
     msg.pop("think", None)
+    msg.pop("reasoning_details", None)
     if isinstance(msg.get("content"), list):
         msg["content"] = [
             b for b in msg["content"]
@@ -2187,21 +2237,15 @@ def _strip_response(data: dict):
 def _choice_has_output(choice: dict) -> bool:
     """True when a chat-completion choice contains user-visible output or a tool
     call. Empty assistant messages are treated as unusable so failover can try
-    another provider instead of caching a blank answer."""
+    another provider instead of caching a blank answer.
+    Gemma thinking renderers return the answer in `reasoning` with empty
+    `content` — that IS output, so count non-empty reasoning/details too."""
     msg = choice.get("message") or {}
     if msg.get("tool_calls"):
         return True
-    content = msg.get("content")
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text") or part.get("content")
-            if isinstance(text, str) and text.strip():
-                return True
-    return False
+    if not _content_is_empty(msg.get("content")):
+        return True
+    return bool(_reasoning_text(msg))
 
 
 def _completion_has_output(data: dict) -> bool:
@@ -2212,7 +2256,8 @@ def _completion_has_output(data: dict) -> bool:
 def _sse_chunk_has_output(event: dict) -> bool:
     """True when an OpenAI-format SSE chunk has user-visible content or a tool call.
     Role-only / empty-content / finish_reason-only chunks (ling's common empty
-    reply shape) return False so the router can cascade before the client sees them."""
+    reply shape) return False so the router can cascade before the client sees them.
+    Gemma may stream the answer in delta.reasoning with empty delta.content."""
     if not isinstance(event, dict):
         return False
     for choice in event.get("choices") or []:
@@ -2223,16 +2268,10 @@ def _sse_chunk_has_output(event: dict) -> bool:
             continue
         if delta.get("tool_calls") or delta.get("function_call"):
             return True
-        content = delta.get("content")
-        if isinstance(content, str) and content.strip():
+        if not _content_is_empty(delta.get("content")):
             return True
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                text = part.get("text") or part.get("content")
-                if isinstance(text, str) and text.strip():
-                    return True
+        if _reasoning_text(delta):
+            return True
     return False
 
 
@@ -2270,6 +2309,7 @@ def _prepare_stream_with_output(gen):
 def _streaming_generator(resp: requests.Response):
     """
     Yield SSE chunks with thinking fields stripped from delta objects.
+    Promotes reasoning→content when content is empty (Gemma-style) before strip.
     Buffers by newline to handle chunks that split across SSE boundaries.
     """
     buf = b""
@@ -2283,9 +2323,8 @@ def _streaming_generator(resp: requests.Response):
                     event = json.loads(line[6:])
                     for choice in event.get("choices", []):
                         delta = choice.get("delta", {})
-                        delta.pop("reasoning_content", None)
-                        delta.pop("reasoning", None)
-                        delta.pop("think", None)
+                        if isinstance(delta, dict):
+                            _strip_message(delta)
                     yield ("data: " + json.dumps(event) + "\n").encode("utf-8")
                     continue
                 except (json.JSONDecodeError, Exception):
@@ -3060,7 +3099,7 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
         hdrs = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
         try:
             return _HTTP.post("https://api.anthropic.com/v1/messages",
-                              headers=hdrs, json=body, stream=streaming, timeout=(10, 120))
+                              headers=hdrs, json=body, stream=streaming, timeout=(10, UPSTREAM_TIMEOUT))
         except requests.exceptions.RequestException as e:
             log.error(f"  Network error → anthropic: {e}")
             return None
@@ -3123,7 +3162,7 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
 
     url = provider["base_url"].rstrip("/") + "/chat/completions"
     try:
-        return _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, 120))
+        return _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, UPSTREAM_TIMEOUT))
     except requests.exceptions.RequestException as e:
         log.error(f"  Network error → {provider['name']}: {e}")
         return None
@@ -4648,9 +4687,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     _req_ctx.attempts  = 0   # total forward() calls made (cascades = attempts-1)
 
     # Routing profile: `hermes-router:fast` (or header X-Hermes-Profile: fast)
-    # prefers a local model for short/casual turns, with cloud as fallback. We
-    # normalize the model back to the router id so the cache and upstream model
-    # selection behave exactly like a default request.
+    # is local-only (Ollama/LM Studio) — no cloud fallback. Caller (Hermes)
+    # handles failure. Normalize model back to the router id for cache/upstream.
     # Routing profile: `hermes-router:main` uses the MAIN model list
     # (laguna → deepseek cascade via OPENROUTER_MAIN_MODEL env var).
     prefer_local = False
@@ -4717,8 +4755,15 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
             else:
                 patched.append(p)
         ordered = _ordered_providers(payload, prefer_local=False, prefer_main=True, providers_override=patched)
+    elif prefer_local:
+        # `:fast` — Ollama/local only. No OpenRouter/nemotron cascade.
+        local_only = [p for p in PROVIDERS if p["name"] == "local"]
+        if not local_only:
+            return ("error", {"error": {"message": "hermes-router:fast requires LOCAL_BASE_URL/LOCAL_MODEL",
+                                        "type": "router_error"}}, 503)
+        ordered = _ordered_providers(payload, prefer_local=True, providers_override=local_only)
     else:
-        ordered = _ordered_providers(payload, prefer_local)
+        ordered = _ordered_providers(payload, prefer_local=False)
 
     # Tool-aware routing: when the request carries tools, prefer (provider, model)
     # candidates whose MODEL actually supports function calling — otherwise a model
