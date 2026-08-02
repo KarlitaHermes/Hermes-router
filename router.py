@@ -2205,13 +2205,15 @@ def _reasoning_text(msg: dict) -> str:
     return ""
 
 
-def _strip_message(msg: dict):
+def _strip_message(msg: dict, *, promote_reasoning: bool = True):
     """Remove thinking fields from a message dict in-place.
 
-    If content is empty but reasoning has text (Gemma), copy reasoning into
-    content first so upstream still receives the answer.
+    If content is empty but reasoning has text (model answered only via
+    reasoning — Gemma and some cloud models), copy reasoning into content
+    first so the client still gets the reply. Callers that process mid-stream
+    deltas must pass promote_reasoning=False (CoT arrives before content).
     """
-    if _content_is_empty(msg.get("content")):
+    if promote_reasoning and _content_is_empty(msg.get("content")):
         r = _reasoning_text(msg)
         if r:
             msg["content"] = r
@@ -2228,18 +2230,19 @@ def _strip_message(msg: dict):
 
 
 def _strip_response(data: dict):
-    """Strip thinking fields from a non-streaming response before returning it."""
+    """Strip thinking fields from a non-streaming response before returning it.
+    Promotes reasoning→content when the model left content empty."""
     for choice in data.get("choices", []):
         if "message" in choice:
-            _strip_message(choice["message"])
+            _strip_message(choice["message"], promote_reasoning=True)
 
 
 def _choice_has_output(choice: dict) -> bool:
     """True when a chat-completion choice contains user-visible output or a tool
     call. Empty assistant messages are treated as unusable so failover can try
     another provider instead of caching a blank answer.
-    Gemma thinking renderers return the answer in `reasoning` with empty
-    `content` — that IS output, so count non-empty reasoning/details too."""
+    Reasoning-only replies (empty content) count as output — the strip step
+    will promote that text into content before the client sees it."""
     msg = choice.get("message") or {}
     if msg.get("tool_calls"):
         return True
@@ -2254,10 +2257,9 @@ def _completion_has_output(data: dict) -> bool:
 
 
 def _sse_chunk_has_output(event: dict) -> bool:
-    """True when an OpenAI-format SSE chunk has user-visible content or a tool call.
-    Role-only / empty-content / finish_reason-only chunks (ling's common empty
-    reply shape) return False so the router can cascade before the client sees them.
-    Gemma may stream the answer in delta.reasoning with empty delta.content."""
+    """True when an OpenAI-format SSE chunk has user-visible content, a tool call,
+    or reasoning (reasoning-only models; streaming promotes at end if content
+    never arrives). Role-only / empty chunks return False so we can cascade."""
     if not isinstance(event, dict):
         return False
     for choice in event.get("choices") or []:
@@ -2307,31 +2309,82 @@ def _prepare_stream_with_output(gen):
 
 
 def _streaming_generator(resp: requests.Response):
-    """
-    Yield SSE chunks with thinking fields stripped from delta objects.
-    Promotes reasoning→content when content is empty (Gemma-style) before strip.
-    Buffers by newline to handle chunks that split across SSE boundaries.
-    """
+    """Yield raw SSE line chunks from upstream (no mutation)."""
     buf = b""
     for raw_chunk in resp.iter_content(chunk_size=None):
         buf += raw_chunk
         while b"\n" in buf:
             line_bytes, buf = buf.split(b"\n", 1)
             line = line_bytes.decode("utf-8", errors="replace")
+            yield (line + "\n").encode("utf-8")
+    if buf:
+        yield buf
+
+
+def _strip_streaming_chunks(gen):
+    """Strip thinking fields from an SSE byte stream.
+
+    Mid-stream: never promote reasoning→content (cloud CoT streams with empty
+    content first — promoting each chunk would leak thinking into content).
+    Accumulate reasoning; if the stream finishes with no content at all, emit
+    one content delta with the buffered reasoning (reasoning-only models).
+    """
+    reasoning_parts: list[str] = []
+    saw_content = False
+    pending = b""
+
+    def _flush_reasoning_chunk():
+        nonlocal reasoning_parts
+        if saw_content or not reasoning_parts:
+            reasoning_parts = []
+            return None
+        text = "".join(reasoning_parts)
+        reasoning_parts = []
+        if not text.strip():
+            return None
+        event = {"choices": [{"index": 0, "delta": {"content": text}}]}
+        return ("data: " + json.dumps(event) + "\n").encode("utf-8")
+
+    for chunk in gen:
+        pending += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+        while b"\n" in pending:
+            line_bytes, pending = pending.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace")
+            if line.strip() == "data: [DONE]":
+                flushed = _flush_reasoning_chunk()
+                if flushed:
+                    yield flushed
+                yield (line + "\n").encode("utf-8")
+                continue
             if line.startswith("data: ") and line != "data: [DONE]":
                 try:
                     event = json.loads(line[6:])
+                    finishing = False
                     for choice in event.get("choices", []):
+                        if choice.get("finish_reason"):
+                            finishing = True
                         delta = choice.get("delta", {})
                         if isinstance(delta, dict):
-                            _strip_message(delta)
+                            r = _reasoning_text(delta)
+                            if r:
+                                reasoning_parts.append(r)
+                            if not _content_is_empty(delta.get("content")):
+                                saw_content = True
+                            _strip_message(delta, promote_reasoning=False)
+                    if finishing:
+                        flushed = _flush_reasoning_chunk()
+                        if flushed:
+                            yield flushed
                     yield ("data: " + json.dumps(event) + "\n").encode("utf-8")
                     continue
                 except (json.JSONDecodeError, Exception):
                     pass
             yield (line + "\n").encode("utf-8")
-    if buf:
-        yield buf
+    flushed = _flush_reasoning_chunk()
+    if flushed:
+        yield flushed
+    if pending:
+        yield pending
 
 
 def _with_cleanup(resp: requests.Response, gen):
@@ -4982,7 +5035,8 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
                 _req_ctx.provider = name
                 _req_ctx.model    = model
-                wrapped = _streaming_with_usage(_with_cleanup(resp, peeked), name, model)
+                out = peeked if is_anthropic else _strip_streaming_chunks(peeked)
+                wrapped = _streaming_with_usage(_with_cleanup(resp, out), name, model)
                 return ("stream", wrapped, name)
             else:
                 try:
