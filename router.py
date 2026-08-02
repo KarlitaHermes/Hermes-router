@@ -2328,10 +2328,17 @@ def _strip_streaming_chunks(gen):
     content first — promoting each chunk would leak thinking into content).
     Accumulate reasoning; if the stream finishes with no content at all, emit
     one content delta with the buffered reasoning (reasoning-only models).
+
+    Every rewritten `data:` event is terminated with a blank line (`\\n\\n`).
+    SSE joins consecutive data lines until a blank line — omitting it makes
+    the OpenAI SDK json.loads two events as one → Extra data: line 2 column 1.
     """
     reasoning_parts: list[str] = []
     saw_content = False
     pending = b""
+
+    def _sse_data(event: dict) -> bytes:
+        return ("data: " + json.dumps(event) + "\n\n").encode("utf-8")
 
     def _flush_reasoning_chunk():
         nonlocal reasoning_parts
@@ -2342,8 +2349,7 @@ def _strip_streaming_chunks(gen):
         reasoning_parts = []
         if not text.strip():
             return None
-        event = {"choices": [{"index": 0, "delta": {"content": text}}]}
-        return ("data: " + json.dumps(event) + "\n").encode("utf-8")
+        return _sse_data({"choices": [{"index": 0, "delta": {"content": text}}]})
 
     for chunk in gen:
         pending += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
@@ -2354,7 +2360,7 @@ def _strip_streaming_chunks(gen):
                 flushed = _flush_reasoning_chunk()
                 if flushed:
                     yield flushed
-                yield (line + "\n").encode("utf-8")
+                yield b"data: [DONE]\n\n"
                 continue
             if line.startswith("data: ") and line != "data: [DONE]":
                 try:
@@ -2375,10 +2381,11 @@ def _strip_streaming_chunks(gen):
                         flushed = _flush_reasoning_chunk()
                         if flushed:
                             yield flushed
-                    yield ("data: " + json.dumps(event) + "\n").encode("utf-8")
+                    yield _sse_data(event)
                     continue
                 except (json.JSONDecodeError, Exception):
                     pass
+            # Pass through comments / blank lines (blank lines keep upstream framing)
             yield (line + "\n").encode("utf-8")
     flushed = _flush_reasoning_chunk()
     if flushed:
