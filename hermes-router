@@ -21,11 +21,17 @@
 #   hr service status|uninstall       Show / remove the boot service
 #   hr start                          Run the router (same as: python router.py)
 #   hr status                         Live health dashboard for the running router
+#   hr enroll <provider> <model>      Fingerprint a model and save its adapter profile
+#   hr enroll list                    Show enrolled vs configured models
+#   hr enroll check                   Run enrollment self-check (no network)
 #   hr restart                        Restart the router so key/config changes take effect
 #   hr doctor                         Diagnose installation issues
 #   hr update [--check]               Update to the latest version (safe; auto-rollback)
 #   hr version                        Show the installed version
 #   hr help                           Show all commands
+#
+# Enrollment tip: prefer offline `hr enroll` / staging PORT=8320 before flipping
+# ENROLLMENT_ADAPTERS=1 on production (:8319). Optional: HERMES_ROUTER_URL for API enroll.
 #
 # Install with ./install.sh — creates venv, installs deps, and puts `hr` on PATH.
 #
@@ -77,6 +83,52 @@ case "$cmd" in
     ;;
   status)
     exec "$REPO/scripts/status.sh" "$@"
+    ;;
+  enroll)
+    sub="${1:-}"
+    case "$sub" in
+      list)
+        shift 2>/dev/null || true
+        exec "$PYTHON" -m enrollment list "$@"
+        ;;
+      check|self-check)
+        shift 2>/dev/null || true
+        exec "$PYTHON" -m enrollment check "$@"
+        ;;
+      "")
+        echo "usage: hr enroll <provider> <model> | hr enroll list | hr enroll check" >&2
+        exit 2
+        ;;
+      *)
+        # Offline battery (no running router required). Prefer this for staging.
+        # To hit a live router API instead: HERMES_ROUTER_URL=http://127.0.0.1:8320 hr enroll …
+        if [ -n "${HERMES_ROUTER_URL:-}" ]; then
+          provider="$1"; model="$2"
+          if [ -z "${provider:-}" ] || [ -z "${model:-}" ]; then
+            echo "usage: HERMES_ROUTER_URL=… hr enroll <provider> <model>" >&2
+            exit 2
+          fi
+          key="${PROXY_API_KEY:-${HERMES_ROUTER_KEY:-}}"
+          if [ -z "$key" ]; then
+            # fall back to first PROXY_API_KEYS entry from .env if present
+            key="$("$PYTHON" -c "
+import os
+from pathlib import Path
+p=Path('$REPO')/'.env'
+if p.exists():
+  for line in p.read_text().splitlines():
+    if line.startswith('PROXY_API_KEYS='):
+      print(line.split('=',1)[1].split(',')[0].strip()); break
+")"
+          fi
+          exec curl -sS -X POST "${HERMES_ROUTER_URL%/}/v1/enroll" \
+            -H "Authorization: Bearer ${key}" \
+            -H "Content-Type: application/json" \
+            -d "{\"provider\":\"$provider\",\"model\":\"$model\"}"
+        fi
+        exec "$PYTHON" -m enrollment enroll "$@"
+        ;;
+    esac
     ;;
   restart)
     exec "$REPO/scripts/restart.sh" "$@"

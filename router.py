@@ -141,6 +141,34 @@ if ROTATION_MODE not in ("round-robin", "sequential"):
 STATE_FILE        = Path(os.environ.get("ROUTER_STATE_FILE", "./router_state.json"))
 STATE_TTL_HOURS   = int(os.environ.get("ROUTER_STATE_TTL_HOURS", 24))  # 0 = re-probe every start
 AUTH_FILE         = Path(os.environ.get("ROUTER_AUTH_FILE", "./auth.json"))  # router's own key store
+# Per-model enrollment adapters (see enrollment.py). Default OFF so production
+# egress stays on the legacy strip path until staging is verified.
+ENROLLMENT_ADAPTERS = os.environ.get("ENROLLMENT_ADAPTERS", "0").strip().lower() not in (
+    "0", "", "false", "no", "off",
+)
+_enrollment_warned: set[tuple[str, str]] = set()
+
+
+def _parse_named_profiles() -> dict[str, str]:
+    """Optional test/staging map: name=model;name2=model2
+    Enables hermes-router:<name> to pin a single upstream model.
+    Model ids may contain ':' (e.g. …:free) — use '=' between name and model."""
+    raw = os.environ.get("ROUTER_NAMED_PROFILES", "").strip()
+    out: dict[str, str] = {}
+    if not raw:
+        return out
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, model = part.partition("=")
+        name, model = name.strip(), model.strip()
+        if name and model:
+            out[name] = model
+    return out
+
+
+_NAMED_PROFILES = _parse_named_profiles()
 # In-memory request log: last N requests kept in a ring buffer. Pure RAM, no disk
 # writes. Set REQUEST_LOG_SIZE=0 to disable. Exposed via GET /v1/logs.
 REQUEST_LOG_SIZE  = max(0, int(os.environ.get("REQUEST_LOG_SIZE", "500")))
@@ -2205,14 +2233,82 @@ def _reasoning_text(msg: dict) -> str:
     return ""
 
 
-def _strip_message(msg: dict, *, promote_reasoning: bool = True):
+# Models (esp. ling after a contaminated history) sometimes emit chat-template
+# / tool-XML debris as the first tokens of content. Strip leading junk so
+# Hermes doesn't store/echo `</role>` / `<arg_value>` forever.
+# ponytail: leading-only strip; mid-content DSML/tool XML still possible —
+# promote those to tool_calls if they start showing up as visible replies.
+# Keep token list in sync with enrollment._JUNK_TOKEN_LITERALS.
+_LEADING_TEMPLATE_JUNK = re.compile(
+    r"^(?:\s*(?:"
+    r"</role>|<\|im_end\|>|<\|im_start\|>\s*assistant\s*|"
+    r"<\|endoftext\|>|"
+    r"</s>|<end_of_turn>|<eos>|"
+    r"</?arg_value>|</?arg_key>|"
+    r'">|》《'
+    r"))+",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_content_text(text: str) -> str:
+    if not text:
+        return text
+    return _LEADING_TEMPLATE_JUNK.sub("", text)
+
+
+# runnable check — fails import if the strip regresses
+assert _sanitize_content_text("<arg_value>🌤️ Warsaw morning") == "🌤️ Warsaw morning"
+assert _sanitize_content_text('</role>">ok') == "ok"
+assert _sanitize_content_text("<arg_value>\">done") == "done"
+assert _sanitize_content_text("<|endoftext|>ok") == "ok"
+assert _sanitize_content_text("》《ok") == "ok"
+
+
+def _sanitize_message_content(msg: dict) -> None:
+    content = msg.get("content")
+    if isinstance(content, str):
+        cleaned = _sanitize_content_text(content)
+        if cleaned != content:
+            msg["content"] = cleaned
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                part["text"] = _sanitize_content_text(part["text"])
+
+
+def _adapter_steps_for(provider: str | None, model: str | None) -> list[str] | None:
+    """When ENROLLMENT_ADAPTERS is on, return composed steps for this model.
+    None means callers must use the legacy strip path (flag off)."""
+    if not ENROLLMENT_ADAPTERS or not provider or not model:
+        return None
+    import enrollment as _enr
+    enrolled = _enr.is_enrolled(provider, model)
+    steps = _enr.resolve_steps(provider, model, warn=False)
+    if not enrolled:
+        k = (provider, model)
+        if k not in _enrollment_warned:
+            _enrollment_warned.add(k)
+            log.warning(f"unenrolled model {provider}/{model} — using default adapter")
+    return steps
+
+
+def _strip_message(msg: dict, *, promote_reasoning: bool = True,
+                   adapter_steps: list[str] | None = None):
     """Remove thinking fields from a message dict in-place.
 
     If content is empty but reasoning has text (model answered only via
     reasoning — Gemma and some cloud models), copy reasoning into content
     first so the client still gets the reply. Callers that process mid-stream
     deltas must pass promote_reasoning=False (CoT arrives before content).
+
+    When adapter_steps is set (ENROLLMENT_ADAPTERS on), apply the enrolled /
+    default composed steps instead of the hard-coded legacy path.
     """
+    if adapter_steps is not None:
+        import enrollment as _enr
+        _enr.apply_steps(msg, adapter_steps, promote_reasoning=promote_reasoning)
+        return
     if promote_reasoning and _content_is_empty(msg.get("content")):
         r = _reasoning_text(msg)
         if r:
@@ -2227,14 +2323,16 @@ def _strip_message(msg: dict, *, promote_reasoning: bool = True):
             b for b in msg["content"]
             if b.get("type") not in ("thinking", "think")
         ]
+    _sanitize_message_content(msg)
 
 
-def _strip_response(data: dict):
+def _strip_response(data: dict, provider: str | None = None, model: str | None = None):
     """Strip thinking fields from a non-streaming response before returning it.
     Promotes reasoning→content when the model left content empty."""
+    steps = _adapter_steps_for(provider, model)
     for choice in data.get("choices", []):
         if "message" in choice:
-            _strip_message(choice["message"], promote_reasoning=True)
+            _strip_message(choice["message"], promote_reasoning=True, adapter_steps=steps)
 
 
 def _choice_has_output(choice: dict) -> bool:
@@ -2321,7 +2419,7 @@ def _streaming_generator(resp: requests.Response):
         yield buf
 
 
-def _strip_streaming_chunks(gen):
+def _strip_streaming_chunks(gen, adapter_steps: list[str] | None = None):
     """Strip thinking fields from an SSE byte stream.
 
     Mid-stream: never promote reasoning→content (cloud CoT streams with empty
@@ -2329,27 +2427,74 @@ def _strip_streaming_chunks(gen):
     Accumulate reasoning; if the stream finishes with no content at all, emit
     one content delta with the buffered reasoning (reasoning-only models).
 
+    Leading template junk may arrive split across deltas (`</` + `role>…`).
+    Content is accumulated and re-sanitized so Hermes never stores `<arg_value>` /
+    `</role>` prefixes on tool turns.
+
+    `adapter_steps` must be passed explicitly — stream iteration may run on a
+    different waitress thread than the one that set `_req_ctx`.
+
     Every rewritten `data:` event is terminated with a blank line (`\\n\\n`).
     SSE joins consecutive data lines until a blank line — omitting it makes
     the OpenAI SDK json.loads two events as one → Extra data: line 2 column 1.
     """
+    import enrollment as _enr
+
     reasoning_parts: list[str] = []
     saw_content = False
     pending = b""
+    junk_filter = _enr.LeadingJunkStreamFilter()
+    steps = adapter_steps
+    if steps is None:
+        steps = _adapter_steps_for(
+            getattr(_req_ctx, "provider", None),
+            getattr(_req_ctx, "model", None),
+        )
 
     def _sse_data(event: dict) -> bytes:
         return ("data: " + json.dumps(event) + "\n\n").encode("utf-8")
 
+    def _sanitize_text(text: str) -> str:
+        return _enr.sanitize_content_text(text) if ENROLLMENT_ADAPTERS else _sanitize_content_text(text)
+
     def _flush_reasoning_chunk():
-        nonlocal reasoning_parts
+        nonlocal reasoning_parts, saw_content
         if saw_content or not reasoning_parts:
             reasoning_parts = []
             return None
-        text = "".join(reasoning_parts)
+        text = _sanitize_text("".join(reasoning_parts))
         reasoning_parts = []
         if not text.strip():
             return None
-        return _sse_data({"choices": [{"index": 0, "delta": {"content": text}}]})
+        # Run through the same leading filter so CoT-only flushes can't leak tags.
+        out = junk_filter.push(text)
+        if not out:
+            out = junk_filter.flush()
+        if not out:
+            return None
+        saw_content = True
+        return _sse_data({"choices": [{"index": 0, "delta": {"content": out}}]})
+
+    def _rewrite_content(delta: dict) -> None:
+        """Replace delta content with sanitized stream suffix (split-tag safe)."""
+        nonlocal saw_content
+        raw = delta.pop("_raw_content", None)
+        content = delta.get("content")
+        if isinstance(raw, str) and raw != "":
+            out = junk_filter.push(raw)
+            delta["content"] = out
+            if out:
+                saw_content = True
+        elif isinstance(content, str) and content != "":
+            out = junk_filter.push(content)
+            delta["content"] = out
+            if out:
+                saw_content = True
+        elif isinstance(content, list):
+            # Multimodal text parts — sanitize each; split tags across parts are rare.
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    part["text"] = _sanitize_text(part["text"])
 
     for chunk in gen:
         pending += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
@@ -2357,6 +2502,11 @@ def _strip_streaming_chunks(gen):
             line_bytes, pending = pending.split(b"\n", 1)
             line = line_bytes.decode("utf-8", errors="replace")
             if line.strip() == "data: [DONE]":
+                # Emit any held suffix that became complete, then reasoning.
+                held = junk_filter.flush()
+                if held:
+                    saw_content = True
+                    yield _sse_data({"choices": [{"index": 0, "delta": {"content": held}}]})
                 flushed = _flush_reasoning_chunk()
                 if flushed:
                     yield flushed
@@ -2374,19 +2524,38 @@ def _strip_streaming_chunks(gen):
                             r = _reasoning_text(delta)
                             if r:
                                 reasoning_parts.append(r)
+                            # Stash raw string content before strip mutates it.
+                            c = delta.get("content")
+                            if isinstance(c, str) and c != "":
+                                delta["_raw_content"] = c
+                            _strip_message(delta, promote_reasoning=False, adapter_steps=steps)
+                            _rewrite_content(delta)
                             if not _content_is_empty(delta.get("content")):
                                 saw_content = True
-                            _strip_message(delta, promote_reasoning=False)
                     if finishing:
+                        held = junk_filter.flush()
+                        if held:
+                            saw_content = True
+                            yield _sse_data({"choices": [{"index": 0, "delta": {"content": held}}]})
                         flushed = _flush_reasoning_chunk()
                         if flushed:
                             yield flushed
                     yield _sse_data(event)
                     continue
-                except (json.JSONDecodeError, Exception):
-                    pass
+                except json.JSONDecodeError:
+                    # Non-JSON data line — pass through (comments / keepalives).
+                    yield (line + "\n").encode("utf-8")
+                    continue
+                except Exception as e:
+                    # Never forward raw upstream SSE on strip failure — that is
+                    # how <arg_value>/</role> leaked onto Hermes tool turns.
+                    log.warning(f"SSE strip failed, dropping chunk: {e}")
+                    continue
             # Pass through comments / blank lines (blank lines keep upstream framing)
             yield (line + "\n").encode("utf-8")
+    held = junk_filter.flush()
+    if held:
+        yield _sse_data({"choices": [{"index": 0, "delta": {"content": held}}]})
     flushed = _flush_reasoning_chunk()
     if flushed:
         yield flushed
@@ -2929,9 +3098,17 @@ def _estimated_tokens(messages: list) -> int:
     if enc is not None:
         total = 3
         for m in messages:
-            total += 4 + len(enc.encode(_message_text(m)))
+            # Chat history can contain leaked template tokens (<|endoftext|>,
+            # <|im_end|>, …). tiktoken rejects those by default and would 500
+            # the whole /v1/chat/completions before any provider is tried.
+            total += 4 + len(enc.encode(_message_text(m), disallowed_special=()))
         return total
     return sum(len(_message_text(m)) for m in messages) // 4
+
+
+# runnable check — special tokens in history must not crash estimation
+assert _estimated_tokens([{"role": "user", "content": "hi <|endoftext|> there"}]) > 0
+assert _estimated_tokens([{"role": "assistant", "content": "</role>ok"}]) > 0
 
 
 def _ordered_providers(payload: dict, prefer_local: bool = False,
@@ -4727,6 +4904,8 @@ def models():
         data.append({"id": f"{ROUTER_MODEL}:fast", "object": "model", "owned_by": "hermes-router"})
     # Always advertise :main profile (laguna → deepseek cascade)
     data.append({"id": f"{ROUTER_MODEL}:main", "object": "model", "owned_by": "hermes-router"})
+    for name in sorted(_NAMED_PROFILES):
+        data.append({"id": f"{ROUTER_MODEL}:{name}", "object": "model", "owned_by": "hermes-router"})
     return jsonify({"object": "list", "data": data})
 
 
@@ -4749,26 +4928,43 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     # Routing profile: `hermes-router:fast` (or header X-Hermes-Profile: fast)
     # is local-only (Ollama/LM Studio) — no cloud fallback. Caller (Hermes)
     # handles failure. Normalize model back to the router id for cache/upstream.
-    # Routing profile: `hermes-router:main` uses the MAIN model list
-    # (laguna → deepseek cascade via OPENROUTER_MAIN_MODEL env var).
+    # Routing profile: `hermes-router:main` uses OPENROUTER_MAIN_MODEL cascade
+    # (currently gemma-free → ling → nemotron → deepseek, then local).
     prefer_local = False
     prefer_main = False
+    named_pin: str | None = None  # single upstream model for hermes-router:<name>
+    profile_tag = "default"
     model_suffix = str(payload.get("model") or "").split(":")[-1]
     if model_suffix == "fast":
         prefer_local = True
+        profile_tag = "fast"
         payload = {**payload, "model": ROUTER_MODEL}
     elif model_suffix == "main":
         prefer_main = True
+        profile_tag = "main"
+        payload = {**payload, "model": ROUTER_MODEL}
+    elif model_suffix in _NAMED_PROFILES:
+        named_pin = _NAMED_PROFILES[model_suffix]
+        profile_tag = f"pin:{model_suffix}"
         payload = {**payload, "model": ROUTER_MODEL}
     else:
         try:
             profile = request.headers.get("X-Hermes-Profile", "").strip().lower()
             if profile == "fast":
                 prefer_local = True
+                profile_tag = "fast"
             elif profile == "main":
                 prefer_main = True
+                profile_tag = "main"
+            elif profile in _NAMED_PROFILES:
+                named_pin = _NAMED_PROFILES[profile]
+                profile_tag = f"pin:{profile}"
         except RuntimeError:
             pass  # called outside a request context (e.g. tests)
+
+    # Profile must be in the cache namespace — :fast/:main rewrite model to the
+    # same ROUTER_MODEL id, and without this they share cache entries.
+    ns = f"{ns}|p:{profile_tag}"
 
     messages = payload.get("messages", [])
 
@@ -4793,8 +4989,32 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
 
     est_tokens = _estimated_tokens(messages)
 
-    # `:main` profile: swap OpenRouter model to prio laguna then deepseek
-    if prefer_main:
+    # Named pin (staging/test): hermes-router:<name> → exactly one upstream model.
+    if named_pin:
+        pin = named_pin
+        log.info(f"[named profile] {model_suffix} → {pin}")
+        if model_suffix == "ollama":
+            local_only = []
+            for p in PROVIDERS:
+                if p["name"] != "local":
+                    continue
+                pool.ensure_model("local", pin, p.get("keys") or [])
+                local_only.append({**p, "model": pin, "models": [pin]})
+            if not local_only:
+                return ("error", {"error": {"message": "named profile 'ollama' needs LOCAL_*",
+                                            "type": "router_error"}}, 503)
+            ordered = _ordered_providers(payload, prefer_local=True, providers_override=local_only)
+        else:
+            patched = []
+            for p in PROVIDERS:
+                if p["name"] == "openrouter":
+                    pool.ensure_model("openrouter", pin, p.get("keys") or [])
+                    patched.append({**p, "model": pin, "models": [pin]})
+                else:
+                    patched.append(p)
+            ordered = _ordered_providers(payload, prefer_local=False, prefer_main=True, providers_override=patched)
+    # `:main` profile: OpenRouter uses OPENROUTER_MAIN_MODEL list (not local-first).
+    elif prefer_main:
         main_models = os.environ.get("OPENROUTER_MAIN_MODEL",
                                      "poolside/laguna-s-2.1:free,deepseek/deepseek-v4-flash")
         log.info(f"[main profile] using models: {main_models}")
@@ -5042,7 +5262,11 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 log.info(f"  ✓ {name}/{model} {resp.status_code} ({elapsed*1000:.0f}ms)")
                 _req_ctx.provider = name
                 _req_ctx.model    = model
-                out = peeked if is_anthropic else _strip_streaming_chunks(peeked)
+                # Pass steps explicitly — waitress may iterate the generator on
+                # another thread where _req_ctx is empty (would skip adapters /
+                # and the old broad except re-yielded raw SSE with tags intact).
+                steps = _adapter_steps_for(name, model)
+                out = peeked if is_anthropic else _strip_streaming_chunks(peeked, adapter_steps=steps)
                 wrapped = _streaming_with_usage(_with_cleanup(resp, out), name, model)
                 return ("stream", wrapped, name)
             else:
@@ -5088,7 +5312,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 _req_ctx.provider = name
                 _req_ctx.model    = model
                 if not is_anthropic:
-                    _strip_response(data)
+                    _strip_response(data, name, model)
                 _add_provider_tokens(name, data, model)
                 cache.set(payload, data, ns, query_emb)
                 return ("json", data)
@@ -5688,6 +5912,59 @@ def config_delete_proxy_key(tail):
     return jsonify({"key_tail": tail, "revoked": True, "restart_required": True})
 
 
+@app.route("/v1/enroll", methods=["GET"])
+def enroll_list():
+    """List enrollment profiles + which configured models are still unenrolled."""
+    err = _auth_check()
+    if err:
+        return err
+    import enrollment as _enr
+    return jsonify({
+        "adapters_enabled": ENROLLMENT_ADAPTERS,
+        **_enr.list_status(),
+    })
+
+
+@app.route("/v1/enroll", methods=["POST"])
+def enroll_model():
+    """Run the enrollment battery for one provider/model and persist its adapter profile.
+
+    Body: {"provider": "openrouter", "model": "inclusionai/ling-3.0-flash:free"}
+    Does not require ENROLLMENT_ADAPTERS=1 — profiles can be written while the
+    flag is off; chat egress only applies them when the flag is on.
+    """
+    err = _auth_check()
+    if err:
+        return err
+    body = request.get_json(force=True, silent=True) or {}
+    provider = (body.get("provider") or "").strip()
+    model = (body.get("model") or "").strip()
+    if not provider or not model:
+        return jsonify({"error": {"message": "provider and model are required",
+                                  "type": "invalid_request_error"}}), 400
+
+    p = next((x for x in PROVIDERS if x["name"] == provider), None)
+    if not p:
+        return jsonify({"error": {"message": f"unknown provider: {provider}",
+                                  "type": "invalid_request_error"}}), 404
+    key = pool.first_key(provider) or (p.get("keys") or [None])[0]
+    if not key:
+        return jsonify({"error": {"message": f"no ready key for {provider}",
+                                  "type": "router_error"}}), 503
+
+    import enrollment as _enr
+    result = _enr.enroll(
+        provider, model,
+        base_url=p["base_url"],
+        key=key,
+        extra_headers=p.get("headers") or {},
+    )
+    if not result.get("ok"):
+        return jsonify({"error": {"message": result.get("error", "enroll failed"),
+                                  "type": "router_error"}, "result": result}), 502
+    return jsonify(result)
+
+
 @app.route("/v1/status")
 def status():
     """Show key cooldown state, latency/error stats, and cache metrics."""
@@ -5736,8 +6013,14 @@ def status():
             entry["models"] = p["models"]
             # Per-model capability breakdown (rating + tool/reasoning support), so
             # dashboards can show why a non-primary model gets picked for hard turns.
-            entry["model_caps"] = [
-                {"model": m, **_model_caps(p["name"], m)} for m in p["models"]]
+            caps = []
+            for m in p["models"]:
+                row = {"model": m, **_model_caps(p["name"], m)}
+                if ENROLLMENT_ADAPTERS:
+                    import enrollment as _enr
+                    row["enrolled"] = _enr.is_enrolled(p["name"], m)
+                caps.append(row)
+            entry["model_caps"] = caps
         if "available" in st:
             entry["available"] = st["available"]
         if "supports_tools" in st:
@@ -5750,8 +6033,17 @@ def status():
             entry["max_output_tokens"] = p["max_output_tokens"]
         provider_stats[p["name"]] = entry
 
+    # MAIN / configured models enrollment overview (always listed; useful even
+    # when the adapters flag is off — enroll writes profiles either way).
+    import enrollment as _enr
+    enrollment_status = _enr.list_status()
+
     return jsonify({
         "providers": provider_stats,
+        "enrollment": {
+            "adapters_enabled": ENROLLMENT_ADAPTERS,
+            **enrollment_status,
+        },
         "cache": {
             "enabled":    CACHE_TTL > 0,
             "ttl_s":      CACHE_TTL,
