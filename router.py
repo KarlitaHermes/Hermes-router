@@ -699,6 +699,7 @@ def _build_providers() -> list[dict]:
             "base_url": os.environ.get("LOCAL_BASE_URL", "http://localhost:11434/v1"),
             "model":    os.environ.get("LOCAL_MODEL", "llama3.1"),
             "keys":     [os.environ.get("LOCAL_API_KEY", "local")],
+            "context_window": int(os.environ.get("LOCAL_CONTEXT_WINDOW", "131072")),
         })
 
     if not providers:
