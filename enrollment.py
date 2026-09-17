@@ -405,11 +405,13 @@ def run_battery(base_url: str, model: str, key: str, *, extra_headers: dict | No
         snippets["reasoning"] = (content or _reasoning_text(msg) or "")[:120]
 
     # 3) Forced tool
+    # ponytail: 64 was too tight for reasoning locals (glm) — they burn the
+    # budget on a content preamble and finish=length before tool_calls land.
     got = False
     for choice in ("required", "auto"):
         code, data, err = _chat(url, hdrs, {
             "model": model,
-            "max_tokens": 64,
+            "max_tokens": 256,
             "tools": _TOOL_PROBE,
             "tool_choice": choice,
             "messages": [{"role": "user",

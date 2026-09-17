@@ -62,6 +62,9 @@ _http_adapter = requests.adapters.HTTPAdapter(
 _HTTP.mount("https://", _http_adapter)
 _HTTP.mount("http://", _http_adapter)
 
+# ponytail: single local GPU — one inference at a time. Upgrade: per-host queue / multi-GPU.
+_LOCAL_SLOT = threading.Lock()
+
 PORT              = int(os.environ.get("PORT", 8319))
 # Bind address. Default 0.0.0.0 (needed for Docker port mapping). Set HOST=127.0.0.1
 # to expose the router to localhost only — recommended on a shared/VPS host where
@@ -177,6 +180,44 @@ REQUEST_LOG_SIZE  = max(0, int(os.environ.get("REQUEST_LOG_SIZE", "500")))
 # minutes on a generation; default to 600s (10 min) so long local runs don't trip.
 # ponytail: single knob replaces three hardcoded (10,120) spots below.
 UPSTREAM_TIMEOUT  = int(os.environ.get("UPSTREAM_TIMEOUT", "600"))
+
+# hermes-router:fast only — Hermes defaults max_tokens=65536, which on a
+# single-slot llama.cpp (-np 1) monopolizes the GPU for ages and starves peers.
+# :main is untouched (OpenRouter can take large prompts/outputs).
+FAST_MAX_OUTPUT_TOKENS = int(os.environ.get("FAST_MAX_OUTPUT_TOKENS", "4096"))
+
+
+def _apply_fast_profile_guards(payload: dict, est_tokens: int) -> tuple[dict, tuple | None]:
+    """Clamp/reject for `:fast` (local) only. Returns (payload, None) or (payload, error_tuple)."""
+    out_cap = FAST_MAX_OUTPUT_TOKENS
+    payload = dict(payload)
+    if out_cap > 0:
+        saw_cap = False
+        for field in ("max_tokens", "max_completion_tokens"):
+            cur = payload.get(field)
+            if isinstance(cur, int) and cur > 0:
+                saw_cap = True
+                if cur > out_cap:
+                    log.info(f"[fast] clamping {field} {cur}→{out_cap}")
+                    payload[field] = out_cap
+        if not saw_cap:
+            payload["max_tokens"] = out_cap
+            log.info(f"[fast] setting max_tokens={out_cap} (client omitted)")
+
+    local_ctx = int(os.environ.get("LOCAL_CONTEXT_WINDOW", "131072"))
+    budget = max(1, local_ctx - max(out_cap, 0))
+    if est_tokens > budget:
+        msg = (
+            f"hermes-router:fast prompt ~{est_tokens} tokens exceeds local "
+            f"budget {budget} (ctx={local_ctx}, max_out={out_cap})"
+        )
+        log.warning(f"[fast] rejecting oversized prompt: {msg}")
+        return payload, (
+            "error",
+            {"error": {"message": msg, "type": "context_length_exceeded"}},
+            400,
+        )
+    return payload, None
 
 
 def _load_auth_json() -> dict[str, list[str]]:
@@ -724,7 +765,12 @@ def _build_providers() -> list[dict]:
     #   • groq          ~6000 TPM → 413
     #   • sambanova     DeepSeek-V3.2 here caps at 32K context → 400
     #   • github_models gpt-4o free tier ~8K input-token limit → 413
-    _skip_defaults = {"groq": 5500, "sambanova": 30000, "github_models": 6000}
+    # local: leave headroom under LOCAL_CONTEXT_WINDOW so a 65k Hermes default
+    # max_tokens can't push prompt+output over the llama.cpp -c ceiling.
+    _skip_defaults = {
+        "groq": 5500, "sambanova": 30000, "github_models": 6000,
+        "local": 120000,
+    }
     for p in providers:
         env_var = f"{p['name'].upper()}_SKIP_TOKENS_OVER"
         p["skip_if_tokens_over"] = _int_env(env_var, _skip_defaults.get(p["name"], 0))
@@ -734,7 +780,9 @@ def _build_providers() -> list[dict]:
     #   Configure via  {PROVIDER}_MAX_OUTPUT_TOKENS  (0 = no clamp).
     #   • cohere        command-a caps output at 8192
     #   • github_models gpt-4o here rejects very large max_tokens (e.g. 65536)
-    _max_out_defaults = {"cohere": 8192, "github_models": 16384}
+    #   • local         llama.cpp -np 1: Hermes often sends max_tokens=65536;
+    #                   uncapped gens monopolize the single slot for minutes.
+    _max_out_defaults = {"cohere": 8192, "github_models": 16384, "local": 4096}
     for p in providers:
         env_var = f"{p['name'].upper()}_MAX_OUTPUT_TOKENS"
         p["max_output_tokens"] = _int_env(env_var, _max_out_defaults.get(p["name"], 0))
@@ -3399,11 +3447,42 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
         body["stream_options"]["include_usage"] = True
 
     url = provider["base_url"].rstrip("/") + "/chat/completions"
+    # Serialize local (single-GPU). Hold through non-stream response; for streams
+    # until resp.close() (_with_cleanup / empty-stream paths all call close).
+    local_slot = provider.get("name") == "local"
+    if local_slot:
+        log.info("  ⏳ waiting for local GPU slot")
+        if not _LOCAL_SLOT.acquire(timeout=UPSTREAM_TIMEOUT + 60):
+            log.error("  local GPU slot wait timed out")
+            return None
+        log.info("  🔒 acquired local GPU slot")
     try:
-        return _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, UPSTREAM_TIMEOUT))
+        resp = _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, UPSTREAM_TIMEOUT))
     except requests.exceptions.RequestException as e:
+        if local_slot:
+            _LOCAL_SLOT.release()
+            log.info("  🔓 released local GPU slot (error)")
         log.error(f"  Network error → {provider['name']}: {e}")
         return None
+    if local_slot:
+        if not streaming:
+            _LOCAL_SLOT.release()
+            log.info("  🔓 released local GPU slot")
+        else:
+            _orig_close = resp.close
+            _released = {"done": False}
+
+            def _close_and_release():
+                try:
+                    _orig_close()
+                finally:
+                    if not _released["done"]:
+                        _released["done"] = True
+                        _LOCAL_SLOT.release()
+                        log.info("  🔓 released local GPU slot")
+
+            resp.close = _close_and_release  # type: ignore[method-assign]
+    return resp
 
 
 def _embed_ordered() -> list[dict]:
@@ -4899,11 +4978,13 @@ def models():
     if err:
         return err
     data = [{"id": ROUTER_MODEL, "object": "model", "owned_by": "hermes-router"}]
-    # Advertise the fast/conversation profile only when a local model is configured,
-    # since that's what it routes short turns to.
+    # :dumb / :fast — local llama.cpp only (advertise when LOCAL_* configured)
     if any(p["name"] == "local" for p in PROVIDERS):
+        data.append({"id": f"{ROUTER_MODEL}:dumb", "object": "model", "owned_by": "hermes-router"})
         data.append({"id": f"{ROUTER_MODEL}:fast", "object": "model", "owned_by": "hermes-router"})
-    # Always advertise :main profile (laguna → deepseek cascade)
+    # :smart / :cheap OpenRouter cascades; :main aliases :smart
+    data.append({"id": f"{ROUTER_MODEL}:smart", "object": "model", "owned_by": "hermes-router"})
+    data.append({"id": f"{ROUTER_MODEL}:cheap", "object": "model", "owned_by": "hermes-router"})
     data.append({"id": f"{ROUTER_MODEL}:main", "object": "model", "owned_by": "hermes-router"})
     for name in sorted(_NAMED_PROFILES):
         data.append({"id": f"{ROUTER_MODEL}:{name}", "object": "model", "owned_by": "hermes-router"})
@@ -4926,44 +5007,48 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     _req_ctx.cache_hit = False
     _req_ctx.attempts  = 0   # total forward() calls made (cascades = attempts-1)
 
-    # Routing profile: `hermes-router:fast` (or header X-Hermes-Profile: fast)
-    # is local-only (Ollama/LM Studio) — no cloud fallback. Caller (Hermes)
-    # handles failure. Normalize model back to the router id for cache/upstream.
-    # Routing profile: `hermes-router:main` uses OPENROUTER_MAIN_MODEL cascade
-    # (currently gemma-free → ling → nemotron → deepseek, then local).
+    # Routing profiles (suffix or X-Hermes-Profile header):
+    #   :dumb / :fast  — local llama.cpp only (no cloud fallback)
+    #   :smart / :main — OPENROUTER_SMART_MODEL (Deepseek); :main aliases :smart
+    #   :cheap         — OPENROUTER_CHEAP_MODEL (lightning free → paid)
     prefer_local = False
-    prefer_main = False
+    prefer_main = False  # True for any OR-only cascade (:smart/:cheap/:main)
+    or_cascade_env: str | None = None  # env var holding comma-separated OR models
     named_pin: str | None = None  # single upstream model for hermes-router:<name>
     profile_tag = "default"
     model_suffix = str(payload.get("model") or "").split(":")[-1]
-    if model_suffix == "fast":
-        prefer_local = True
-        profile_tag = "fast"
-        payload = {**payload, "model": ROUTER_MODEL}
-    elif model_suffix == "main":
-        prefer_main = True
-        profile_tag = "main"
-        payload = {**payload, "model": ROUTER_MODEL}
-    elif model_suffix in _NAMED_PROFILES:
-        named_pin = _NAMED_PROFILES[model_suffix]
-        profile_tag = f"pin:{model_suffix}"
-        payload = {**payload, "model": ROUTER_MODEL}
-    else:
+
+    def _apply_profile(suffix: str) -> None:
+        nonlocal prefer_local, prefer_main, or_cascade_env, named_pin, profile_tag, payload
+        if suffix in ("fast", "dumb"):
+            prefer_local = True
+            profile_tag = "dumb" if suffix == "dumb" else "fast"
+            payload = {**payload, "model": ROUTER_MODEL}
+        elif suffix in ("smart", "main"):
+            prefer_main = True
+            or_cascade_env = "OPENROUTER_SMART_MODEL"
+            profile_tag = "smart"
+            payload = {**payload, "model": ROUTER_MODEL}
+        elif suffix == "cheap":
+            prefer_main = True
+            or_cascade_env = "OPENROUTER_CHEAP_MODEL"
+            profile_tag = "cheap"
+            payload = {**payload, "model": ROUTER_MODEL}
+        elif suffix in _NAMED_PROFILES:
+            named_pin = _NAMED_PROFILES[suffix]
+            profile_tag = f"pin:{suffix}"
+            payload = {**payload, "model": ROUTER_MODEL}
+
+    _apply_profile(model_suffix)
+    if profile_tag == "default":
         try:
             profile = request.headers.get("X-Hermes-Profile", "").strip().lower()
-            if profile == "fast":
-                prefer_local = True
-                profile_tag = "fast"
-            elif profile == "main":
-                prefer_main = True
-                profile_tag = "main"
-            elif profile in _NAMED_PROFILES:
-                named_pin = _NAMED_PROFILES[profile]
-                profile_tag = f"pin:{profile}"
+            if profile:
+                _apply_profile(profile)
         except RuntimeError:
             pass  # called outside a request context (e.g. tests)
 
-    # Profile must be in the cache namespace — :fast/:main rewrite model to the
+    # Profile must be in the cache namespace — suffix profiles rewrite model to the
     # same ROUTER_MODEL id, and without this they share cache entries.
     ns = f"{ns}|p:{profile_tag}"
 
@@ -4990,6 +5075,13 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
 
     est_tokens = _estimated_tokens(messages)
 
+    # :dumb/:fast = local-only, single GPU slot. Cap output + reject prompts that
+    # cannot fit LOCAL_CONTEXT_WINDOW. :smart/:cheap keep Hermes' large defaults.
+    if prefer_local:
+        payload, fast_err = _apply_fast_profile_guards(payload, est_tokens)
+        if fast_err is not None:
+            return fast_err
+
     # Named pin (staging/test): hermes-router:<name> → exactly one upstream model.
     if named_pin:
         pin = named_pin
@@ -5014,33 +5106,31 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 else:
                     patched.append(p)
             ordered = _ordered_providers(payload, prefer_local=False, prefer_main=True, providers_override=patched)
-    # `:main` profile: OpenRouter uses OPENROUTER_MAIN_MODEL list (not local-first).
+    # :smart / :cheap / :main — OpenRouter cascade from env (not local-first).
     elif prefer_main:
-        main_models = os.environ.get("OPENROUTER_MAIN_MODEL",
-                                     "poolside/laguna-s-2.1:free,deepseek/deepseek-v4-flash")
-        log.info(f"[main profile] using models: {main_models}")
-        # Build a patched provider list with the main models for OpenRouter
+        env_key = or_cascade_env or "OPENROUTER_SMART_MODEL"
+        cascade = os.environ.get(env_key) or os.environ.get(
+            "OPENROUTER_MAIN_MODEL", "~deepseek/deepseek-flash-latest"
+        )
+        log.info(f"[{profile_tag} profile] {env_key}={cascade}")
         patched = []
         for p in PROVIDERS:
             if p["name"] == "openrouter":
-                # Properly build models list from the comma-separated model string
-                main_models_list = [m.strip() for m in main_models.split(",") if m.strip()]
-                # Profile models need their own pool buckets. Without this,
-                # get_key() falls back to another model's deque — a 429 that
-                # cools that bucket silently starves every later cascade entry
-                # (no "→ Trying" log, jumps straight to local / 503).
-                for m in main_models_list:
+                models_list = [m.strip() for m in cascade.split(",") if m.strip()]
+                if not models_list:
+                    return ("error", {"error": {"message": f"{env_key} empty",
+                                                "type": "router_error"}}, 503)
+                for m in models_list:
                     pool.ensure_model("openrouter", m, p.get("keys") or [])
-                new_p = {**p, "model": main_models_list[0], "models": main_models_list}
-                patched.append(new_p)
+                patched.append({**p, "model": models_list[0], "models": models_list})
             else:
                 patched.append(p)
         ordered = _ordered_providers(payload, prefer_local=False, prefer_main=True, providers_override=patched)
     elif prefer_local:
-        # `:fast` — Ollama/local only. No OpenRouter/nemotron cascade.
+        # :dumb/:fast — local only. No OpenRouter cascade.
         local_only = [p for p in PROVIDERS if p["name"] == "local"]
         if not local_only:
-            return ("error", {"error": {"message": "hermes-router:fast requires LOCAL_BASE_URL/LOCAL_MODEL",
+            return ("error", {"error": {"message": "hermes-router:dumb/:fast requires LOCAL_BASE_URL/LOCAL_MODEL",
                                         "type": "router_error"}}, 503)
         ordered = _ordered_providers(payload, prefer_local=True, providers_override=local_only)
     else:
