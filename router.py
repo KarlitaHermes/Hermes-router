@@ -64,6 +64,21 @@ _HTTP.mount("http://", _http_adapter)
 
 # ponytail: single local GPU — one inference at a time. Upgrade: per-host queue / multi-GPU.
 _LOCAL_SLOT = threading.Lock()
+# Face I1 2026-09-25: streaming 400 skipped resp.close() → slot held 13h.
+_LOCAL_SLOT_HELD_AT: float | None = None
+_LOCAL_SLOT_META = threading.Lock()
+
+
+def _local_slot_mark_held(held: bool) -> None:
+    global _LOCAL_SLOT_HELD_AT
+    with _LOCAL_SLOT_META:
+        _LOCAL_SLOT_HELD_AT = time.monotonic() if held else None
+
+
+def _local_slot_held_for() -> float | None:
+    with _LOCAL_SLOT_META:
+        at = _LOCAL_SLOT_HELD_AT
+    return (time.monotonic() - at) if at is not None else None
 
 PORT              = int(os.environ.get("PORT", 8319))
 # Bind address. Default 0.0.0.0 (needed for Docker port mapping). Set HOST=127.0.0.1
@@ -3452,22 +3467,45 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
     local_slot = provider.get("name") == "local"
     if local_slot:
         log.info("  ⏳ waiting for local GPU slot")
+        # Face I1: if a prior stream never closed, force-release after max hold.
+        held_for = _local_slot_held_for()
+        max_hold = UPSTREAM_TIMEOUT + 120
+        if held_for is not None and held_for > max_hold and _LOCAL_SLOT.locked():
+            log.error(
+                "  🔓 force-releasing stale local GPU slot "
+                f"(held {held_for:.0f}s > {max_hold}s) — Face I1"
+            )
+            try:
+                _LOCAL_SLOT.release()
+            except RuntimeError:
+                pass
+            _local_slot_mark_held(False)
         if not _LOCAL_SLOT.acquire(timeout=UPSTREAM_TIMEOUT + 60):
             log.error("  local GPU slot wait timed out")
             return None
+        _local_slot_mark_held(True)
         log.info("  🔒 acquired local GPU slot")
+
+    def _release_local(reason: str = "") -> None:
+        if not local_slot:
+            return
+        try:
+            _LOCAL_SLOT.release()
+        except RuntimeError:
+            return
+        _local_slot_mark_held(False)
+        suffix = f" ({reason})" if reason else ""
+        log.info(f"  🔓 released local GPU slot{suffix}")
+
     try:
         resp = _HTTP.post(url, headers=headers, json=body, stream=streaming, timeout=(10, UPSTREAM_TIMEOUT))
     except requests.exceptions.RequestException as e:
-        if local_slot:
-            _LOCAL_SLOT.release()
-            log.info("  🔓 released local GPU slot (error)")
+        _release_local("error")
         log.error(f"  Network error → {provider['name']}: {e}")
         return None
     if local_slot:
         if not streaming:
-            _LOCAL_SLOT.release()
-            log.info("  🔓 released local GPU slot")
+            _release_local()
         else:
             _orig_close = resp.close
             _released = {"done": False}
@@ -3478,11 +3516,24 @@ def forward(provider: dict, key: str, payload: dict, streaming: bool,
                 finally:
                     if not _released["done"]:
                         _released["done"] = True
-                        _LOCAL_SLOT.release()
-                        log.info("  🔓 released local GPU slot")
+                        _release_local()
 
             resp.close = _close_and_release  # type: ignore[method-assign]
     return resp
+
+
+def _drop_resp(resp) -> None:
+    """Always close an upstream response we are not returning to the client.
+
+    Face I1: streaming local 400/404/`break` paths used to skip close →
+    ``_LOCAL_SLOT`` leaked until process restart.
+    """
+    if resp is None:
+        return
+    try:
+        resp.close()
+    except Exception:
+        pass
 
 
 def _embed_ordered() -> list[dict]:
@@ -5008,7 +5059,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
     _req_ctx.attempts  = 0   # total forward() calls made (cascades = attempts-1)
 
     # Routing profiles (suffix or X-Hermes-Profile header):
-    #   :dumb / :fast  — local llama.cpp only (no cloud fallback)
+    #   :dumb / :fast  — local first, then OPENROUTER_CHEAP_MODEL (Face I2)
     #   :smart / :main — OPENROUTER_SMART_MODEL (Deepseek); :main aliases :smart
     #   :cheap         — OPENROUTER_CHEAP_MODEL (lightning free → paid)
     prefer_local = False
@@ -5127,12 +5178,36 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 patched.append(p)
         ordered = _ordered_providers(payload, prefer_local=False, prefer_main=True, providers_override=patched)
     elif prefer_local:
-        # :dumb/:fast — local only. No OpenRouter cascade.
+        # :dumb/:fast — local first; cascade to OPENROUTER_FAST_FALLBACK_MODEL
+        # (default: OPENROUTER_CHEAP_MODEL) so a leaked/down local slot cannot
+        # freeze the music pipeline (Face I2 2026-09-25).
         local_only = [p for p in PROVIDERS if p["name"] == "local"]
         if not local_only:
             return ("error", {"error": {"message": "hermes-router:dumb/:fast requires LOCAL_BASE_URL/LOCAL_MODEL",
                                         "type": "router_error"}}, 503)
         ordered = _ordered_providers(payload, prefer_local=True, providers_override=local_only)
+        fb = (
+            os.environ.get("OPENROUTER_FAST_FALLBACK_MODEL")
+            or os.environ.get("OPENROUTER_CHEAP_MODEL")
+            or ""
+        ).strip()
+        if fb:
+            for p in PROVIDERS:
+                if p["name"] != "openrouter":
+                    continue
+                models_list = [m.strip() for m in fb.split(",") if m.strip()]
+                for m in models_list:
+                    pool.ensure_model("openrouter", m, p.get("keys") or [])
+                patched = [{**p, "model": models_list[0], "models": models_list}]
+                cloud = _ordered_providers(
+                    payload, prefer_local=False, prefer_main=True, providers_override=patched
+                )
+                ordered = list(ordered) + list(cloud)
+                log.info(
+                    f"[{profile_tag} profile] local + fallback "
+                    f"OPENROUTER_FAST_FALLBACK/CHEAP={fb}"
+                )
+                break
     else:
         ordered = _ordered_providers(payload, prefer_local=False)
 
@@ -5246,6 +5321,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
                 pool.mark_rate_limited(name, key, model, retry_after=retry_after)
                 log.warning(f"  {name}/{model} 429 — cooldown {retry_after}s, trying next")
+                _drop_resp(resp)
                 continue
 
             if resp.status_code in (401, 403):
@@ -5257,6 +5333,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 # provider's next one instead of disabling the whole provider.
                 if re.search(r"modelerror|not supported|promotion has ended|subscrib|no payment|credits", btxt, re.I):
                     log.warning(f"  {name}/{model} {resp.status_code} model-level — skipping this model: {btxt[:160]}")
+                    _drop_resp(resp)
                     break
                 # Genuine auth/permission failure — won't work for any model here.
                 # Also count it against the circuit breaker: record_error() alone only
@@ -5269,12 +5346,14 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 log.error(f"  {name} {resp.status_code} — auth, skipping provider: {btxt[:200]}")
                 stats.record_health(name, False)
                 skip_providers.add(name)
+                _drop_resp(resp)
                 break
 
             if resp.status_code in (400, 404):
                 stats.record_error(name)
                 # model-specific (e.g. bad model name) — just skip this candidate.
                 log.warning(f"  {name}/{model} {resp.status_code} — skipping this model: {resp.text[:150]}")
+                _drop_resp(resp)  # Face I1 — must close so streaming local releases _LOCAL_SLOT
                 break
 
             if resp.status_code == 413:
@@ -5282,12 +5361,14 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 # payload-specific — bigger model won't help; cascade providers.
                 log.warning(f"  {name} 413 — payload too large, cascading")
                 skip_providers.add(name)
+                _drop_resp(resp)
                 break
 
             if resp.status_code >= 500:
                 stats.record_error(name)
                 stats.record_health(name, False)   # 5xx = provider health failure
                 pool.mark_key_down(name, key, retry_after=15)
+                _drop_resp(resp)
                 continue
 
             if not (200 <= resp.status_code < 300):
@@ -5295,6 +5376,7 @@ def _route_completion(payload: dict, streaming: bool, ns: str = ""):
                 stats.record_health(name, False)   # unexpected non-2xx = health failure
                 log.warning(f"  {name} unexpected {resp.status_code} — skipping provider")
                 skip_providers.add(name)
+                _drop_resp(resp)
                 break
 
             # 2xx — validate body/stream before committing success. Empty
